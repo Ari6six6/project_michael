@@ -403,7 +403,11 @@ def run_sandbox(
         cpus = float(cfg.sandbox_cpus)
         pids = int(cfg.sandbox_pids)
 
-        mount = f"{tmp}:/workspace:rw"
+        # Mount the workspace read-only: the source is dropped in before the
+        # container starts, and any transient writes go to the /tmp tmpfs.
+        # This means a compromised payload cannot mutate files the host
+        # process will inspect after exit.
+        mount = f"{tmp}:/workspace:ro"
         if RUNTIME == "podman":
             mount += ",Z"
 

@@ -76,9 +76,14 @@ else
          "you must copy a pubkey to ${USER_HOME}/.ssh/authorized_keys before logging out." >&2
 fi
 
+# NOTE: michael runs containers via *rootless* podman (uidmap + slirp4netns
+# are installed above). The application never shells out to sudo, so we
+# deliberately do NOT grant NOPASSWD on podman/docker — that would be
+# equivalent to root (sudo podman run -v /:/host …). Keep journalctl only,
+# for read-only diagnostics.
 SUDOERS_FILE="/etc/sudoers.d/10-${USERNAME}-agent"
 cat >"${SUDOERS_FILE}" <<EOF
-${USERNAME} ALL=(root) NOPASSWD: /usr/bin/podman, /usr/bin/docker, /bin/systemctl restart docker, /bin/systemctl status *, /usr/bin/journalctl
+${USERNAME} ALL=(root) NOPASSWD: /usr/bin/journalctl
 EOF
 chmod 0440 "${SUDOERS_FILE}"
 visudo -cf "${SUDOERS_FILE}"
