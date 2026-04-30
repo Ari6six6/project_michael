@@ -10,11 +10,13 @@ USERNAME="${USERNAME:-michael}"
 OPERATOR_USER="${OPERATOR_USER:-ari}"
 SSH_PORT="${SSH_PORT:-22}"
 TIMEZONE="${TIMEZONE:-UTC}"
-TTYD_PORT="${TTYD_PORT:-443}"
+TTYD_LOCAL_PORT="${TTYD_LOCAL_PORT:-7681}"
+WEB_PORT="${WEB_PORT:-443}"
 TTYD_VERSION="${TTYD_VERSION:-1.7.7}"
 WEB_CRED_FILE="/root/.web-terminal-credentials"
 TTYD_BIN="/usr/local/bin/ttyd"
-TTYD_ETC="/etc/ttyd"
+WEB_TLS_DIR="/etc/ssl/web-terminal"
+NGINX_HTPASSWD="/etc/nginx/web-terminal.htpasswd"
 
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "ERROR: bootstrap.sh must be run as root." >&2
@@ -27,15 +29,16 @@ export NEEDRESTART_SUSPEND=1
 
 APT_CONFOLD=(-o "Dpkg::Options::=--force-confold")
 
-echo "[1/12] apt update + upgrade and install base packages"
+echo "[1/13] apt update + upgrade and install base packages"
 apt-get update -y
 apt-get "${APT_CONFOLD[@]}" -y upgrade
 apt-get "${APT_CONFOLD[@]}" -y install \
     ufw fail2ban unattended-upgrades needrestart chrony apparmor-utils \
     ca-certificates curl gnupg lsb-release git jq podman uidmap slirp4netns \
-    tmux htop
+    tmux htop \
+    nginx apache2-utils openssl
 
-echo "[2/12] timezone, chrony, locale"
+echo "[2/13] timezone, chrony, locale"
 timedatectl set-timezone "${TIMEZONE}"
 systemctl enable --now chrony
 if ! locale -a | grep -qiE '^en_US\.utf-?8$'; then
@@ -45,7 +48,7 @@ if ! locale -a | grep -qiE '^en_US\.utf-?8$'; then
 fi
 update-locale LANG=en_US.UTF-8
 
-echo "[3/12] unattended-upgrades configuration"
+echo "[3/13] unattended-upgrades configuration"
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -66,7 +69,7 @@ Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
 systemctl enable --now unattended-upgrades.service
 
-echo "[4/12] non-root user ${USERNAME} + sudoers"
+echo "[4/13] non-root user ${USERNAME} + sudoers"
 if ! id -u "${USERNAME}" >/dev/null 2>&1; then
     adduser --disabled-password --gecos "" "${USERNAME}"
 fi
@@ -94,16 +97,16 @@ EOF
 chmod 0440 "${SUDOERS_FILE}"
 visudo -cf "${SUDOERS_FILE}"
 
-echo "[5/12] UFW firewall"
+echo "[5/13] UFW firewall"
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow "${SSH_PORT}/tcp"
-ufw allow "${TTYD_PORT}/tcp"
+ufw allow "${WEB_PORT}/tcp"
 ufw --force enable
 ufw status verbose
 
-echo "[6/12] SSH hardening"
+echo "[6/13] SSH hardening"
 CLOUD_INIT_DROPIN="/etc/ssh/sshd_config.d/50-cloud-init.conf"
 if [[ -f "${CLOUD_INIT_DROPIN}" ]]; then
     sed -i 's/^[[:space:]]*PasswordAuthentication[[:space:]].*/# &/' "${CLOUD_INIT_DROPIN}"
@@ -125,7 +128,7 @@ EOF
 sshd -t
 systemctl reload ssh
 
-echo "[7/12] fail2ban"
+echo "[7/13] fail2ban"
 cat >/etc/fail2ban/jail.d/sshd-local.conf <<EOF
 [sshd]
 enabled = true
@@ -137,7 +140,7 @@ EOF
 systemctl enable --now fail2ban
 fail2ban-client status sshd || true
 
-echo "[8/12] sysctl + needrestart + apparmor"
+echo "[8/13] sysctl + needrestart + apparmor"
 cat >/etc/sysctl.d/99-hardening.conf <<'EOF'
 net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.rp_filter = 1
@@ -162,7 +165,7 @@ EOF
 
 aa-status || true
 
-echo "[9/12] michael state dir + sandbox image"
+echo "[9/13] michael state dir + sandbox image"
 MICHAEL_DIR="${USER_HOME}/.michael"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "${MICHAEL_DIR}"
 if [[ -f Dockerfile.sandbox ]]; then
@@ -176,7 +179,7 @@ else
     echo "NOTE: Dockerfile.sandbox not found in CWD; skipping sandbox image build." >&2
 fi
 
-echo "[10/12] operator user ${OPERATOR_USER} (web-terminal account, no SSH)"
+echo "[10/13] operator user ${OPERATOR_USER} (web-terminal account, no SSH)"
 if ! id -u "${OPERATOR_USER}" >/dev/null 2>&1; then
     adduser --disabled-password --gecos "" "${OPERATOR_USER}"
 fi
@@ -201,45 +204,19 @@ EOF
 chmod 0440 "${SUDOERS_OP}"
 visudo -cf "${SUDOERS_OP}"
 
-echo "[11/12] ttyd binary + self-signed TLS cert"
-install -d -m 0755 "${TTYD_ETC}"
+echo "[11/13] ttyd binary + loopback systemd unit"
 if [[ ! -x "${TTYD_BIN}" ]] || ! "${TTYD_BIN}" --version 2>/dev/null | grep -q "${TTYD_VERSION}"; then
     curl -fsSL -o "${TTYD_BIN}" \
         "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"
     chmod 0755 "${TTYD_BIN}"
 fi
 
-apt-get "${APT_CONFOLD[@]}" -y install openssl
-PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org || true)"
-CERT_CN="${PUBLIC_IP:-michael-vps}"
-if [[ ! -s "${TTYD_ETC}/cert.pem" || ! -s "${TTYD_ETC}/key.pem" || "${WEB_REGEN:-0}" == "1" ]]; then
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -days 3650 \
-        -subj "/CN=${CERT_CN}" \
-        -addext "subjectAltName=IP:${PUBLIC_IP:-127.0.0.1}" \
-        -keyout "${TTYD_ETC}/key.pem" \
-        -out "${TTYD_ETC}/cert.pem"
-fi
-chmod 0640 "${TTYD_ETC}/key.pem" "${TTYD_ETC}/cert.pem"
-chgrp "${OPERATOR_USER}" "${TTYD_ETC}/key.pem" "${TTYD_ETC}/cert.pem"
-
-# Persist credentials for the operator to retrieve.
-umask 077
-cat >"${WEB_CRED_FILE}" <<EOF
-url=https://${PUBLIC_IP:-<vps-ip>}:${TTYD_PORT}/
-username=${OPERATOR_USER}
-password=${WEB_PASSWORD}
-EOF
-chmod 0400 "${WEB_CRED_FILE}"
-
-echo "[12/12] ttyd systemd unit (HTTPS web terminal on :${TTYD_PORT})"
-# Note: AmbientCapabilities lets the operator user bind :443 without root.
-# We deliberately do NOT set NoNewPrivileges/CapabilityBoundingSet/ProtectSystem,
-# because the user expects a full sudoer shell from the web terminal — those
-# directives would block sudo (setuid) and writes to / outside /home.
+# ttyd listens only on loopback; nginx terminates TLS and gates basic-auth.
+# Auth+TLS are intentionally NOT in the ttyd cmdline: keeping the password
+# out of /proc/<pid>/cmdline is the whole reason for fronting with nginx.
 cat >/etc/systemd/system/ttyd.service <<EOF
 [Unit]
-Description=ttyd web terminal (HTTPS, basic-auth) for ${OPERATOR_USER}
+Description=ttyd web terminal (loopback; fronted by nginx)
 After=network-online.target
 Wants=network-online.target
 
@@ -247,15 +224,10 @@ Wants=network-online.target
 Type=simple
 User=${OPERATOR_USER}
 Group=${OPERATOR_USER}
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 WorkingDirectory=/home/${OPERATOR_USER}
 ExecStart=${TTYD_BIN} \\
-    --port ${TTYD_PORT} \\
-    --interface 0.0.0.0 \\
-    --credential ${OPERATOR_USER}:${WEB_PASSWORD} \\
-    --ssl \\
-    --ssl-cert ${TTYD_ETC}/cert.pem \\
-    --ssl-key ${TTYD_ETC}/key.pem \\
+    --port ${TTYD_LOCAL_PORT} \\
+    --interface 127.0.0.1 \\
     --writable \\
     --max-clients 4 \\
     /bin/bash -l
@@ -265,12 +237,91 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-chmod 0640 /etc/systemd/system/ttyd.service
-
+chmod 0644 /etc/systemd/system/ttyd.service
 systemctl daemon-reload
 systemctl enable --now ttyd.service
 sleep 1
 systemctl --no-pager --full status ttyd.service || true
+
+echo "[12/13] self-signed TLS cert + htpasswd for nginx"
+install -d -m 0755 "${WEB_TLS_DIR}"
+PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org || true)"
+CERT_CN="${PUBLIC_IP:-michael-vps}"
+if [[ ! -s "${WEB_TLS_DIR}/cert.pem" || ! -s "${WEB_TLS_DIR}/key.pem" || "${WEB_REGEN:-0}" == "1" ]]; then
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -days 3650 \
+        -subj "/CN=${CERT_CN}" \
+        -addext "subjectAltName=IP:${PUBLIC_IP:-127.0.0.1}" \
+        -keyout "${WEB_TLS_DIR}/key.pem" \
+        -out "${WEB_TLS_DIR}/cert.pem"
+fi
+chmod 0600 "${WEB_TLS_DIR}/key.pem"
+chmod 0644 "${WEB_TLS_DIR}/cert.pem"
+chown root:root "${WEB_TLS_DIR}/key.pem" "${WEB_TLS_DIR}/cert.pem"
+
+# bcrypt-hashed htpasswd. -B = bcrypt, -b = take password from cmdline (this
+# command is transient; only the resulting file persists). htpasswd file is
+# readable by www-data only.
+htpasswd -bcB "${NGINX_HTPASSWD}" "${OPERATOR_USER}" "${WEB_PASSWORD}"
+chown root:www-data "${NGINX_HTPASSWD}"
+chmod 0640 "${NGINX_HTPASSWD}"
+
+# Persist credentials (root-only) so they can be re-printed later.
+umask 077
+cat >"${WEB_CRED_FILE}" <<EOF
+url=https://${PUBLIC_IP:-<vps-ip>}/
+username=${OPERATOR_USER}
+password=${WEB_PASSWORD}
+EOF
+chmod 0400 "${WEB_CRED_FILE}"
+
+echo "[13/13] nginx reverse proxy (HTTPS :${WEB_PORT} -> 127.0.0.1:${TTYD_LOCAL_PORT})"
+rm -f /etc/nginx/sites-enabled/default
+cat >/etc/nginx/sites-available/web-terminal <<EOF
+server {
+    listen ${WEB_PORT} ssl;
+    listen [::]:${WEB_PORT} ssl;
+    server_name _;
+
+    ssl_certificate     ${WEB_TLS_DIR}/cert.pem;
+    ssl_certificate_key ${WEB_TLS_DIR}/key.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+
+    auth_basic           "web terminal";
+    auth_basic_user_file ${NGINX_HTPASSWD};
+
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass         http://127.0.0.1:${TTYD_LOCAL_PORT};
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade    \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       \$host;
+        proxy_set_header X-Real-IP  \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # ttyd uses a long-lived WebSocket; keep the connection open.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering    off;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/web-terminal /etc/nginx/sites-enabled/web-terminal
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx
 
 cat <<EOF
 
@@ -278,12 +329,21 @@ cat <<EOF
   bootstrap complete.
 
   WEB TERMINAL (use Safari over iCloud Private Relay):
-      URL:      https://${PUBLIC_IP:-<vps-ip>}:${TTYD_PORT}/
+      URL:      https://${PUBLIC_IP:-<vps-ip>}/
       User:     ${OPERATOR_USER}
       Password: ${WEB_PASSWORD}
 
-  The TLS cert is self-signed. On first visit Safari will warn:
-  tap "Show Details" -> "visit this website" -> confirm.
+  Traffic is TLS-encrypted (TLS 1.2/1.3). The cert is self-signed —
+  Safari will show a "not private" warning on first visit because no
+  public CA vouches for it (we have no domain). Encryption is real;
+  trust is what's missing. Tap "Show Details" -> "visit this
+  website" once per device to accept it.
+
+  Architecture: nginx (:${WEB_PORT}, TLS + bcrypt htpasswd) -> ttyd
+  (127.0.0.1:${TTYD_LOCAL_PORT}, no auth, no TLS, loopback only) -> bash -l
+  as ${OPERATOR_USER}. Password is in ${NGINX_HTPASSWD} (mode 0640
+  root:www-data), never on a process command line.
+
   Credentials also persisted at ${WEB_CRED_FILE} (root-only).
   To rotate them later: WEB_REGEN=1 ./bootstrap.sh
 
