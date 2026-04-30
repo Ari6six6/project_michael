@@ -165,19 +165,36 @@ EOF
 
 aa-status || true
 
-echo "[9/13] michael state dir + sandbox image"
+echo "[9/13] michael state dir, sandbox image, CLI install"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MICHAEL_DIR="${USER_HOME}/.michael"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "${MICHAEL_DIR}"
-if [[ -f Dockerfile.sandbox ]]; then
+if [[ -f "${PROJECT_DIR}/Dockerfile.sandbox" ]]; then
     install -m 0644 -o "${USERNAME}" -g "${USERNAME}" \
-        Dockerfile.sandbox "${MICHAEL_DIR}/Dockerfile.sandbox"
+        "${PROJECT_DIR}/Dockerfile.sandbox" "${MICHAEL_DIR}/Dockerfile.sandbox"
     sudo -u "${USERNAME}" podman build \
         -t michael-sandbox:alpine \
         -f "${MICHAEL_DIR}/Dockerfile.sandbox" \
         "${MICHAEL_DIR}/"
 else
-    echo "NOTE: Dockerfile.sandbox not found in CWD; skipping sandbox image build." >&2
+    echo "NOTE: Dockerfile.sandbox not found; skipping sandbox image build." >&2
 fi
+
+# Install the michael CLI into a venv (Ubuntu 24.04 system Python is
+# PEP 668-protected) and expose /usr/local/bin/michael as a thin wrapper.
+apt-get "${APT_CONFOLD[@]}" -y install python3-venv python3-pip
+VENV_DIR="${PROJECT_DIR}/.venv"
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+    python3 -m venv "${VENV_DIR}"
+fi
+"${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+"${VENV_DIR}/bin/pip" install --quiet -r "${PROJECT_DIR}/requirements.txt"
+
+cat >/usr/local/bin/michael <<EOF
+#!/bin/sh
+exec "${VENV_DIR}/bin/python" "${PROJECT_DIR}/main.py" "\$@"
+EOF
+chmod 0755 /usr/local/bin/michael
 
 echo "[10/13] operator user ${OPERATOR_USER} (web-terminal account, no SSH)"
 if ! id -u "${OPERATOR_USER}" >/dev/null 2>&1; then
@@ -203,6 +220,22 @@ ${OPERATOR_USER} ALL=(ALL:ALL) ALL
 EOF
 chmod 0440 "${SUDOERS_OP}"
 visudo -cf "${SUDOERS_OP}"
+
+# Build the sandbox image under the operator's rootless podman storage too,
+# so `michael sandbox foo.py` works from the web terminal as ${OPERATOR_USER}.
+# Each rootless podman user has its own image store.
+OP_HOME="$(getent passwd "${OPERATOR_USER}" | cut -d: -f6)"
+OP_MICHAEL_DIR="${OP_HOME}/.michael"
+install -d -m 0700 -o "${OPERATOR_USER}" -g "${OPERATOR_USER}" "${OP_MICHAEL_DIR}"
+if [[ -f "${PROJECT_DIR}/Dockerfile.sandbox" ]]; then
+    install -m 0644 -o "${OPERATOR_USER}" -g "${OPERATOR_USER}" \
+        "${PROJECT_DIR}/Dockerfile.sandbox" "${OP_MICHAEL_DIR}/Dockerfile.sandbox"
+    sudo -u "${OPERATOR_USER}" podman build \
+        -t michael-sandbox:alpine \
+        -f "${OP_MICHAEL_DIR}/Dockerfile.sandbox" \
+        "${OP_MICHAEL_DIR}/" || \
+        echo "WARNING: sandbox build for ${OPERATOR_USER} failed (non-fatal)" >&2
+fi
 
 echo "[11/13] ttyd binary + loopback systemd unit"
 if [[ ! -x "${TTYD_BIN}" ]] || ! "${TTYD_BIN}" --version 2>/dev/null | grep -q "${TTYD_VERSION}"; then
@@ -346,6 +379,12 @@ cat <<EOF
 
   Credentials also persisted at ${WEB_CRED_FILE} (root-only).
   To rotate them later: WEB_REGEN=1 ./bootstrap.sh
+
+  michael CLI is on PATH for any user: just run \`michael\`.
+  Next steps from the web terminal as ${OPERATOR_USER}:
+      michael init
+      \$EDITOR ~/.michael/config.json    # paste vast/vllm keys
+      michael up                        # resumes the GPU instance
 
   SSH (kept available; key-only, no password, no root):
       ssh -p ${SSH_PORT} ${USERNAME}@${PUBLIC_IP:-<vps-ip>}
