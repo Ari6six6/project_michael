@@ -36,6 +36,7 @@ Commands (work as one-shot or inside the REPL):
 from __future__ import annotations
 
 import difflib
+import fcntl
 import hashlib
 import json
 import os
@@ -57,6 +58,8 @@ import typer
 from openai import OpenAI
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.panel import Panel
@@ -317,19 +320,27 @@ def _last_seq(path: pathlib.Path) -> int:
 
 
 def _append(path: pathlib.Path, type_: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Append one event line under an exclusive flock so two michael processes
+    can't tear the seq numbering when they race."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    seq = _last_seq(path) + 1
-    event = {
-        "seq": seq,
-        "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-        "type": type_,
-        "payload": payload,
-    }
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    if not path.exists():
+        path.touch(mode=0o600)
     with path.open("a", encoding="utf-8") as f:
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            seq = _last_seq(path) + 1
+            event = {
+                "seq": seq,
+                "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                "type": type_,
+                "payload": payload,
+            }
+            line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     return event
 
 
@@ -1565,13 +1576,73 @@ REPL_COMMANDS = {
 }
 
 
+def _config_is_unset() -> bool:
+    """True when the user hasn't filled in any vast/vllm credentials yet."""
+    if not GLOBAL_CONFIG_PATH.is_file():
+        return True
+    try:
+        cfg = Config.load()
+    except MichaelError:
+        return True
+    return not (cfg.vast_api_key or cfg.vast_instance_id)
+
+
+class MichaelCompleter(Completer):
+    """Tab-completion for the REPL: command names, then context-specific args.
+
+    Project slugs for `use` are read live so newly-created projects show up
+    immediately.
+    """
+
+    LOG_FLAGS = ("--tail", "-n")
+
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        words = text.split()
+        at_boundary = text.endswith(" ") or not text
+
+        if not words or (len(words) == 1 and not at_boundary):
+            prefix = words[0] if words else ""
+            for cmd in sorted(REPL_COMMANDS):
+                if cmd.startswith(prefix):
+                    yield Completion(cmd, start_position=-len(prefix))
+            return
+
+        head = words[0]
+        if head == "use":
+            prefix = words[1] if len(words) > 1 and not at_boundary else ""
+            for p in list_projects():
+                if p.slug.startswith(prefix):
+                    yield Completion(p.slug, start_position=-len(prefix))
+            return
+        if head == "new":
+            if len(words) == 1 and at_boundary:
+                yield Completion("project", start_position=0)
+            elif len(words) == 2 and not at_boundary and "project".startswith(words[1]):
+                yield Completion("project", start_position=-len(words[1]))
+            return
+        if head == "log":
+            prefix = words[-1] if not at_boundary else ""
+            for f in self.LOG_FLAGS:
+                if f.startswith(prefix):
+                    yield Completion(f, start_position=-len(prefix))
+            return
+
+
 def repl() -> None:
     STATE_DIR.mkdir(mode=0o700, exist_ok=True)
     session = PromptSession(
         history=FileHistory(str(REPL_HISTORY_PATH)),
         auto_suggest=AutoSuggestFromHistory(),
+        completer=MichaelCompleter(),
+        complete_while_typing=False,
     )
     console.print("hey")
+    if _config_is_unset():
+        console.print(
+            "[yellow]no config yet — type `config` to set up your vast.ai keys, "
+            "vllm key, and model[/]"
+        )
     while True:
         try:
             line = session.prompt("michael> ").strip()
