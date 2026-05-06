@@ -779,6 +779,17 @@ def _action_log_lines(project: Project) -> list[str]:
         elif t == "tool.rejected":
             n += 1
             out.append(f"[{n}] {p.get('summary', t)}  [REJECTED BY USER]")
+        elif t == "tool.verify_failed":
+            n += 1
+            rc = p.get("verify_rc", "?")
+            out.append(
+                f"[{n}] {p.get('summary', t)}  [VERIFY FAILED rc={rc}, user not prompted]"
+            )
+        elif t == "tool.undone":
+            n += 1
+            out.append(
+                f"[{n}] undone: {p.get('tool', '?')} ({p.get('trash_id', '?')})"
+            )
     return out
 
 
@@ -836,15 +847,38 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Overwrite (or create) a file in the project workspace. "
-                "Path is relative to the project root. Parent dirs are created. "
-                "Requires user confirmation."
+                "Overwrite (or create) a file in the project workspace. Path is "
+                "relative to the project root; parent dirs are created. "
+                "The change is applied to a staging copy of the project first. "
+                "If `verify` is provided, it runs in the staging copy after the "
+                "write; verify failures (non-zero exit) are reported back to "
+                "you and the user is NOT prompted — fix and try again. "
+                "If verify passes (or is omitted), the user is shown the diff, "
+                "the file-system delta, and the verify output, and is asked to "
+                "confirm before the change is committed to the real workspace."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path relative to project root."},
                     "content": {"type": "string", "description": "Full file content."},
+                    "expected_changes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional list of project-relative paths you expect to "
+                            "change. Michael flags any mismatch (extra/missing files) "
+                            "in the user preview."
+                        ),
+                    },
+                    "verify": {
+                        "type": "string",
+                        "description": (
+                            "Optional shell command run in the staging copy after "
+                            "applying the write. Exit 0 = pass; non-zero = fail "
+                            "and the user is not bothered."
+                        ),
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -879,13 +913,27 @@ TOOLS: list[dict[str, Any]] = [
             "name": "apply_patch",
             "description": (
                 "Apply a unified diff to a file in the project workspace. "
-                "Requires user confirmation."
+                "Goes through the same staging + verify + user-confirm flow as "
+                "write_file."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "unified_diff": {"type": "string"},
+                    "expected_changes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: paths you expect to change.",
+                    },
+                    "verify": {
+                        "type": "string",
+                        "description": (
+                            "Optional shell command run in staging after the patch "
+                            "applies. rc 0 = pass; non-zero hides the result from "
+                            "the user and reports back to you for retry."
+                        ),
+                    },
                 },
                 "required": ["path", "unified_diff"],
             },
@@ -963,20 +1011,263 @@ def _format_proc_result(cp: subprocess.CompletedProcess) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Staging + trash helpers (verify-before-apply)
+# ---------------------------------------------------------------------------
+
+
+def _stage_ignore(directory: str, contents: list[str]) -> list[str]:
+    """copytree filter: skip dotted dirs and SKIP_DIRS during staging."""
+    out: list[str] = []
+    for c in contents:
+        p = pathlib.Path(directory) / c
+        if p.is_dir() and (c.startswith(".") or c in SKIP_DIRS):
+            out.append(c)
+    return out
+
+
+def _stage_project(project: Project) -> pathlib.Path:
+    """Copy the project root into a fresh /tmp dir and return the staging root."""
+    src = pathlib.Path(project.path).resolve()
+    if not src.is_dir():
+        raise MichaelError(f"project root does not exist: {src}")
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-", dir="/tmp"))
+    dst = parent / src.name
+    shutil.copytree(src, dst, ignore=_stage_ignore, symlinks=False)
+    return dst
+
+
+def _file_hashes(root: pathlib.Path) -> dict[str, str]:
+    """sha256 of every regular file under root, keyed by project-relative path.
+    Skips dotted dirs and SKIP_DIRS to keep the diff tractable."""
+    out: dict[str, str] = {}
+    root = root.resolve()
+    if not root.is_dir():
+        return out
+    for dp, dirs, files in os.walk(root):
+        dp_path = pathlib.Path(dp)
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+        for fn in files:
+            fp = dp_path / fn
+            try:
+                data = fp.read_bytes()
+            except OSError:
+                continue
+            rel = str(fp.relative_to(root))
+            out[rel] = hashlib.sha256(data).hexdigest()
+    return out
+
+
+def _diff_hashes(before: dict[str, str], after: dict[str, str]) -> dict[str, list[str]]:
+    added = sorted(p for p in after if p not in before)
+    removed = sorted(p for p in before if p not in after)
+    modified = sorted(p for p in after if p in before and after[p] != before[p])
+    return {"added": added, "removed": removed, "modified": modified}
+
+
+def _check_expected(expected: list[str], delta: dict[str, list[str]]) -> str:
+    """Return a human-readable mismatch description, or '' if delta matches."""
+    actual = set(delta["added"]) | set(delta["modified"]) | set(delta["removed"])
+    expected_set = set(expected)
+    extra = sorted(actual - expected_set)
+    missing = sorted(expected_set - actual)
+    if not extra and not missing:
+        return ""
+    parts: list[str] = []
+    if extra:
+        parts.append(f"extra={extra}")
+    if missing:
+        parts.append(f"missing={missing}")
+    return "; ".join(parts)
+
+
+def _run_verify(cmd: str, cwd: pathlib.Path, *, timeout_s: int = 60) -> tuple[int, str]:
+    """Run `cmd` in `cwd` and return (rc, captured_output_truncated)."""
+    try:
+        cp = subprocess.run(
+            ["bash", "-c", cmd],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "")[-1000:] if isinstance(e.stdout, str) else ""
+        errs = (e.stderr or "")[-500:] if isinstance(e.stderr, str) else ""
+        return 124, f"verify timed out after {timeout_s}s\nstdout:\n{out}\nstderr:\n{errs}"
+    out = ""
+    if cp.stdout:
+        out += f"stdout (truncated):\n{cp.stdout[-1500:]}\n"
+    if cp.stderr:
+        out += f"stderr (truncated):\n{cp.stderr[-500:]}"
+    return cp.returncode, out
+
+
+def _apply_in_staging(name: str, args: dict[str, Any], stage_root: pathlib.Path) -> None:
+    """Apply write_file or apply_patch inside the staging root.
+    Path-escape checks resolve against stage_root, mirroring the real-workspace check."""
+    rel = str(args.get("path", ""))
+    target = (stage_root / rel).resolve()
+    try:
+        target.relative_to(stage_root.resolve())
+    except ValueError as e:
+        raise MichaelError(f"path escapes project root: {rel}") from e
+
+    if name == "write_file":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(args["content"]))
+        return
+
+    if name == "apply_patch":
+        if not target.is_file():
+            raise MichaelError(f"apply_patch target does not exist: {rel}")
+        if not shutil.which("patch"):
+            raise MichaelError("`patch` not installed on host (apt install patch)")
+        diff = str(args["unified_diff"])
+        cp = subprocess.run(
+            ["patch", "--no-backup-if-mismatch", "-u", str(target)],
+            input=diff,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if cp.returncode != 0:
+            raise MichaelError(
+                f"patch failed in staging (rc={cp.returncode}): "
+                f"{(cp.stderr or '')[-500:]}"
+            )
+        return
+
+    raise MichaelError(f"_apply_in_staging: unknown tool {name}")
+
+
+def _save_trash(
+    project: Project,
+    op_name: str,
+    args: dict[str, Any],
+    delta: dict[str, list[str]],
+    real_root: pathlib.Path,
+    *,
+    verify_rc: Optional[int],
+) -> str:
+    """Snapshot the pre-change content of every modified+removed file so undo can restore it.
+    Added files have no `before/` entry — undo deletes them by path."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    trash_id = f"{ts}-{uuid.uuid4().hex[:6]}"
+    trash_dir = PROJECTS_DIR / project.slug / "trash" / trash_id
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    before_dir = trash_dir / "before"
+    before_dir.mkdir(exist_ok=True)
+    for rel in delta["modified"] + delta["removed"]:
+        src = real_root / rel
+        if not src.is_file():
+            continue
+        dst = before_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, dst)
+        except OSError:
+            continue
+    metadata = {
+        "trash_id": trash_id,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tool": op_name,
+        "summary": _summary_for(op_name, args),
+        "args": args,
+        "delta": delta,
+        "verify_rc": verify_rc,
+    }
+    (trash_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True)
+    )
+    return trash_id
+
+
+def _sync_to_real(stage_root: pathlib.Path, real_root: pathlib.Path, delta: dict[str, list[str]]) -> None:
+    """Copy added/modified files from staging to real workspace; delete removed."""
+    for rel in delta["added"] + delta["modified"]:
+        src = stage_root / rel
+        dst = real_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    for rel in delta["removed"]:
+        dst = real_root / rel
+        if dst.is_file():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+
+
+def _list_trash(project: Project) -> list[dict[str, Any]]:
+    trash_root = PROJECTS_DIR / project.slug / "trash"
+    if not trash_root.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for d in sorted(trash_root.iterdir()):
+        if not d.is_dir():
+            continue
+        meta = d / "metadata.json"
+        if not meta.is_file():
+            continue
+        try:
+            out.append(json.loads(meta.read_text()))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _undo_one(project: Project, trash_id: Optional[str] = None) -> dict[str, Any]:
+    """Restore the most recent (or named) trash entry. Returns its metadata."""
+    trash_root = PROJECTS_DIR / project.slug / "trash"
+    if not trash_root.is_dir():
+        raise MichaelError("no trash entries to undo")
+    entries = sorted([d for d in trash_root.iterdir() if d.is_dir()])
+    if not entries:
+        raise MichaelError("no trash entries to undo")
+    if trash_id:
+        target = trash_root / trash_id
+        if not target.is_dir():
+            raise MichaelError(f"unknown trash id: {trash_id}")
+    else:
+        target = entries[-1]
+    metadata = json.loads((target / "metadata.json").read_text())
+    delta = metadata.get("delta", {}) or {}
+    real_root = pathlib.Path(project.path).resolve()
+    # Restore modified + removed from snapshot.
+    for rel in delta.get("modified", []) + delta.get("removed", []):
+        src = target / "before" / rel
+        if not src.is_file():
+            continue
+        dst = real_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    # Delete files that were added by this op.
+    for rel in delta.get("added", []):
+        dst = real_root / rel
+        if dst.is_file():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+    shutil.rmtree(target, ignore_errors=True)
+    return metadata
+
+
+# ---------------------------------------------------------------------------
+# Tool execution (read/list/run paths; write_file & apply_patch go through
+# execute_with_staging instead).
+# ---------------------------------------------------------------------------
+
+
 def execute_tool(
     name: str,
     args: dict[str, Any],
     project: Project,
     cfg: Config,
 ) -> str:
-    if name == "write_file":
-        target = _resolve_in_project(project, str(args["path"]))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        content = str(args["content"])
-        target.write_text(content)
-        h = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
-        return f"ok; path={args['path']}; sha256={h}; size={len(content)}"
-
     if name == "read_file":
         target = _resolve_in_project(project, str(args["path"]))
         if not target.is_file():
@@ -1002,19 +1293,6 @@ def execute_tool(
             kind = "dir" if child.is_dir() else "file"
             rows.append(f"{kind}\t{child.name}\t{size}")
         return "\n".join(rows) or "(empty)"
-
-    if name == "apply_patch":
-        target = _resolve_in_project(project, str(args["path"]))
-        if not shutil.which("patch"):
-            return "error: `patch` not installed on host (apt install patch)"
-        diff = str(args["unified_diff"])
-        cp = subprocess.run(
-            ["patch", "--no-backup-if-mismatch", "-u", str(target)],
-            input=diff, capture_output=True, text=True, timeout=30, check=False,
-        )
-        if cp.returncode != 0:
-            return f"patch failed (rc={cp.returncode}): {(cp.stderr or '')[-500:]}"
-        return f"ok; patched {target.relative_to(pathlib.Path(project.path).resolve())}"
 
     if name == "run_in_sandbox":
         cp = run_sandbox(
@@ -1046,7 +1324,267 @@ def execute_tool(
 
 
 # ---------------------------------------------------------------------------
-# Y/n/Edit confirmation for tool calls
+# Verify-before-apply flow (write_file, apply_patch)
+# ---------------------------------------------------------------------------
+
+
+def _format_delta(delta: dict[str, list[str]]) -> str:
+    parts: list[str] = [
+        f"files added:    {len(delta['added'])}",
+        f"files modified: {len(delta['modified'])}",
+        f"files removed:  {len(delta['removed'])}",
+    ]
+    if delta["added"]:
+        parts.append("  + " + "\n  + ".join(delta["added"]))
+    if delta["modified"]:
+        parts.append("  ~ " + "\n  ~ ".join(delta["modified"]))
+    if delta["removed"]:
+        parts.append("  - " + "\n  - ".join(delta["removed"]))
+    return "\n".join(parts)
+
+
+def _format_staging_preview(
+    name: str,
+    args: dict[str, Any],
+    project: Project,
+    delta: dict[str, list[str]],
+    verify_rc: Optional[int],
+    verify_out: str,
+    mismatch: str,
+) -> str:
+    sections: list[str] = []
+
+    # Section 1: the proposed change itself
+    if name == "write_file":
+        try:
+            real_target = _resolve_in_project(project, str(args["path"]))
+            old = real_target.read_text(errors="replace") if real_target.is_file() else ""
+        except MichaelError:
+            old = ""
+        diff = "".join(difflib.unified_diff(
+            old.splitlines(keepends=True),
+            str(args["content"]).splitlines(keepends=True),
+            fromfile=f"a/{args.get('path', '?')}",
+            tofile=f"b/{args.get('path', '?')}",
+        )) or "(no changes)"
+        sections.append(diff)
+    elif name == "apply_patch":
+        sections.append(
+            f"patch target: {args.get('path', '?')}\n\n"
+            f"{args.get('unified_diff', '')}"
+        )
+
+    sections.append("─── staging preview ───")
+    sections.append(_format_delta(delta))
+
+    if verify_rc is not None:
+        sections.append("")
+        sections.append(f"verify: rc={verify_rc}")
+        if verify_out:
+            sections.append(verify_out[-800:])
+
+    if mismatch:
+        sections.append("")
+        sections.append(f"⚠ expected_changes mismatch: {mismatch}")
+
+    return "\n\n".join(sections)
+
+
+def execute_with_staging(
+    name: str,
+    args: dict[str, Any],
+    project: Project,
+    cfg: Config,
+) -> str:
+    """Stage the project, apply the change, optionally verify, then prompt the
+    user. On user-yes, snapshot pre-change content into trash and sync staged
+    files back to the real workspace.
+
+    Returns the result string handed to the LLM as a tool message. Verify
+    failures and rejections are reported to the LLM, *not* the user."""
+    real_root = pathlib.Path(project.path).resolve()
+    while True:
+        stage_root: Optional[pathlib.Path] = None
+        try:
+            try:
+                stage_root = _stage_project(project)
+            except MichaelError as e:
+                return f"error: staging failed: {e}"
+
+            before = _file_hashes(stage_root)
+            try:
+                _apply_in_staging(name, args, stage_root)
+            except MichaelError as e:
+                return f"error applying in staging: {e}"
+            after = _file_hashes(stage_root)
+            delta = _diff_hashes(before, after)
+
+            verify_rc: Optional[int] = None
+            verify_out = ""
+            verify_cmd = args.get("verify")
+            if isinstance(verify_cmd, str) and verify_cmd.strip():
+                verify_rc, verify_out = _run_verify(
+                    verify_cmd, stage_root, timeout_s=60
+                )
+                if verify_rc != 0:
+                    append_event(
+                        "tool.verify_failed",
+                        {
+                            "tool": name,
+                            "summary": _summary_for(name, args),
+                            "verify_cmd": verify_cmd,
+                            "verify_rc": verify_rc,
+                            "delta": delta,
+                        },
+                        project=project,
+                    )
+                    return (
+                        f"verify failed in staging (rc={verify_rc}); the user "
+                        f"was NOT prompted.\n"
+                        f"delta: {delta}\n"
+                        f"verify output:\n{verify_out[-1500:]}"
+                    )
+
+            mismatch = ""
+            expected = args.get("expected_changes")
+            if isinstance(expected, list) and expected:
+                mismatch = _check_expected([str(x) for x in expected], delta)
+
+            preview_text = _format_staging_preview(
+                name, args, project, delta, verify_rc, verify_out, mismatch
+            )
+            console.print(
+                Panel(
+                    Syntax(preview_text, "diff", theme="ansi_dark", word_wrap=True),
+                    title=f"[cyan]propose[/] {name}",
+                    border_style="cyan",
+                )
+            )
+
+            try:
+                choice = (typer.prompt(
+                    "Apply? [Y]es / [n]o / [e]dit", default="y"
+                ) or "").strip().lower()
+            except (KeyboardInterrupt, typer.Abort):
+                choice = "n"
+
+            if choice in ("", "y", "yes"):
+                trash_id = _save_trash(
+                    project, name, args, delta, real_root, verify_rc=verify_rc
+                )
+                _sync_to_real(stage_root, real_root, delta)
+                first = (
+                    f"applied; trash_id={trash_id}; "
+                    f"+{len(delta['added'])} ~{len(delta['modified'])} "
+                    f"-{len(delta['removed'])}"
+                )
+                if verify_rc is not None:
+                    first += f"; verify_rc={verify_rc}"
+                append_event(
+                    "tool.executed",
+                    {
+                        "tool": name,
+                        "args": args,
+                        "summary": f"{_summary_for(name, args)} → {first}"[:240],
+                        "trash_id": trash_id,
+                        "delta": delta,
+                        "verify_rc": verify_rc,
+                    },
+                    project=project,
+                )
+                return first
+            if choice in ("n", "no"):
+                append_event(
+                    "tool.rejected",
+                    {
+                        "tool": name,
+                        "args": args,
+                        "summary": _summary_for(name, args),
+                        "delta": delta,
+                        "verify_rc": verify_rc,
+                    },
+                    project=project,
+                )
+                return "[user rejected this tool call]"
+            if choice in ("e", "edit"):
+                edited = _edit_args(name, args)
+                if edited is None:
+                    err.print("editor returned no content; try again")
+                    continue
+                args = edited
+                continue
+            err.print(f"unknown choice: {choice!r}")
+            continue
+        finally:
+            if stage_root is not None:
+                shutil.rmtree(stage_root.parent, ignore_errors=True)
+
+
+def dispatch_tool_call(
+    name: str,
+    args: dict[str, Any],
+    project: Project,
+    cfg: Config,
+) -> str:
+    """Single entry point for the agent loop. Routes to the right execution
+    path, handles user confirmation where needed, and emits the tool.* events.
+    Returns the result string the LLM will see as a tool message."""
+    summary = _summary_for(name, args)
+
+    if name in AUTO_EXEC_TOOLS:
+        try:
+            result = execute_tool(name, args, project, cfg)
+        except MichaelError as e:
+            result = f"error: {e}"
+        first = (result.splitlines()[0] if result else "ok")[:120]
+        append_event(
+            "tool.executed",
+            {
+                "tool": name,
+                "args": args,
+                "summary": f"{summary} → {first}",
+                "result_chars": len(result),
+            },
+            project=project,
+        )
+        return result
+
+    if name in ("write_file", "apply_patch"):
+        return execute_with_staging(name, args, project, cfg)
+
+    # run_in_sandbox, run_shell — confirm, then execute.
+    try:
+        decision, final_args = confirm_tool_call(name, args, project)
+    except (KeyboardInterrupt, typer.Abort):
+        decision, final_args = "no", args
+    if decision == "no":
+        append_event(
+            "tool.rejected",
+            {"tool": name, "args": args, "summary": summary},
+            project=project,
+        )
+        return "[user rejected this tool call]"
+    try:
+        result = execute_tool(name, final_args, project, cfg)
+    except MichaelError as e:
+        result = f"error: {e}"
+    first = (result.splitlines()[0] if result else "ok")[:120]
+    append_event(
+        "tool.executed",
+        {
+            "tool": name,
+            "args": final_args,
+            "summary": f"{_summary_for(name, final_args)} → {first}",
+            "result_chars": len(result),
+        },
+        project=project,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Y/n/Edit confirmation for tool calls (run_in_sandbox, run_shell only;
+# write_file & apply_patch run their own preview inside execute_with_staging)
 # ---------------------------------------------------------------------------
 
 
@@ -1377,39 +1915,7 @@ def cmd_run() -> None:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-
-                if name in AUTO_EXEC_TOOLS:
-                    decision, final_args = "yes", args
-                else:
-                    try:
-                        decision, final_args = confirm_tool_call(name, args, project)
-                    except (KeyboardInterrupt, typer.Abort):
-                        decision, final_args = "no", args
-
-                if decision == "no":
-                    result = "[user rejected this tool call]"
-                    append_event(
-                        "tool.rejected",
-                        {"tool": name, "args": args, "summary": _summary_for(name, args)},
-                        project=project,
-                    )
-                else:
-                    try:
-                        result = execute_tool(name, final_args, project, cfg)
-                    except MichaelError as e:
-                        result = f"error: {e}"
-                    first_line = (result.splitlines()[0] if result else "ok")[:120]
-                    append_event(
-                        "tool.executed",
-                        {
-                            "tool": name,
-                            "args": final_args,
-                            "summary": f"{_summary_for(name, final_args)} → {first_line}",
-                            "result_chars": len(result),
-                        },
-                        project=project,
-                    )
-
+                result = dispatch_tool_call(name, args, project, cfg)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -1450,6 +1956,56 @@ def cmd_log(tail: int) -> None:
             payload,
         )
     console.print(table)
+
+
+def cmd_undo(list_only: bool = False, trash_id: Optional[str] = None) -> None:
+    project = require_active_project()
+    if list_only:
+        entries = _list_trash(project)
+        if not entries:
+            console.print("(no trash)")
+            return
+        table = Table(
+            title=f"trash for {project.slug} (newest last)",
+            border_style="cyan",
+        )
+        table.add_column("trash_id", style="bold")
+        table.add_column("ts")
+        table.add_column("tool")
+        table.add_column("delta")
+        table.add_column("verify")
+        for m in entries:
+            d = m.get("delta", {}) or {}
+            delta_summary = (
+                f"+{len(d.get('added', []))} "
+                f"~{len(d.get('modified', []))} "
+                f"-{len(d.get('removed', []))}"
+            )
+            v = m.get("verify_rc")
+            v_str = "—" if v is None else f"rc={v}"
+            table.add_row(
+                str(m.get("trash_id", "?")),
+                str(m.get("ts", "?")),
+                str(m.get("tool", "?")),
+                delta_summary,
+                v_str,
+            )
+        console.print(table)
+        return
+    metadata = _undo_one(project, trash_id)
+    append_event(
+        "tool.undone",
+        {
+            "trash_id": metadata.get("trash_id"),
+            "tool": metadata.get("tool"),
+            "summary": metadata.get("summary", ""),
+        },
+        project=project,
+    )
+    console.print(
+        f"[green]undone[/] {metadata.get('tool')} "
+        f"({metadata.get('trash_id')})"
+    )
 
 
 def cmd_sandbox(file: pathlib.Path, net: bool = False, timeout: int = 30) -> None:
@@ -1563,6 +2119,15 @@ def sandbox_cmd(
     sys.exit(0)
 
 
+@app.command(name="undo")
+def undo_cmd(
+    list_only: bool = typer.Option(False, "--list", "-l", help="List trash entries instead of popping."),
+    trash_id: Optional[str] = typer.Argument(None, help="Specific trash id to undo."),
+) -> None:
+    """Restore the most recent (or named) staged change. `undo --list` to inspect."""
+    cmd_undo(list_only=list_only, trash_id=trash_id)
+
+
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
@@ -1571,7 +2136,7 @@ def sandbox_cmd(
 REPL_COMMANDS = {
     "show", "new", "use", "current", "config",
     "up", "down", "status",
-    "ask", "run", "log", "sandbox",
+    "ask", "run", "log", "sandbox", "undo",
     "quit", "exit", "help",
 }
 
@@ -1728,6 +2293,11 @@ def dispatch_repl(line: str) -> None:
             err.print("usage: sandbox <file>")
             return
         cmd_sandbox(pathlib.Path(rest[0]))
+    elif cmd == "undo":
+        list_only = "--list" in rest or "-l" in rest
+        positional = [r for r in rest if r not in ("--list", "-l")]
+        target = positional[0] if positional else None
+        cmd_undo(list_only=list_only, trash_id=target)
     else:
         err.print(f"unknown command: {cmd!r}. try 'help'.")
 
