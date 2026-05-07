@@ -27,7 +27,7 @@ REPL commands (also work as `michael <cmd>` one-shot):
     new project [name]            create a new project
     new code [--model P]          fresh agent loop, code mode (full toolset)
     new discussion [--model P]    fresh agent loop, read-only chat
-    nitro [--model P]             fresh agent loop on the heavy model
+    nitro [--model P] [--god]     fresh agent loop on the heavy model; --god for God mode
     use <slug>                    switch active project
     current                       print the active project
     config                        open ~/.michael/config.json in $EDITOR
@@ -108,7 +108,7 @@ SKIP_DIRS = {
     "target", ".cache",
 }
 
-AUTO_EXEC_TOOLS = {"read_file", "list_dir"}
+AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory"}
 
 
 class MichaelError(RuntimeError):
@@ -119,6 +119,15 @@ class MichaelError(RuntimeError):
 # Hardcoded by design: one symbol, one source of truth, used by both the
 # protocol text the LLM reads and the parser that gates user-presentation.
 JA_PASSPHRASE = "Ja"
+
+# God-mode prompt — the only input the heavy model ever receives in --god.
+# No user text, no approval gate: Michael auto-commits whatever the LLM proposes.
+_GOD_MODE_PROMPT = (
+    "Assess the full state of this project. "
+    "Burn what is not working. "
+    "Let stand what is righteous. "
+    "Propose your changes."
+)
 
 
 def _message_ends_with_ja(text: str) -> bool:
@@ -273,6 +282,7 @@ def make_stub_config() -> Config:
         default_model="coder",
         vps=VpsConfig(),
         sandbox=SandboxConfig(),
+        log_responses=True,
     )
 
 
@@ -1177,6 +1187,14 @@ _MODE_ADDENDUM: dict[str, str] = {
         "is paying premium GPU time for this turn — be efficient with the "
         "loop, but do not skip estimation or the Ja gate."
     ),
+    "god": (
+        "MODE: god (heavy model, full authority). No user approval gate: when "
+        "you emit the Ja passcode Michael will auto-commit every staged change "
+        "immediately, without asking the user. Authority is fully granted. "
+        "Assess the project in its entirety. Burn what is not working. Let "
+        "stand what is righteous. This is a one-shot session — make it count. "
+        "Do not skip estimation; the staging pipeline still runs."
+    ),
 }
 
 
@@ -1251,6 +1269,7 @@ def build_protocol(mode: str = "code") -> str:
         "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
         "  read_file(path)                                    auto-executes",
         "  list_dir(path='.')                                 auto-executes",
+        "  search_memory(query)                               auto-executes, searches stored LLM responses",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
         "",
@@ -1371,6 +1390,28 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "default": "."}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": (
+                "Search past LLM responses stored in this project's event log for a "
+                "query string (case-insensitive substring match). Returns up to 5 "
+                "matching excerpts with timestamps. Auto-executes — no confirmation "
+                "needed. Only works when log_responses=true in config."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Substring to search for in past assistant responses.",
+                    }
+                },
+                "required": ["query"],
             },
         },
     },
@@ -1714,6 +1755,43 @@ def _undo_one(project: Project, trash_id: Optional[str] = None) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 
+def _search_memory(project: Project, query: str, cfg: Config) -> str:
+    """Full-text search over stored assistant.message events for this project.
+
+    Only works when cfg.log_responses is True (text is saved in the event).
+    Returns up to 5 matching excerpts (first 500 chars each) with timestamps.
+    """
+    if not cfg.log_responses:
+        return (
+            "search_memory: responses are not stored in this installation. "
+            "Set log_responses=true in config and run new sessions to build memory."
+        )
+    query = query.strip()
+    if not query:
+        return "search_memory: query must not be empty"
+    q = query.lower()
+    hits: list[str] = []
+    for ev in iter_events(project.events_path):
+        if ev.get("type") != "assistant.message":
+            continue
+        payload = ev.get("payload") or {}
+        text = payload.get("text") or ""
+        if not text or q not in text.lower():
+            continue
+        ts = ev.get("ts", "?")
+        turn = payload.get("turn", "?")
+        excerpt = text[:500] + ("…" if len(text) > 500 else "")
+        hits.append(f"[{ts} turn={turn}]\n{excerpt}")
+        if len(hits) >= 5:
+            break
+    if not hits:
+        return f"search_memory: no matches for {query!r} in this project's history"
+    return (
+        f"search_memory: {len(hits)} match(es) for {query!r}\n\n"
+        + "\n\n---\n\n".join(hits)
+    )
+
+
 def execute_tool(
     name: str,
     args: dict[str, Any],
@@ -1771,6 +1849,9 @@ def execute_tool(
         except subprocess.TimeoutExpired as e:
             return f"timed out after {timeout_s}s; partial stdout:\n{(e.stdout or '')[-1000:]}"
         return _format_proc_result(cp)
+
+    if name == "search_memory":
+        return _search_memory(project, str(args.get("query", "")), cfg)
 
     return f"error: unknown tool {name}"
 
@@ -2581,6 +2662,7 @@ def _run_agent_loop(
     mode: str,
     *,
     verb_label: str,
+    god_mode: bool = False,
 ) -> None:
     """Shared agent-loop body for `run`, `new code`, `new discussion`, `nitro`.
 
@@ -2617,13 +2699,16 @@ def _run_agent_loop(
     )
 
     while True:
-        try:
-            user = session.prompt(">>> ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        user = (user or "").strip()
-        if not user or user.lower() in ("quit", "exit"):
-            break
+        if god_mode:
+            user = _GOD_MODE_PROMPT
+        else:
+            try:
+                user = session.prompt(">>> ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            user = (user or "").strip()
+            if not user or user.lower() in ("quit", "exit"):
+                break
 
         append_event(
             "prompt.sent",
@@ -2755,35 +2840,52 @@ def _run_agent_loop(
                 project=project,
             )
             pending.discard()
+            if god_mode:
+                break
             continue
 
         if not ja_received:
             # LLM error or non-Ja exit — discard staging, bail out.
             pending.discard()
+            if god_mode:
+                break
             continue
 
-        # Ja received. Show the user the pending product and ask one y/n.
-        approved = _present_pending_to_user(project, pending, content)
-        if approved:
-            summaries = commit_pending(project, pending)
-            if summaries:
+        # Ja received.
+        if god_mode:
+            # Auto-commit: no user gate.
+            if content:
                 console.print(
-                    f"[green]applied[/] {len(summaries)} change(s)"
+                    Panel(content, title="⚡ god — Ja", border_style="yellow")
                 )
+            if pending.change_log:
+                summaries = commit_pending(project, pending)
+                for s in summaries:
+                    console.print(f"[green]auto-applied[/] {s['summary']}")
+            break
         else:
-            for entry in pending.change_log:
-                append_event(
-                    "tool.rejected",
-                    {
-                        "tool": entry["tool"],
-                        "args": entry["args"],
-                        "summary": _summary_for(entry["tool"], entry["args"]),
-                        "delta": entry["delta"],
-                    },
-                    project=project,
-                )
-            pending.discard()
-            console.print("[yellow]rejected[/] pending changes discarded")
+            # Normal: show the user the pending product and ask one y/n.
+            approved = _present_pending_to_user(project, pending, content)
+            if approved:
+                summaries = commit_pending(project, pending)
+                if summaries:
+                    console.print(
+                        f"[green]applied[/] {len(summaries)} change(s)"
+                    )
+            else:
+                for entry in pending.change_log:
+                    append_event(
+                        "tool.rejected",
+                        {
+                            "tool": entry["tool"],
+                            "args": entry["args"],
+                            "summary": _summary_for(entry["tool"], entry["args"]),
+                            "delta": entry["delta"],
+                        },
+                        project=project,
+                    )
+                pending.discard()
+                console.print("[yellow]rejected[/] pending changes discarded")
 
 
 def cmd_run(model: Optional[str]) -> None:
@@ -2814,18 +2916,27 @@ def cmd_new_discussion(model: Optional[str]) -> None:
     )
 
 
-def cmd_nitro(model: Optional[str]) -> None:
-    """Fresh agent loop on the heavy model — same contract as code mode."""
+def cmd_nitro(model: Optional[str], god: bool = False) -> None:
+    """Fresh agent loop on the heavy model. Pass god=True for God mode."""
     project = require_active_project()
     cfg = Config.load()
     name, profile = _resolve_nitro_model(cfg, model or None)
-    console.print(
-        f"[bold yellow]⚡ nitro engaged[/] [dim]heavy model `{name}` — "
-        f"cold-start may take a few minutes; stop with `down --model {name}` "
-        "when finished[/]"
-    )
+    if god:
+        console.print(
+            f"[bold yellow]⚡ god mode[/] [dim]heavy model `{name}` — "
+            "hardcoded prompt, no approval gate; changes auto-apply on Ja[/]"
+        )
+    else:
+        console.print(
+            f"[bold yellow]⚡ nitro engaged[/] [dim]heavy model `{name}` — "
+            f"cold-start may take a few minutes; stop with `down --model {name}` "
+            "when finished[/]"
+        )
     _run_agent_loop(
-        project, cfg, name, profile, mode="nitro", verb_label="nitro"
+        project, cfg, name, profile,
+        mode="god" if god else "nitro",
+        verb_label="nitro --god" if god else "nitro",
+        god_mode=god,
     )
 
 
@@ -3006,9 +3117,13 @@ def nitro_cmd(
         "", "--model", "-m",
         help="Override the heavy-model profile (defaults to 'nitro' then 'big').",
     ),
+    god: bool = typer.Option(
+        False, "--god",
+        help="God mode: hardcoded prompt, changes auto-apply on Ja (no approval gate).",
+    ),
 ) -> None:
     """Fresh agent loop on the heavy model (cold-start aware)."""
-    cmd_nitro(model or None)
+    cmd_nitro(model or None, god=god)
 
 
 @app.command(name="use")
@@ -3135,6 +3250,7 @@ class MichaelCompleter(Completer):
     LOG_FLAGS = ("--tail", "-n")
     UP_FLAGS = ("--model", "-m")
     DOWN_FLAGS = ("--model", "-m")
+    NITRO_FLAGS = ("--model", "-m", "--god")
     UNDO_FLAGS = ("--list", "-l")
 
     def get_completions(self, document: Document, complete_event):
@@ -3171,9 +3287,15 @@ class MichaelCompleter(Completer):
                 if f.startswith(prefix):
                     yield Completion(f, start_position=-len(prefix))
             return
-        if head in ("up", "down", "run", "ask", "nitro"):
+        if head in ("up", "down", "run", "ask"):
             prefix = words[-1] if not at_boundary else ""
             for f in self.UP_FLAGS:
+                if f.startswith(prefix):
+                    yield Completion(f, start_position=-len(prefix))
+            return
+        if head == "nitro":
+            prefix = words[-1] if not at_boundary else ""
+            for f in self.NITRO_FLAGS:
                 if f.startswith(prefix):
                     yield Completion(f, start_position=-len(prefix))
             return
@@ -3291,7 +3413,10 @@ def dispatch_repl(line: str) -> None:
     elif cmd == "run":
         cmd_run(_opt_value(rest, "--model", "-m"))
     elif cmd == "nitro":
-        cmd_nitro(_opt_value(rest, "--model", "-m"))
+        cmd_nitro(
+            _opt_value(rest, "--model", "-m"),
+            god="--god" in rest,
+        )
     elif cmd == "log":
         n = 20
         if (v := _opt_value(rest, "--tail", "-n")) is not None:
