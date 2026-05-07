@@ -56,7 +56,7 @@ Unattended-Upgrade::Allowed-Origins {
     "${distro_id}ESM:${distro_codename}-infra-security";
     "${distro_id}:${distro_codename}-updates";
 };
-Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF

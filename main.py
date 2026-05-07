@@ -2433,25 +2433,33 @@ def cmd_up(model: Optional[str]) -> None:
         )
         console.print(f"[cyan]starting {name} (instance {profile.vast_instance_id})…[/]")
         endpoint: Optional[str] = None
-        for i in range(30):
-            time.sleep(cfg.boot_poll_s)
+        _max_wait_s = 600  # 10 minutes total
+        _poll_s = max(cfg.boot_poll_s, 10)
+        _elapsed = 0
+        _attempt = 0
+        while _elapsed < _max_wait_s:
+            time.sleep(_poll_s)
+            _elapsed += _poll_s
+            _attempt += 1
             try:
                 ep = vast.endpoint_for(profile.vast_instance_id, profile.vllm_internal_port)
             except MichaelError:
                 ep = None
             append_event(
                 "instance.poll",
-                {"i": i + 1, "model": name, "endpoint_known": bool(ep)},
+                {"i": _attempt, "model": name, "endpoint_known": bool(ep), "elapsed_s": _elapsed},
             )
             if not ep:
-                console.print(f"[dim]· poll {i + 1}: no endpoint yet[/]")
-                continue
-            if _ping_vllm(ep, profile.vllm_api_key, timeout_s=10.0):
+                console.print(f"[dim]· poll {_attempt} ({_elapsed}s elapsed): no endpoint yet[/]")
+            elif _ping_vllm(ep, profile.vllm_api_key, timeout_s=10.0):
                 endpoint = ep
                 break
-            console.print(f"[dim]· poll {i + 1}: endpoint {ep} not ready[/]")
+            else:
+                console.print(f"[dim]· poll {_attempt} ({_elapsed}s elapsed): endpoint {ep} not ready[/]")
+            # exponential backoff: 10s → 20s → 40s → 60s (capped)
+            _poll_s = min(_poll_s * 2, 60)
         if not endpoint:
-            raise MichaelError("instance did not become ready within poll budget")
+            raise MichaelError(f"instance did not become ready within {_max_wait_s}s")
         append_event("endpoint.discovered", {"endpoint": endpoint, "model": name})
         append_event(
             "instance.started",
