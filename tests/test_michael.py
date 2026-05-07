@@ -314,15 +314,6 @@ def test_tools_for_mode_code_and_nitro_are_full():
     assert nitro_names == full
 
 
-def test_protocol_for_mode_branches_distinct():
-    code = m._protocol_for_mode("code")
-    discussion = m._protocol_for_mode("discussion")
-    nitro = m._protocol_for_mode("nitro")
-    assert "code" in code.lower() and "expected_changes" in code
-    assert "read-only" in discussion or "read_file" in discussion
-    assert "nitro" in nitro.lower() and "heavy" in nitro.lower()
-
-
 def test_resolve_nitro_prefers_nitro_then_big_then_errors(home):
     cfg = m.Config(models={"coder": m.ModelProfile()})
     with pytest.raises(m.MichaelError):
@@ -368,28 +359,29 @@ def test_apply_patch_schema_requires_expected_changes():
     assert "expected_changes" in required
 
 
-# ---- predicted-delta gate ------------------------------------------------
+# ---- predicted-delta gate (review reporter, not auto-reject) ------------
 
 def test_execute_with_staging_missing_expected_returns_error_to_llm(home, workspace):
     p = m.create_project("x", workspace)
     cfg = m.Config()
+    pending = m.PendingChanges()
     result = m.execute_with_staging(
         "write_file",
         {"path": "src/bar.py", "content": "y = 2\n"},
-        p, cfg,
+        p, cfg, pending,
     )
     assert result.startswith("error: expected_changes is required")
-    # The user's workspace must be untouched.
     assert not (workspace / "src" / "bar.py").exists()
-    # An audit event should have been logged.
+    assert pending.stage_root is None
     events = m.iter_events(p.events_path)
     types = [e.get("type") for e in events]
     assert "tool.delta_missing" in types
 
 
-def test_execute_with_staging_mismatch_returns_error_to_llm(home, workspace):
+def test_execute_with_staging_mismatch_is_review_data_not_rejection(home, workspace):
     p = m.create_project("x", workspace)
     cfg = m.Config()
+    pending = m.PendingChanges()
     # LLM predicts a different file than what the write actually changes.
     result = m.execute_with_staging(
         "write_file",
@@ -398,21 +390,33 @@ def test_execute_with_staging_mismatch_returns_error_to_llm(home, workspace):
             "content": "y = 2\n",
             "expected_changes": ["src/wrong.py"],
         },
-        p, cfg,
+        p, cfg, pending,
     )
-    assert result.startswith("error: predicted-delta mismatch")
-    assert "src/bar.py" in result  # actual delta surfaced
+    # Mismatch is information, not auto-rejection — no error: prefix.
+    assert not result.startswith("error:")
+    assert "predicted:" in result and "actual:" in result
+    assert "src/bar.py" in result
+    # Real workspace untouched; staging holds the change for the LLM to review.
     assert not (workspace / "src" / "bar.py").exists()
+    assert pending.stage_root is not None
+    assert len(pending.change_log) == 1
     events = m.iter_events(p.events_path)
     types = [e.get("type") for e in events]
     assert "tool.delta_mismatch" in types
+    assert "tool.staged" in types
 
 
-def test_execute_with_staging_match_prompts_user_and_applies(home, workspace, monkeypatch):
+def test_execute_with_staging_review_returns_diff_without_prompt(home, workspace, monkeypatch):
+    """A clean prediction match returns review data and stages the change.
+    The user is NOT prompted; commit is deferred to the Ja gate."""
     p = m.create_project("x", workspace)
     cfg = m.Config()
-    # Force the user-confirm prompt to "yes".
-    monkeypatch.setattr(m.typer, "prompt", lambda *a, **k: "y")
+    pending = m.PendingChanges()
+    # If anything tries to prompt the user, fail loudly.
+    monkeypatch.setattr(
+        m.typer, "prompt",
+        lambda *a, **k: pytest.fail("user must not be prompted in review mode"),
+    )
     result = m.execute_with_staging(
         "write_file",
         {
@@ -420,10 +424,120 @@ def test_execute_with_staging_match_prompts_user_and_applies(home, workspace, mo
             "content": "y = 2\n",
             "expected_changes": ["src/bar.py"],
         },
-        p, cfg,
+        p, cfg, pending,
     )
-    assert result.startswith("applied;")
-    assert (workspace / "src" / "bar.py").read_text() == "y = 2\n"
+    assert "predicted:" in result and "actual:" in result
+    assert "match" in result.lower()
+    # Stage holds the file; real workspace does not.
+    assert (pending.stage_root / "src" / "bar.py").read_text() == "y = 2\n"
+    assert not (workspace / "src" / "bar.py").exists()
+    assert len(pending.change_log) == 1
+
+
+def test_pending_changes_accumulates_across_calls(home, workspace):
+    p = m.create_project("x", workspace)
+    cfg = m.Config()
+    pending = m.PendingChanges()
+    r1 = m.execute_with_staging(
+        "write_file",
+        {"path": "src/a.py", "content": "a = 1\n", "expected_changes": ["src/a.py"]},
+        p, cfg, pending,
+    )
+    r2 = m.execute_with_staging(
+        "write_file",
+        {"path": "src/b.py", "content": "b = 2\n", "expected_changes": ["src/b.py"]},
+        p, cfg, pending,
+    )
+    assert "predicted:" in r1 and "predicted:" in r2
+    # One persistent stage_root reused; two entries in the change log.
+    assert pending.stage_root is not None
+    assert len(pending.change_log) == 2
+    # Both files exist in stage; neither in real.
+    assert (pending.stage_root / "src" / "a.py").is_file()
+    assert (pending.stage_root / "src" / "b.py").is_file()
+    assert not (workspace / "src" / "a.py").exists()
+    assert not (workspace / "src" / "b.py").exists()
+
+
+def test_commit_pending_syncs_all_entries_then_discards(home, workspace):
+    p = m.create_project("x", workspace)
+    cfg = m.Config()
+    pending = m.PendingChanges()
+    m.execute_with_staging(
+        "write_file",
+        {"path": "src/a.py", "content": "a = 1\n", "expected_changes": ["src/a.py"]},
+        p, cfg, pending,
+    )
+    m.execute_with_staging(
+        "write_file",
+        {"path": "src/b.py", "content": "b = 2\n", "expected_changes": ["src/b.py"]},
+        p, cfg, pending,
+    )
+    summaries = m.commit_pending(p, pending)
+    assert len(summaries) == 2
+    assert (workspace / "src" / "a.py").read_text() == "a = 1\n"
+    assert (workspace / "src" / "b.py").read_text() == "b = 2\n"
+    # Stage is discarded after commit.
+    assert pending.stage_root is None
+    assert pending.change_log == []
+    events = m.iter_events(p.events_path)
+    types = [e.get("type") for e in events]
+    assert types.count("tool.executed") == 2
+
+
+# ---- Ja passcode and detector -------------------------------------------
+
+def test_ja_passphrase_constant():
+    assert m.JA_PASSPHRASE == "Ja"
+
+
+def test_ja_detector_recognises_end_of_message():
+    assert m._message_ends_with_ja("thoughts.\nJa")
+    assert m._message_ends_with_ja("thoughts.\nJa\n")
+    assert m._message_ends_with_ja("done with the work. Ja")
+    assert m._message_ends_with_ja("done. Ja.")
+    assert m._message_ends_with_ja("Ja")
+
+
+def test_ja_detector_rejects_mid_sentence_and_other_languages():
+    assert not m._message_ends_with_ja("")
+    assert not m._message_ends_with_ja("Yes")
+    assert not m._message_ends_with_ja("Ja, das ist gut")
+    assert not m._message_ends_with_ja("Ja im Anfang")
+    assert not m._message_ends_with_ja("ja")  # case-sensitive
+
+
+# ---- Header 4 / build_protocol ------------------------------------------
+
+def test_build_protocol_lists_four_headers():
+    text = m.build_protocol("code")
+    for h in ("H1", "H2", "H3", "H4"):
+        assert h in text
+
+
+def test_build_protocol_mentions_ja_passcode_and_no_hands():
+    text = m.build_protocol("code")
+    assert "Ja" in text
+    assert "passcode" in text.lower()
+    assert "no hands" in text.lower() or "NO HANDS" in text
+
+
+def test_build_protocol_mode_addendum_changes():
+    code = m.build_protocol("code")
+    discussion = m.build_protocol("discussion")
+    nitro = m.build_protocol("nitro")
+    assert "MODE: code" in code
+    assert "MODE: discussion" in discussion
+    assert "MODE: nitro" in nitro
+
+
+def test_build_header_includes_protocol(home, workspace):
+    p = m.create_project("x", workspace)
+    pkg = m.build_header(p, "system stub", mode="code")
+    assert "H4: Protocol" in pkg
+    assert "Ja" in pkg
+    # H1/H2/H3 markers are present too.
+    assert "H1:" in pkg and "H2:" in pkg and "H3:" in pkg
 
 
 # ---- REPL surface --------------------------------------------------------

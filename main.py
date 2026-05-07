@@ -109,11 +109,33 @@ SKIP_DIRS = {
 }
 
 AUTO_EXEC_TOOLS = {"read_file", "list_dir"}
-MAX_AGENT_TURNS = 25
 
 
 class MichaelError(RuntimeError):
     """Domain error surfaced to the user with a clean message."""
+
+
+# The literal passcode the LLM emits to surface its product to the user.
+# Hardcoded by design: one symbol, one source of truth, used by both the
+# protocol text the LLM reads and the parser that gates user-presentation.
+JA_PASSPHRASE = "Ja"
+
+
+def _message_ends_with_ja(text: str) -> bool:
+    """True iff the message's trailing token (after stripping whitespace and
+    common terminal punctuation) is the bareword JA_PASSPHRASE — case-sensitive.
+
+    Catches: 'thoughts.\\nJa', 'thoughts.\\nJa\\n', 'thoughts. Ja', 'work. Ja.'
+    Rejects: '', 'Ja, das ist gut' (mid-sentence), 'Yes',
+             'Ja im Anfang' (Ja not at the end).
+    """
+    if not text:
+        return False
+    stripped = text.rstrip().rstrip(".!?;:")
+    if not stripped:
+        return False
+    last_token = stripped.rsplit(None, 1)[-1]
+    return last_token == JA_PASSPHRASE
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -1137,46 +1159,143 @@ def _action_log_lines(project: Project) -> list[str]:
     return out
 
 
-def build_header(project: Project, system_prompt: str) -> str:
-    """Build the system-prompt brief. Called fresh per user prompt."""
+_MODE_ADDENDUM: dict[str, str] = {
+    "code": (
+        "MODE: code. Full toolset. write_file and apply_patch require "
+        "`expected_changes`. Predict, propose, sandbox, review, refine. "
+        "Surface to the user only with the Ja passcode."
+    ),
+    "discussion": (
+        "MODE: discussion. You have read-only tools (read_file, list_dir). "
+        "write_file, apply_patch, run_in_sandbox, and run_shell are NOT "
+        "available — for code changes the user will start a `new code` or "
+        "`nitro` session. End your message with the Ja passcode when you "
+        "are ready for the user to read your reply."
+    ),
+    "nitro": (
+        "MODE: nitro (heavy model). Same contract as code mode. The user "
+        "is paying premium GPU time for this turn — be efficient with the "
+        "loop, but do not skip estimation or the Ja gate."
+    ),
+}
+
+
+def build_protocol(mode: str = "code") -> str:
+    """Header 4 — the protocol Bible. The contract the LLM operates under.
+
+    Generated fresh per package; references JA_PASSPHRASE so the literal
+    passcode and the parser stay in lockstep.
+    """
+    addendum = _MODE_ADDENDUM.get(mode, _MODE_ADDENDUM["code"])
+    return "\n".join([
+        "You are connected to the user's machine through Project Michael.",
+        "Michael is event-sourced: every user prompt and every tool call you",
+        "execute is logged. You are amnesiac across user prompts; the package",
+        "below is your entire memory of this project.",
+        "",
+        "PACKAGE STRUCTURE (sent on every fresh instance):",
+        "  H1 — User's prompts in this project, verbatim and in order. The",
+        "       user's formal/technical language is the source of truth; do",
+        "       not re-derive intent from your own past output.",
+        "  H2 — Filesystem snapshot of the project workspace as of NOW.",
+        "  H3 — Every tool call you have executed in this project, with",
+        "       outcomes. This is your causal chain.",
+        "  H4 — This protocol. The contract you operate under.",
+        "",
+        "NO HANDS:",
+        "You propose; Michael executes. You cannot directly write to the",
+        "user's filesystem or run shell commands on the host. Every tool call",
+        "is a proposal that Michael stages, verifies, and reports back to you.",
+        "",
+        "ESTIMATION MANDATE:",
+        "On write_file and apply_patch you MUST include `expected_changes` —",
+        "your prediction of which project-relative paths will be added,",
+        "modified, or removed. This is non-negotiable. Michael runs the",
+        "proposal in staging, computes the actual delta, and feeds prediction",
+        "vs reality back to you. Mismatch is information, not failure: read",
+        "it and decide what to do next.",
+        "",
+        "THE BOMB FIELD (sandbox / VPS):",
+        "Michael handles and detonates your estimates in the bomb field — a",
+        "remote VPS running rootless podman, or local podman if no VPS is",
+        "configured. Use run_in_sandbox to test code before proposing a",
+        "write_file. The user's real workspace stays untouched until the Ja",
+        "gate fires AND the user approves.",
+        "",
+        "INDEFINITE ITERATION:",
+        "You and Michael iterate alone, in private. There is no turn budget.",
+        "Propose, stage, sandbox, review, refine — as many rounds as you need.",
+        "The user is not watching individual turns. The only ways out of the",
+        "loop are the Ja passcode below, or a user-initiated abort (Ctrl-C).",
+        "",
+        f"THE {JA_PASSPHRASE!r} PASSCODE:",
+        f"The user only sees your work when you END a message with the literal",
+        f"bareword `{JA_PASSPHRASE}` (case-sensitive, on its own line or as the",
+        f"trailing token). That is the ONLY signal Michael reads as 'surface",
+        f"this to the user.' Until {JA_PASSPHRASE}, you are talking to Michael,",
+        f"not the user.",
+        "",
+        f"Do NOT use {JA_PASSPHRASE} casually. Do NOT use it mid-thought. Do",
+        f"NOT use it as a filler word. {JA_PASSPHRASE} means: 'I am done",
+        f"iterating; this is the product I want the user to review.'",
+        "",
+        f"After {JA_PASSPHRASE}, Michael shows the user the staged delta and",
+        f"asks one yes/no question. Yes = the change is committed and this",
+        f"prompt cycle ends. No = the staging is discarded; the next user",
+        f"prompt re-enters the loop and you will see the rejection in H3.",
+        "",
+        addendum,
+        "",
+        "Tools (full schemas in the API call):",
+        "  write_file(path, content, expected_changes)        expected_changes required",
+        "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
+        "  read_file(path)                                    auto-executes",
+        "  list_dir(path='.')                                 auto-executes",
+        "  run_in_sandbox(python_code)                        isolated podman, no network",
+        "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
+        "",
+        "All paths are relative to the project root. Do not escape with '..'.",
+    ])
+
+
+def build_header(
+    project: Project,
+    system_prompt: str,
+    *,
+    mode: str = "code",
+) -> str:
+    """Pack the four-header context package sent to a fresh LLM instance.
+
+    H1 = user's prompts in this project (verbatim).
+    H2 = filesystem snapshot.
+    H3 = tool calls executed in this project (causal chain).
+    H4 = the protocol Bible (build_protocol(mode)).
+
+    The system_prompt sits above H4 as the operator's standing brief.
+    """
     prompts = _prompt_history_lines(project)
     actions = _action_log_lines(project)
     snap = filesystem_snapshot(pathlib.Path(project.path))
+    protocol = build_protocol(mode)
 
     return "\n".join([
         system_prompt,
         "",
-        "You are connected to the user's machine through Project Michael.",
-        "Project Michael:",
-        "- Maintains a per-project event log of every user prompt and every tool",
-        "  call you have executed in this project.",
-        "- Rebuilds this brief from scratch on every user prompt — you have no",
-        "  memory across user prompts. The log below is your memory.",
-        "- Asks the user to confirm before any write or code execution.",
-        "  read_file and list_dir auto-execute.",
-        "",
-        "Tools (full schemas in the API call):",
-        "  write_file(path, content, expected_changes)  expected_changes required",
-        "  read_file(path)                              auto-executes",
-        "  list_dir(path='.')                           auto-executes",
-        "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
-        "  run_in_sandbox(python_code)                  isolated podman, no network",
-        "  run_shell(cmd, timeout_s=60)                 runs in the project workspace",
-        "",
-        "All paths are relative to the project root. Do not escape with '..'.",
+        "=== H4: Protocol ===",
+        protocol,
         "",
         "=== Project ===",
         f"Name: {project.name}",
         f"Slug: {project.slug}",
         f"Root: {project.path}",
         "",
-        "=== User's prompts in this project (verbatim, in order) ===",
+        "=== H1: User's prompts in this project (verbatim, in order) ===",
         "\n".join(prompts) if prompts else "(this is the user's first prompt)",
         "",
-        "=== Tool calls executed in this project (in order) ===",
+        "=== H3: Tool calls executed in this project (in order) ===",
         "\n".join(actions) if actions else "(none yet)",
         "",
-        "=== Filesystem snapshot ===",
+        "=== H2: Filesystem snapshot ===",
         snap,
     ])
 
@@ -1721,185 +1840,264 @@ def _format_staging_preview(
     return "\n\n".join(sections)
 
 
+@dataclass
+class PendingChanges:
+    """Per-agent-loop staging state. The LLM and Michael iterate against a
+    persistent stage; entries accumulate until the LLM emits the Ja passcode
+    and the user approves (commit) or rejects (discard).
+    """
+
+    stage_root: Optional[pathlib.Path] = None
+    change_log: list[dict[str, Any]] = field(default_factory=list)
+
+    def ensure_stage(self, project: Project) -> pathlib.Path:
+        if self.stage_root is None:
+            self.stage_root = _stage_project(project)
+        return self.stage_root
+
+    def discard(self) -> None:
+        if self.stage_root is not None:
+            shutil.rmtree(self.stage_root.parent, ignore_errors=True)
+            self.stage_root = None
+        self.change_log.clear()
+
+
+def _snapshot_file(stage_root: pathlib.Path, rel: str) -> tuple[bool, Optional[bytes]]:
+    """Capture pre-apply content of one staged file so a verify-failure can
+    roll back without polluting prior pending changes."""
+    target = stage_root / rel
+    if not target.is_file():
+        return False, None
+    try:
+        return True, target.read_bytes()
+    except OSError:
+        return True, None
+
+
+def _restore_file(
+    stage_root: pathlib.Path, rel: str, existed: bool, blob: Optional[bytes]
+) -> None:
+    target = stage_root / rel
+    if not existed:
+        if target.is_file():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        return
+    if blob is None:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(blob)
+
+
+def _format_review(
+    name: str,
+    args: dict[str, Any],
+    project: Project,
+    stage_root: pathlib.Path,
+    delta: dict[str, list[str]],
+    verify_rc: Optional[int],
+    verify_out: str,
+    expected: list[str],
+    mismatch: str,
+) -> str:
+    """Structured review fed back to the LLM. Includes prediction vs reality,
+    full diff, and verify output. Mismatch is informational, not a rejection.
+    """
+    sections: list[str] = []
+    sections.append(f"tool: {name}({args.get('path', '?')})")
+    sections.append(
+        f"predicted: added/modified/removed = {sorted(expected)}"
+    )
+    sections.append(
+        f"actual:    added={delta['added']}  "
+        f"modified={delta['modified']}  removed={delta['removed']}"
+    )
+    if mismatch:
+        sections.append(f"prediction-vs-reality: {mismatch}")
+    else:
+        sections.append("prediction-vs-reality: match")
+
+    if name == "write_file":
+        rel = str(args.get("path", "?"))
+        try:
+            real_target = _resolve_in_project(project, rel)
+            old = real_target.read_text(errors="replace") if real_target.is_file() else ""
+        except MichaelError:
+            old = ""
+        diff = "".join(difflib.unified_diff(
+            old.splitlines(keepends=True),
+            str(args.get("content", "")).splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        )) or "(no changes)"
+        sections.append("diff (vs. real workspace):")
+        sections.append(diff)
+    elif name == "apply_patch":
+        sections.append("patch applied:")
+        sections.append(str(args.get("unified_diff", "")))
+
+    if verify_rc is not None:
+        tail = (verify_out or "")[-1200:]
+        sections.append(f"verify rc={verify_rc}\n{tail}")
+
+    sections.append(
+        f"staging committed at {stage_root}; this change is pending. "
+        "Continue iterating or end your message with the Ja passcode to "
+        "surface to the user."
+    )
+    return "\n\n".join(sections)
+
+
 def execute_with_staging(
     name: str,
     args: dict[str, Any],
     project: Project,
     cfg: Config,
+    pending: PendingChanges,
 ) -> str:
-    """Stage the project, apply the change, gate on the LLM's predicted
-    filesystem delta, optionally verify, then prompt the user. Predicted-delta
-    failures and verify failures are reported to the LLM (not the user); the
-    user is only prompted on a clean prediction match. On user-yes, snapshot
-    pre-change content into trash and sync staged files to the real workspace.
+    """Apply the LLM's proposal in the per-loop persistent staging dir,
+    compute prediction vs reality, and return a structured review back to
+    the LLM. Does NOT prompt the user. Does NOT sync to the real workspace.
+
+    The estimation mandate is enforced: missing `expected_changes` returns
+    an error (the mandate survives). A mismatch between predicted and actual
+    delta is returned as review data — NOT an auto-rejection. Verify
+    failures roll back this single call and surface the verify output to
+    the LLM. The LLM keeps iterating until it emits the Ja passcode.
     """
+    expected_raw = args.get("expected_changes")
+    expected_list: list[str] = (
+        [str(x) for x in expected_raw]
+        if isinstance(expected_raw, list) else []
+    )
+    if not expected_list:
+        append_event(
+            "tool.delta_missing",
+            {"tool": name, "summary": _summary_for(name, args)},
+            project=project,
+        )
+        return (
+            "error: expected_changes is required and must be a non-empty "
+            "list of project-relative paths you predict will be added, "
+            "modified, or removed. Predict the delta, then re-propose."
+        )
+
+    try:
+        stage_root = pending.ensure_stage(project)
+    except MichaelError as e:
+        return f"error: staging failed: {e}"
+
+    rel = str(args.get("path", ""))
+    existed, blob = _snapshot_file(stage_root, rel)
+    before = _file_hashes(stage_root)
+    try:
+        _apply_in_staging(name, args, stage_root)
+    except MichaelError as e:
+        _restore_file(stage_root, rel, existed, blob)
+        return f"error applying in staging: {e}"
+    after = _file_hashes(stage_root)
+    delta = _diff_hashes(before, after)
+
+    verify_rc: Optional[int] = None
+    verify_out = ""
+    verify_cmd = args.get("verify")
+    if isinstance(verify_cmd, str) and verify_cmd.strip():
+        verify_rc, verify_out = _run_verify(verify_cmd, stage_root, timeout_s=60)
+        if verify_rc != 0:
+            _restore_file(stage_root, rel, existed, blob)
+            append_event(
+                "tool.verify_failed",
+                {
+                    "tool": name,
+                    "summary": _summary_for(name, args),
+                    "verify_cmd": verify_cmd,
+                    "verify_rc": verify_rc,
+                    "delta": delta,
+                },
+                project=project,
+            )
+            return (
+                f"verify failed in staging (rc={verify_rc}); this call was "
+                f"rolled back. Prior pending changes are intact.\n"
+                f"delta this call would have made: {delta}\n"
+                f"verify output:\n{verify_out[-1500:]}"
+            )
+
+    mismatch = _check_expected(expected_list, delta)
+    if mismatch:
+        append_event(
+            "tool.delta_mismatch",
+            {
+                "tool": name,
+                "summary": _summary_for(name, args),
+                "expected": expected_list,
+                "delta": delta,
+                "mismatch": mismatch,
+            },
+            project=project,
+        )
+    append_event(
+        "tool.staged",
+        {
+            "tool": name,
+            "summary": _summary_for(name, args),
+            "delta": delta,
+            "verify_rc": verify_rc,
+            "mismatch": mismatch,
+        },
+        project=project,
+    )
+    pending.change_log.append({
+        "tool": name,
+        "args": args,
+        "delta": delta,
+        "verify_rc": verify_rc,
+        "expected": expected_list,
+        "mismatch": mismatch,
+    })
+    return _format_review(
+        name, args, project, stage_root, delta,
+        verify_rc, verify_out, expected_list, mismatch,
+    )
+
+
+def commit_pending(project: Project, pending: PendingChanges) -> list[dict[str, Any]]:
+    """At Ja-time + user-yes: sync pending stage to the real workspace,
+    save trash for each entry, append tool.executed events, and discard
+    the stage. Returns the per-entry summaries for display."""
+    if pending.stage_root is None or not pending.change_log:
+        return []
     real_root = pathlib.Path(project.path).resolve()
-    from_edit = False
-    while True:
-        stage_root: Optional[pathlib.Path] = None
-        try:
-            try:
-                stage_root = _stage_project(project)
-            except MichaelError as e:
-                return f"error: staging failed: {e}"
-
-            before = _file_hashes(stage_root)
-            try:
-                _apply_in_staging(name, args, stage_root)
-            except MichaelError as e:
-                return f"error applying in staging: {e}"
-            after = _file_hashes(stage_root)
-            delta = _diff_hashes(before, after)
-
-            verify_rc: Optional[int] = None
-            verify_out = ""
-            verify_cmd = args.get("verify")
-            if isinstance(verify_cmd, str) and verify_cmd.strip():
-                verify_rc, verify_out = _run_verify(
-                    verify_cmd, stage_root, timeout_s=60
-                )
-                if verify_rc != 0:
-                    append_event(
-                        "tool.verify_failed",
-                        {
-                            "tool": name,
-                            "summary": _summary_for(name, args),
-                            "verify_cmd": verify_cmd,
-                            "verify_rc": verify_rc,
-                            "delta": delta,
-                        },
-                        project=project,
-                    )
-                    return (
-                        f"verify failed in staging (rc={verify_rc}); the user "
-                        f"was NOT prompted.\n"
-                        f"delta: {delta}\n"
-                        f"verify output:\n{verify_out[-1500:]}"
-                    )
-
-            expected_raw = args.get("expected_changes")
-            expected_list: list[str] = (
-                [str(x) for x in expected_raw]
-                if isinstance(expected_raw, list) else []
-            )
-            mismatch = (
-                _check_expected(expected_list, delta) if expected_list else ""
-            )
-
-            # Predicted-delta gate: on the LLM's first proposal, missing or
-            # mismatched expected_changes goes back to the LLM, not the user.
-            # After a user edit (`from_edit`) we just warn — the user is now
-            # in control of the args.
-            if not from_edit:
-                if not expected_list:
-                    append_event(
-                        "tool.delta_missing",
-                        {
-                            "tool": name,
-                            "summary": _summary_for(name, args),
-                            "delta": delta,
-                        },
-                        project=project,
-                    )
-                    return (
-                        "error: expected_changes is required and must be a "
-                        "non-empty list of project-relative paths you predict "
-                        "will be added, modified, or removed. Predict the "
-                        "delta, then re-propose.\n"
-                        f"actual delta would have been: added={delta['added']}, "
-                        f"modified={delta['modified']}, "
-                        f"removed={delta['removed']}"
-                    )
-                if mismatch:
-                    append_event(
-                        "tool.delta_mismatch",
-                        {
-                            "tool": name,
-                            "summary": _summary_for(name, args),
-                            "expected": expected_list,
-                            "delta": delta,
-                            "mismatch": mismatch,
-                        },
-                        project=project,
-                    )
-                    return (
-                        f"error: predicted-delta mismatch — {mismatch}\n"
-                        f"actual delta: added={delta['added']}, "
-                        f"modified={delta['modified']}, "
-                        f"removed={delta['removed']}\n"
-                        "Re-propose with corrected expected_changes or "
-                        "different content."
-                    )
-
-            preview_text = _format_staging_preview(
-                name, args, project, delta, verify_rc, verify_out, mismatch
-            )
-            console.print(
-                Panel(
-                    Syntax(preview_text, "diff", theme="ansi_dark", word_wrap=True),
-                    title=f"[cyan]propose[/] {name}",
-                    border_style="cyan",
-                )
-            )
-
-            try:
-                choice = (typer.prompt(
-                    "Apply? [Y]es / [n]o / [e]dit", default="y"
-                ) or "").strip().lower()
-            except (KeyboardInterrupt, typer.Abort):
-                choice = "n"
-
-            if choice in ("", "y", "yes"):
-                trash_id = _save_trash(
-                    project, name, args, delta, real_root, verify_rc=verify_rc
-                )
-                _sync_to_real(stage_root, real_root, delta)
-                first = (
-                    f"applied; trash_id={trash_id}; "
-                    f"+{len(delta['added'])} ~{len(delta['modified'])} "
-                    f"-{len(delta['removed'])}"
-                )
-                if verify_rc is not None:
-                    first += f"; verify_rc={verify_rc}"
-                append_event(
-                    "tool.executed",
-                    {
-                        "tool": name,
-                        "args": args,
-                        "summary": f"{_summary_for(name, args)} → {first}"[:240],
-                        "trash_id": trash_id,
-                        "delta": delta,
-                        "verify_rc": verify_rc,
-                    },
-                    project=project,
-                )
-                return first
-            if choice in ("n", "no"):
-                append_event(
-                    "tool.rejected",
-                    {
-                        "tool": name,
-                        "args": args,
-                        "summary": _summary_for(name, args),
-                        "delta": delta,
-                        "verify_rc": verify_rc,
-                    },
-                    project=project,
-                )
-                return "[user rejected this tool call]"
-            if choice in ("e", "edit"):
-                edited = _edit_args(name, args)
-                if edited is None:
-                    err.print("editor returned no content; try again")
-                    continue
-                args = edited
-                from_edit = True
-                continue
-            err.print(f"unknown choice: {choice!r}")
-            continue
-        finally:
-            if stage_root is not None:
-                shutil.rmtree(stage_root.parent, ignore_errors=True)
+    summaries: list[dict[str, Any]] = []
+    for entry in pending.change_log:
+        delta = entry["delta"]
+        trash_id = _save_trash(
+            project, entry["tool"], entry["args"], delta, real_root,
+            verify_rc=entry.get("verify_rc"),
+        )
+        _sync_to_real(pending.stage_root, real_root, delta)
+        summary = (
+            f"{_summary_for(entry['tool'], entry['args'])} → applied "
+            f"+{len(delta['added'])} ~{len(delta['modified'])} "
+            f"-{len(delta['removed'])} trash_id={trash_id}"
+        )
+        append_event(
+            "tool.executed",
+            {
+                "tool": entry["tool"],
+                "args": entry["args"],
+                "summary": summary[:240],
+                "trash_id": trash_id,
+                "delta": delta,
+                "verify_rc": entry.get("verify_rc"),
+            },
+            project=project,
+        )
+        summaries.append({"trash_id": trash_id, "summary": summary})
+    pending.discard()
+    return summaries
 
 
 def dispatch_tool_call(
@@ -1908,7 +2106,12 @@ def dispatch_tool_call(
     project: Project,
     cfg: Config,
     backend: SandboxBackend,
+    pending: PendingChanges,
 ) -> str:
+    """Route one LLM tool call. write_file/apply_patch stage into the per-loop
+    `pending` state and return a review (no user prompt). Other tools auto-
+    execute (read_file, list_dir) or run after one user confirmation
+    (run_in_sandbox, run_shell)."""
     summary = _summary_for(name, args)
 
     if name in AUTO_EXEC_TOOLS:
@@ -1930,7 +2133,7 @@ def dispatch_tool_call(
         return result
 
     if name in ("write_file", "apply_patch"):
-        return execute_with_staging(name, args, project, cfg)
+        return execute_with_staging(name, args, project, cfg, pending)
 
     try:
         decision, final_args = confirm_tool_call(name, args, project)
@@ -2285,31 +2488,6 @@ def _tools_for_mode(mode: str) -> list[dict[str, Any]]:
     return TOOLS
 
 
-def _protocol_for_mode(mode: str) -> str:
-    """Mode-specific Header-4 addendum prepended to the system prompt."""
-    if mode == "discussion":
-        return (
-            "MODE: discussion. You have read-only tools (read_file, list_dir). "
-            "write_file, apply_patch, run_in_sandbox, and run_shell are not "
-            "available — for code changes the user will start a `new code` "
-            "or `nitro` session."
-        )
-    if mode == "nitro":
-        return (
-            "MODE: nitro (heavy model). Same contract as code mode: "
-            "write_file and apply_patch require `expected_changes` — predict "
-            "the project-relative paths that will be added, modified, or "
-            "removed. On mismatch Michael returns an error and you re-propose "
-            "without bothering the user."
-        )
-    return (
-        "MODE: code. write_file and apply_patch require `expected_changes` — "
-        "predict the project-relative paths that will be added, modified, or "
-        "removed before each write. On mismatch Michael returns an error and "
-        "you re-propose without bothering the user."
-    )
-
-
 def _resolve_nitro_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelProfile]:
     """Pick the heavy model for nitro: explicit --model wins, then 'nitro',
     then 'big'. No silent fallback to the default profile."""
@@ -2324,6 +2502,77 @@ def _resolve_nitro_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelP
     )
 
 
+_NUDGE_NO_JA = (
+    "system reminder: you ended your turn without tool calls and without "
+    f"the {JA_PASSPHRASE!r} passcode. Either use tools to keep iterating, "
+    f"or end your message with `{JA_PASSPHRASE}` on its own line to surface "
+    "your work to the user. Until then you are talking to Michael, not "
+    "the user."
+)
+
+
+def _present_pending_to_user(
+    project: Project,
+    pending: PendingChanges,
+    final_text: str,
+) -> bool:
+    """Render the LLM's accumulated pending changes for the user and ask
+    one yes/no. Returns True on apply, False on reject. If there are no
+    pending changes, just shows the LLM's final text and returns True."""
+    if final_text:
+        console.print(
+            Panel(final_text, title="assistant — Ja", border_style="green")
+        )
+    if not pending.change_log:
+        return True
+
+    for i, entry in enumerate(pending.change_log, 1):
+        delta = entry["delta"]
+        title = (
+            f"[{i}/{len(pending.change_log)}] "
+            f"{_summary_for(entry['tool'], entry['args'])}  "
+            f"+{len(delta['added'])} ~{len(delta['modified'])} "
+            f"-{len(delta['removed'])}"
+        )
+        sections: list[str] = []
+        if entry["tool"] == "write_file":
+            rel = str(entry["args"].get("path", "?"))
+            try:
+                real_target = _resolve_in_project(project, rel)
+                old = real_target.read_text(errors="replace") if real_target.is_file() else ""
+            except MichaelError:
+                old = ""
+            diff = "".join(difflib.unified_diff(
+                old.splitlines(keepends=True),
+                str(entry["args"].get("content", "")).splitlines(keepends=True),
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+            )) or "(no changes)"
+            sections.append(diff)
+        elif entry["tool"] == "apply_patch":
+            sections.append(str(entry["args"].get("unified_diff", "")))
+        sections.append(_format_delta(delta))
+        if entry.get("verify_rc") is not None:
+            sections.append(f"verify rc={entry['verify_rc']}")
+        if entry.get("mismatch"):
+            sections.append(f"prediction mismatch: {entry['mismatch']}")
+        console.print(
+            Panel(
+                Syntax("\n\n".join(sections), "diff", theme="ansi_dark", word_wrap=True),
+                title=title, border_style="cyan",
+            )
+        )
+
+    try:
+        choice = (typer.prompt(
+            f"Apply all {len(pending.change_log)} pending change(s)? [Y]es / [n]o",
+            default="y",
+        ) or "").strip().lower()
+    except (KeyboardInterrupt, typer.Abort):
+        choice = "n"
+    return choice in ("", "y", "yes")
+
+
 def _run_agent_loop(
     project: Project,
     cfg: Config,
@@ -2333,18 +2582,20 @@ def _run_agent_loop(
     *,
     verb_label: str,
 ) -> None:
-    """Shared agent-loop body for `run`, `new code`, `new discussion`, `nitro`."""
+    """Shared agent-loop body for `run`, `new code`, `new discussion`, `nitro`.
+
+    Per user prompt: a fresh PendingChanges holds the persistent staging dir
+    and the change log. The LLM and Michael iterate indefinitely (no turn
+    cap) until the LLM emits the Ja passcode (then user is asked) or the
+    user hits Ctrl-C (graceful abort). The user is NEVER prompted mid-loop.
+    """
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
 
     client = llm_client(endpoint, profile.vllm_api_key)
     backend = make_backend(cfg)
     tools = _tools_for_mode(mode)
-    extra_protocol = _protocol_for_mode(mode)
     base_prompt = cfg.resolved_system_prompt()
-    system_prompt = (
-        f"{base_prompt}\n\n{extra_protocol}" if extra_protocol else base_prompt
-    )
 
     backend_label = (
         "remote-podman (vps)" if cfg.vps_active()
@@ -2355,7 +2606,10 @@ def _run_agent_loop(
         f"[bold cyan]michael {verb_label}[/] [dim]project={project.slug}  "
         f"model={name}  mode={mode}  sandbox={backend_label}[/]"
     )
-    console.print("[dim]empty line or 'quit' to exit[/]")
+    console.print(
+        f"[dim]empty line or 'quit' to exit · Ctrl-C aborts an in-flight "
+        f"loop · LLM surfaces with the {JA_PASSPHRASE!r} passcode[/]"
+    )
 
     session = PromptSession(
         history=FileHistory(str(REPL_HISTORY_PATH)),
@@ -2382,79 +2636,154 @@ def _run_agent_loop(
             project=project,
         )
 
-        # Fresh brief per user prompt; tool messages only flow within this loop.
-        header = build_header(project, system_prompt)
+        # Fresh brief and fresh pending state per user prompt. Tool messages
+        # only flow within this loop; pending stage is discarded at end.
+        header = build_header(project, base_prompt, mode=mode)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": header},
             {"role": "user", "content": user},
         ]
-
-        for turn in range(MAX_AGENT_TURNS):
-            try:
-                resp = client.chat.completions.create(
-                    model=profile.served_model_name,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    stream=False,
-                    timeout=float(profile.request_timeout_s),
+        pending = PendingChanges()
+        turn = 0
+        ja_received = False
+        try:
+            while True:
+                turn += 1
+                console.print(
+                    f"[dim]· turn {turn}: model thinking…[/]"
                 )
-            except Exception as e:
-                err.print(f"LLM error: {e}")
+                try:
+                    resp = client.chat.completions.create(
+                        model=profile.served_model_name,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto",
+                        stream=False,
+                        timeout=float(profile.request_timeout_s),
+                    )
+                except Exception as e:
+                    err.print(f"LLM error: {e}")
+                    append_event(
+                        "error",
+                        {"where": "agent_loop", "msg": str(e), "turn": turn},
+                        project=project,
+                    )
+                    pending.discard()
+                    break
+
+                msg = resp.choices[0].message
+                content = msg.content or ""
+                if content:
+                    payload: dict[str, Any] = {
+                        "chars": len(content),
+                        "model": name,
+                        "served": profile.served_model_name,
+                        "turn": turn,
+                    }
+                    if cfg.log_responses:
+                        payload["text"] = content
+                    append_event("assistant.message", payload, project=project)
+
+                tool_calls = msg.tool_calls or []
+                if tool_calls:
+                    for tc in tool_calls:
+                        console.print(
+                            f"[dim]· turn {turn}: tool {tc.function.name}[/]"
+                        )
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content,
+                }
+                if tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
+                messages.append(assistant_msg)
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        tname = tc.function.name
+                        try:
+                            targs = json.loads(tc.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            targs = {}
+                        result = dispatch_tool_call(
+                            tname, targs, project, cfg, backend, pending,
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                    # After tool-call execution, loop back for the next LLM turn.
+                    continue
+
+                # No tool calls. Either the LLM said Ja → present, or it
+                # stopped without saying Ja → nudge it back into the loop.
+                if _message_ends_with_ja(content):
+                    ja_received = True
+                    append_event(
+                        "assistant.ja",
+                        {
+                            "turn": turn,
+                            "pending": len(pending.change_log),
+                        },
+                        project=project,
+                    )
+                    break
+                console.print(
+                    f"[yellow]· turn {turn}: no {JA_PASSPHRASE} and no tool "
+                    f"calls — nudging the model back into the loop[/]"
+                )
+                messages.append({"role": "system", "content": _NUDGE_NO_JA})
+                continue
+        except KeyboardInterrupt:
+            err.print(
+                f"\nturn {turn}: aborted by user; pending changes discarded"
+            )
+            append_event(
+                "agent.aborted",
+                {"turn": turn, "pending": len(pending.change_log)},
+                project=project,
+            )
+            pending.discard()
+            continue
+
+        if not ja_received:
+            # LLM error or non-Ja exit — discard staging, bail out.
+            pending.discard()
+            continue
+
+        # Ja received. Show the user the pending product and ask one y/n.
+        approved = _present_pending_to_user(project, pending, content)
+        if approved:
+            summaries = commit_pending(project, pending)
+            if summaries:
+                console.print(
+                    f"[green]applied[/] {len(summaries)} change(s)"
+                )
+        else:
+            for entry in pending.change_log:
                 append_event(
-                    "error",
-                    {"where": "agent_loop", "msg": str(e)},
+                    "tool.rejected",
+                    {
+                        "tool": entry["tool"],
+                        "args": entry["args"],
+                        "summary": _summary_for(entry["tool"], entry["args"]),
+                        "delta": entry["delta"],
+                    },
                     project=project,
                 )
-                break
-
-            msg = resp.choices[0].message
-            if msg.content:
-                console.print(
-                    Panel(msg.content, title="assistant", border_style="green")
-                )
-                payload: dict[str, Any] = {
-                    "chars": len(msg.content),
-                    "model": name,
-                    "served": profile.served_model_name,
-                }
-                if cfg.log_responses:
-                    payload["text"] = msg.content
-                append_event("assistant.message", payload, project=project)
-
-            tool_calls = msg.tool_calls or []
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in tool_calls
-                ]
-            messages.append(assistant_msg)
-
-            if not tool_calls:
-                break
-
-            for tc in tool_calls:
-                tname = tc.function.name
-                try:
-                    targs = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    targs = {}
-                result = dispatch_tool_call(tname, targs, project, cfg, backend)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
-        else:
-            err.print(f"hit max-turn limit ({MAX_AGENT_TURNS}); stopping")
+            pending.discard()
+            console.print("[yellow]rejected[/] pending changes discarded")
 
 
 def cmd_run(model: Optional[str]) -> None:
