@@ -21,15 +21,17 @@ export NEEDRESTART_SUSPEND=1
 
 APT_CONFOLD=(-o "Dpkg::Options::=--force-confold")
 
-echo "[1/10] apt update + upgrade and install base packages"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "[1/11] apt update + upgrade and install base packages"
 apt-get update -y
 apt-get "${APT_CONFOLD[@]}" -y upgrade
 apt-get "${APT_CONFOLD[@]}" -y install \
     ufw fail2ban unattended-upgrades needrestart chrony apparmor-utils \
     ca-certificates curl gnupg lsb-release git jq podman uidmap slirp4netns \
-    tmux htop
+    patch python3-venv python3-pip tmux htop
 
-echo "[2/10] timezone, chrony, locale"
+echo "[2/11] timezone, chrony, locale"
 timedatectl set-timezone "${TIMEZONE}"
 systemctl enable --now chrony
 if ! locale -a | grep -qiE '^en_US\.utf-?8$'; then
@@ -39,7 +41,7 @@ if ! locale -a | grep -qiE '^en_US\.utf-?8$'; then
 fi
 update-locale LANG=en_US.UTF-8
 
-echo "[3/10] unattended-upgrades configuration"
+echo "[3/11] unattended-upgrades configuration"
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -60,7 +62,7 @@ Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
 systemctl enable --now unattended-upgrades.service
 
-echo "[4/10] non-root user ${USERNAME} + sudoers"
+echo "[4/11] non-root user ${USERNAME} + sudoers"
 if ! id -u "${USERNAME}" >/dev/null 2>&1; then
     adduser --disabled-password --gecos "" "${USERNAME}"
 fi
@@ -88,7 +90,7 @@ EOF
 chmod 0440 "${SUDOERS_FILE}"
 visudo -cf "${SUDOERS_FILE}"
 
-echo "[5/10] UFW firewall"
+echo "[5/11] UFW firewall"
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
@@ -96,7 +98,7 @@ ufw allow "${SSH_PORT}/tcp"
 ufw --force enable
 ufw status verbose
 
-echo "[6/10] SSH hardening"
+echo "[6/11] SSH hardening"
 CLOUD_INIT_DROPIN="/etc/ssh/sshd_config.d/50-cloud-init.conf"
 if [[ -f "${CLOUD_INIT_DROPIN}" ]]; then
     sed -i 's/^[[:space:]]*PasswordAuthentication[[:space:]].*/# &/' "${CLOUD_INIT_DROPIN}"
@@ -118,7 +120,7 @@ EOF
 sshd -t
 systemctl reload ssh
 
-echo "[7/10] fail2ban"
+echo "[7/11] fail2ban"
 cat >/etc/fail2ban/jail.d/sshd-local.conf <<EOF
 [sshd]
 enabled = true
@@ -130,7 +132,7 @@ EOF
 systemctl enable --now fail2ban
 fail2ban-client status sshd || true
 
-echo "[8/10] sysctl + needrestart + apparmor"
+echo "[8/11] sysctl + needrestart + apparmor"
 cat >/etc/sysctl.d/99-hardening.conf <<'EOF'
 net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.rp_filter = 1
@@ -155,21 +157,38 @@ EOF
 
 aa-status || true
 
-echo "[9/10] michael state dir + sandbox image"
+echo "[9/11] michael state dir + sandbox image"
 MICHAEL_DIR="${USER_HOME}/.michael"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "${MICHAEL_DIR}"
-if [[ -f Dockerfile.sandbox ]]; then
+if [[ -f "${PROJECT_DIR}/Dockerfile.sandbox" ]]; then
     install -m 0644 -o "${USERNAME}" -g "${USERNAME}" \
-        Dockerfile.sandbox "${MICHAEL_DIR}/Dockerfile.sandbox"
+        "${PROJECT_DIR}/Dockerfile.sandbox" "${MICHAEL_DIR}/Dockerfile.sandbox"
     sudo -u "${USERNAME}" podman build \
         -t michael-sandbox:alpine \
         -f "${MICHAEL_DIR}/Dockerfile.sandbox" \
         "${MICHAEL_DIR}/"
 else
-    echo "NOTE: Dockerfile.sandbox not found in CWD; skipping sandbox image build." >&2
+    echo "NOTE: Dockerfile.sandbox not found in ${PROJECT_DIR}; skipping sandbox image build." >&2
 fi
 
-echo "[10/10] workspace directory"
+echo "[10/11] michael CLI venv + /usr/local/bin/michael wrapper"
+# Ubuntu 24.04 system Python is PEP 668-protected, so install into a venv
+# alongside the checkout. The wrapper makes `michael` runnable from anywhere
+# (useful when the user SSHes in and wants to manage projects from the VPS).
+VENV_DIR="${PROJECT_DIR}/.venv"
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+    python3 -m venv "${VENV_DIR}"
+fi
+"${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+"${VENV_DIR}/bin/pip" install --quiet -r "${PROJECT_DIR}/requirements.txt"
+
+cat >/usr/local/bin/michael <<EOF
+#!/bin/sh
+exec "${VENV_DIR}/bin/python" "${PROJECT_DIR}/main.py" "\$@"
+EOF
+chmod 0755 /usr/local/bin/michael
+
+echo "[11/11] workspace directory"
 # Files written by remote Michael clients (over SSH) land here. Kept distinct
 # from ~/.michael so the user can wipe state without losing project files.
 install -d -m 0755 -o "${USERNAME}" -g "${USERNAME}" "${USER_HOME}/workspace"
