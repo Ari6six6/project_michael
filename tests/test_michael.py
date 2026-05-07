@@ -546,3 +546,52 @@ def test_repl_commands_include_nitro_and_new_subcommands():
     assert "nitro" in m.REPL_COMMANDS
     assert "new" in m.REPL_COMMANDS
     assert set(m.NEW_SUBCOMMANDS) == {"project", "code", "discussion"}
+
+
+# ---- tier-specific model resolution: code and discussion ----------------
+
+def test_resolve_code_prefers_coder_then_default(home):
+    # Only default_model configured — falls back cleanly
+    cfg = m.Config(models={"instruct": m.ModelProfile()}, default_model="instruct")
+    name, _ = m._resolve_code_model(cfg, None)
+    assert name == "instruct"
+
+    # "coder" profile present — should be picked over default
+    cfg = m.Config(models={"instruct": m.ModelProfile(), "coder": m.ModelProfile()},
+                   default_model="instruct")
+    name, _ = m._resolve_code_model(cfg, None)
+    assert name == "coder"
+
+
+def test_resolve_code_explicit_model_wins(home):
+    cfg = m.Config(models={"coder": m.ModelProfile(), "instruct": m.ModelProfile()},
+                   default_model="coder")
+    name, _ = m._resolve_code_model(cfg, "instruct")
+    assert name == "instruct"
+
+
+def test_resolve_discussion_prefers_instruct_then_default(home):
+    # Only default_model configured — falls back cleanly
+    cfg = m.Config(models={"coder": m.ModelProfile()}, default_model="coder")
+    name, _ = m._resolve_discussion_model(cfg, None)
+    assert name == "coder"
+
+    # "instruct" profile present — should be picked over default
+    cfg = m.Config(models={"coder": m.ModelProfile(), "instruct": m.ModelProfile()},
+                   default_model="coder")
+    name, _ = m._resolve_discussion_model(cfg, None)
+    assert name == "instruct"
+
+
+def test_resolve_discussion_explicit_model_wins(home):
+    cfg = m.Config(models={"coder": m.ModelProfile(), "instruct": m.ModelProfile()},
+                   default_model="instruct")
+    name, _ = m._resolve_discussion_model(cfg, "coder")
+    assert name == "coder"
+
+
+def test_stub_config_has_three_tiers(home):
+    cfg = m.make_stub_config()
+    assert "coder" in cfg.models
+    assert "instruct" in cfg.models
+    assert "nitro" in cfg.models

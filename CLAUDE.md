@@ -19,10 +19,12 @@ Phone (Termux / Linux)          VPS (Ubuntu 24.04, rootless podman)
   vLLM endpoint
 ```
 
-**Compute tiers:**
-- `coder` / default model — 30B coder (RTX 4090 or similar, cheap, on constantly)
-- `big` / instruct model — 30B instruct (same tier, separate GPU)
-- `nitro` / big model — 235B+ (H100 cluster, expensive, spin up on demand)
+**Compute tiers (three GPUs):**
+- `coder` — 30B coder model, RTX 4090 or similar → auto-used by `new code` / `run`
+- `instruct` — 30B instruct model, separate GPU → auto-used by `new discussion`
+- `nitro` — 235B+ model, H100 cluster, expensive → used by `nitro` / `nitro --god`
+
+`new code` and `new discussion` route to their named GPU automatically; `--model` overrides.
 
 **Four-header context package** (sent on every fresh LLM instance):
 - H1 — user's prompts verbatim, in order
@@ -78,8 +80,9 @@ michael ssh-test                  # verify roundtrip
 3. Add to `~/.michael/config.json`:
    ```json
    "models": {
-     "coder": { "vast_instance_id": "12345", "served_model_name": "qwen3-coder" },
-     "nitro": { "vast_instance_id": "67890", "served_model_name": "qwen3-235b" }
+     "coder":   { "vast_instance_id": "12345", "served_model_name": "qwen3-coder" },
+     "instruct": { "vast_instance_id": "23456", "served_model_name": "qwen3" },
+     "nitro":   { "vast_instance_id": "67890", "served_model_name": "qwen3-235b" }
    }
    ```
 4. Start inference: `michael up` (polls until vLLM is ready, caches the endpoint).

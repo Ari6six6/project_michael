@@ -274,9 +274,13 @@ def make_stub_config() -> Config:
                 vast_instance_id="",
                 served_model_name="qwen3-coder",
             ),
-            "big": ModelProfile(
+            "instruct": ModelProfile(
                 vast_instance_id="",
                 served_model_name="qwen3",
+            ),
+            "nitro": ModelProfile(
+                vast_instance_id="",
+                served_model_name="qwen3-235b",
             ),
         },
         default_model="coder",
@@ -288,7 +292,7 @@ def make_stub_config() -> Config:
 
 CONFIG_HELP: dict[str, str] = {
     "vast_api_key": "Vast.ai console API key.",
-    "default_model": "Profile name used when no --model flag is passed.",
+    "default_model": "Fallback profile when no --model flag and no mode-specific profile found.",
     "models.<name>.vast_instance_id": "Numeric ID of the rented GPU instance.",
     "models.<name>.served_model_name": "Matches --served-model-name on vLLM.",
     "models.<name>.vllm_api_key": "Key vLLM was launched with (or empty).",
@@ -2583,6 +2587,24 @@ def _resolve_nitro_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelP
     )
 
 
+def _resolve_code_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelProfile]:
+    """Pick the coder model: explicit --model wins, then 'coder', then default."""
+    if model:
+        return cfg.get_model(model)
+    if "coder" in cfg.models:
+        return "coder", cfg.models["coder"]
+    return cfg.get_model(None)
+
+
+def _resolve_discussion_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelProfile]:
+    """Pick the instruct model: explicit --model wins, then 'instruct', then default."""
+    if model:
+        return cfg.get_model(model)
+    if "instruct" in cfg.models:
+        return "instruct", cfg.models["instruct"]
+    return cfg.get_model(None)
+
+
 _NUDGE_NO_JA = (
     "system reminder: you ended your turn without tool calls and without "
     f"the {JA_PASSPHRASE!r} passcode. Either use tools to keep iterating, "
@@ -2891,7 +2913,7 @@ def _run_agent_loop(
 def cmd_run(model: Optional[str]) -> None:
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+    name, profile = _resolve_code_model(cfg, model or None)
     _run_agent_loop(project, cfg, name, profile, mode="code", verb_label="run")
 
 
@@ -2899,7 +2921,7 @@ def cmd_new_code(model: Optional[str]) -> None:
     """Fresh agent loop in code mode — full toolset, predicted-delta gate."""
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+    name, profile = _resolve_code_model(cfg, model or None)
     _run_agent_loop(
         project, cfg, name, profile, mode="code", verb_label="new code"
     )
@@ -2909,7 +2931,7 @@ def cmd_new_discussion(model: Optional[str]) -> None:
     """Fresh agent loop in discussion mode — read-only tools, no writes/exec."""
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+    name, profile = _resolve_discussion_model(cfg, model or None)
     _run_agent_loop(
         project, cfg, name, profile, mode="discussion",
         verb_label="new discussion",
