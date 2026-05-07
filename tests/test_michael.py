@@ -294,3 +294,141 @@ def test_config_is_unset_false_when_keys_set(home):
     cfg.models["coder"].vast_instance_id = "12345"
     cfg.save()
     assert m._config_is_unset() is False
+
+
+# ---- mode helpers --------------------------------------------------------
+
+def test_tools_for_mode_discussion_is_read_only():
+    tools = m._tools_for_mode("discussion")
+    names = {t["function"]["name"] for t in tools}
+    assert names == m.AUTO_EXEC_TOOLS
+    assert "write_file" not in names
+    assert "run_shell" not in names
+
+
+def test_tools_for_mode_code_and_nitro_are_full():
+    code_names = {t["function"]["name"] for t in m._tools_for_mode("code")}
+    nitro_names = {t["function"]["name"] for t in m._tools_for_mode("nitro")}
+    full = {t["function"]["name"] for t in m.TOOLS}
+    assert code_names == full
+    assert nitro_names == full
+
+
+def test_protocol_for_mode_branches_distinct():
+    code = m._protocol_for_mode("code")
+    discussion = m._protocol_for_mode("discussion")
+    nitro = m._protocol_for_mode("nitro")
+    assert "code" in code.lower() and "expected_changes" in code
+    assert "read-only" in discussion or "read_file" in discussion
+    assert "nitro" in nitro.lower() and "heavy" in nitro.lower()
+
+
+def test_resolve_nitro_prefers_nitro_then_big_then_errors(home):
+    cfg = m.Config(models={"coder": m.ModelProfile()})
+    with pytest.raises(m.MichaelError):
+        m._resolve_nitro_model(cfg, None)
+
+    cfg = m.Config(models={"coder": m.ModelProfile(), "big": m.ModelProfile()})
+    name, _ = m._resolve_nitro_model(cfg, None)
+    assert name == "big"
+
+    cfg = m.Config(models={
+        "coder": m.ModelProfile(),
+        "big": m.ModelProfile(),
+        "nitro": m.ModelProfile(),
+    })
+    name, _ = m._resolve_nitro_model(cfg, None)
+    assert name == "nitro"
+
+
+def test_resolve_nitro_explicit_model_wins(home):
+    cfg = m.Config(models={
+        "coder": m.ModelProfile(),
+        "nitro": m.ModelProfile(),
+    })
+    name, _ = m._resolve_nitro_model(cfg, "coder")
+    assert name == "coder"
+
+
+# ---- tool schema: expected_changes is required --------------------------
+
+def _tool(name):
+    return next(t for t in m.TOOLS if t["function"]["name"] == name)
+
+
+def test_write_file_schema_requires_expected_changes():
+    schema = _tool("write_file")
+    required = schema["function"]["parameters"]["required"]
+    assert "expected_changes" in required
+
+
+def test_apply_patch_schema_requires_expected_changes():
+    schema = _tool("apply_patch")
+    required = schema["function"]["parameters"]["required"]
+    assert "expected_changes" in required
+
+
+# ---- predicted-delta gate ------------------------------------------------
+
+def test_execute_with_staging_missing_expected_returns_error_to_llm(home, workspace):
+    p = m.create_project("x", workspace)
+    cfg = m.Config()
+    result = m.execute_with_staging(
+        "write_file",
+        {"path": "src/bar.py", "content": "y = 2\n"},
+        p, cfg,
+    )
+    assert result.startswith("error: expected_changes is required")
+    # The user's workspace must be untouched.
+    assert not (workspace / "src" / "bar.py").exists()
+    # An audit event should have been logged.
+    events = m.iter_events(p.events_path)
+    types = [e.get("type") for e in events]
+    assert "tool.delta_missing" in types
+
+
+def test_execute_with_staging_mismatch_returns_error_to_llm(home, workspace):
+    p = m.create_project("x", workspace)
+    cfg = m.Config()
+    # LLM predicts a different file than what the write actually changes.
+    result = m.execute_with_staging(
+        "write_file",
+        {
+            "path": "src/bar.py",
+            "content": "y = 2\n",
+            "expected_changes": ["src/wrong.py"],
+        },
+        p, cfg,
+    )
+    assert result.startswith("error: predicted-delta mismatch")
+    assert "src/bar.py" in result  # actual delta surfaced
+    assert not (workspace / "src" / "bar.py").exists()
+    events = m.iter_events(p.events_path)
+    types = [e.get("type") for e in events]
+    assert "tool.delta_mismatch" in types
+
+
+def test_execute_with_staging_match_prompts_user_and_applies(home, workspace, monkeypatch):
+    p = m.create_project("x", workspace)
+    cfg = m.Config()
+    # Force the user-confirm prompt to "yes".
+    monkeypatch.setattr(m.typer, "prompt", lambda *a, **k: "y")
+    result = m.execute_with_staging(
+        "write_file",
+        {
+            "path": "src/bar.py",
+            "content": "y = 2\n",
+            "expected_changes": ["src/bar.py"],
+        },
+        p, cfg,
+    )
+    assert result.startswith("applied;")
+    assert (workspace / "src" / "bar.py").read_text() == "y = 2\n"
+
+
+# ---- REPL surface --------------------------------------------------------
+
+def test_repl_commands_include_nitro_and_new_subcommands():
+    assert "nitro" in m.REPL_COMMANDS
+    assert "new" in m.REPL_COMMANDS
+    assert set(m.NEW_SUBCOMMANDS) == {"project", "code", "discussion"}

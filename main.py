@@ -23,22 +23,25 @@ Architecture:
   staged files are synced into the real workspace. `undo` restores.
 
 REPL commands (also work as `michael <cmd>` one-shot):
-    show                        list projects
-    new project [name]          create a new project
-    use <slug>                  switch active project
-    current                     print the active project
-    config                      open ~/.michael/config.json in $EDITOR
-    init                        write a stub config if missing
-    up [--model PROFILE]        start a Vast.ai instance
-    down [--model PROFILE]      stop a Vast.ai instance
-    status                      derived state from the event log
-    ask "<prompt>" [--model P]  one-shot LLM call
-    run [--model PROFILE]       multi-turn tool-calling agent loop
-    log [--tail N]              show the event log
-    sandbox <file.py>           run a file in the sandbox
-    undo [--list] [<id>]        restore the most recent (or named) change
-    ssh-test                    verify the VPS is reachable
-    quit | exit                 leave the REPL
+    show                          list projects
+    new project [name]            create a new project
+    new code [--model P]          fresh agent loop, code mode (full toolset)
+    new discussion [--model P]    fresh agent loop, read-only chat
+    nitro [--model P]             fresh agent loop on the heavy model
+    use <slug>                    switch active project
+    current                       print the active project
+    config                        open ~/.michael/config.json in $EDITOR
+    init                          write a stub config if missing
+    up [--model PROFILE]          start a Vast.ai instance
+    down [--model PROFILE]        stop a Vast.ai instance
+    status                        derived state from the event log
+    ask "<prompt>" [--model P]    one-shot LLM call
+    run [--model PROFILE]         multi-turn tool-calling agent loop (alias of `new code`)
+    log [--tail N]                show the event log
+    sandbox <file.py>             run a file in the sandbox
+    undo [--list] [<id>]          restore the most recent (or named) change
+    ssh-test                      verify the VPS is reachable
+    quit | exit                   leave the REPL
 """
 
 from __future__ import annotations
@@ -1153,12 +1156,12 @@ def build_header(project: Project, system_prompt: str) -> str:
         "  read_file and list_dir auto-execute.",
         "",
         "Tools (full schemas in the API call):",
-        "  write_file(path, content)       overwrite a file in the project",
-        "  read_file(path)                 auto-executes",
-        "  list_dir(path='.')              auto-executes",
-        "  apply_patch(path, unified_diff) apply a unified diff to a file",
-        "  run_in_sandbox(python_code)     isolated podman, no network",
-        "  run_shell(cmd, timeout_s=60)    runs in the project workspace",
+        "  write_file(path, content, expected_changes)  expected_changes required",
+        "  read_file(path)                              auto-executes",
+        "  list_dir(path='.')                           auto-executes",
+        "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
+        "  run_in_sandbox(python_code)                  isolated podman, no network",
+        "  run_shell(cmd, timeout_s=60)                 runs in the project workspace",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
         "",
@@ -1192,12 +1195,15 @@ TOOLS: list[dict[str, Any]] = [
                 "Overwrite (or create) a file in the project workspace. Path is "
                 "relative to the project root; parent dirs are created. "
                 "The change is applied to a staging copy of the project first. "
-                "If `verify` is provided, it runs in the staging copy after the "
-                "write; verify failures (non-zero exit) are reported back to "
-                "you and the user is NOT prompted — fix and try again. "
-                "If verify passes (or is omitted), the user is shown the diff, "
-                "the file-system delta, and the verify output, and is asked to "
-                "confirm before the change is committed to the real workspace."
+                "You MUST predict the resulting filesystem delta in "
+                "`expected_changes` (every project-relative path that will be "
+                "added, modified, or removed). If reality diverges from your "
+                "prediction, Michael returns a mismatch error to you and the "
+                "user is NOT prompted — re-propose. If `verify` is provided, "
+                "it runs in the staging copy after the write; verify failures "
+                "are reported back to you. If the prediction matches and verify "
+                "passes (or is omitted), the user is shown the diff and asked "
+                "to confirm before the change is committed to the real workspace."
             ),
             "parameters": {
                 "type": "object",
@@ -1208,8 +1214,9 @@ TOOLS: list[dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Optional list of project-relative paths you expect to "
-                            "change. Michael flags any mismatch in the user preview."
+                            "Required. Project-relative paths you predict will be "
+                            "added, modified, or removed. Mismatch with the actual "
+                            "staged delta is returned to you as an error."
                         ),
                     },
                     "verify": {
@@ -1221,7 +1228,7 @@ TOOLS: list[dict[str, Any]] = [
                         ),
                     },
                 },
-                "required": ["path", "content"],
+                "required": ["path", "content", "expected_changes"],
             },
         },
     },
@@ -1253,8 +1260,11 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "apply_patch",
             "description": (
-                "Apply a unified diff to a file. Goes through the same staging + "
-                "verify + user-confirm flow as write_file."
+                "Apply a unified diff to a file. Goes through the same "
+                "staging + predicted-delta + verify + user-confirm flow as "
+                "write_file: `expected_changes` is required, mismatches are "
+                "returned to you, and the user is only prompted on a clean "
+                "match."
             ),
             "parameters": {
                 "type": "object",
@@ -1264,10 +1274,15 @@ TOOLS: list[dict[str, Any]] = [
                     "expected_changes": {
                         "type": "array",
                         "items": {"type": "string"},
+                        "description": (
+                            "Required. Project-relative paths you predict will be "
+                            "added, modified, or removed. Mismatch is returned "
+                            "to you as an error."
+                        ),
                     },
                     "verify": {"type": "string"},
                 },
-                "required": ["path", "unified_diff"],
+                "required": ["path", "unified_diff", "expected_changes"],
             },
         },
     },
@@ -1712,11 +1727,14 @@ def execute_with_staging(
     project: Project,
     cfg: Config,
 ) -> str:
-    """Stage the project, apply the change, optionally verify, then prompt the
-    user. On user-yes, snapshot pre-change content into trash and sync staged
-    files to the real workspace. Verify failures and rejections are reported
-    to the LLM, NOT the user."""
+    """Stage the project, apply the change, gate on the LLM's predicted
+    filesystem delta, optionally verify, then prompt the user. Predicted-delta
+    failures and verify failures are reported to the LLM (not the user); the
+    user is only prompted on a clean prediction match. On user-yes, snapshot
+    pre-change content into trash and sync staged files to the real workspace.
+    """
     real_root = pathlib.Path(project.path).resolve()
+    from_edit = False
     while True:
         stage_root: Optional[pathlib.Path] = None
         try:
@@ -1759,10 +1777,59 @@ def execute_with_staging(
                         f"verify output:\n{verify_out[-1500:]}"
                     )
 
-            mismatch = ""
-            expected = args.get("expected_changes")
-            if isinstance(expected, list) and expected:
-                mismatch = _check_expected([str(x) for x in expected], delta)
+            expected_raw = args.get("expected_changes")
+            expected_list: list[str] = (
+                [str(x) for x in expected_raw]
+                if isinstance(expected_raw, list) else []
+            )
+            mismatch = (
+                _check_expected(expected_list, delta) if expected_list else ""
+            )
+
+            # Predicted-delta gate: on the LLM's first proposal, missing or
+            # mismatched expected_changes goes back to the LLM, not the user.
+            # After a user edit (`from_edit`) we just warn — the user is now
+            # in control of the args.
+            if not from_edit:
+                if not expected_list:
+                    append_event(
+                        "tool.delta_missing",
+                        {
+                            "tool": name,
+                            "summary": _summary_for(name, args),
+                            "delta": delta,
+                        },
+                        project=project,
+                    )
+                    return (
+                        "error: expected_changes is required and must be a "
+                        "non-empty list of project-relative paths you predict "
+                        "will be added, modified, or removed. Predict the "
+                        "delta, then re-propose.\n"
+                        f"actual delta would have been: added={delta['added']}, "
+                        f"modified={delta['modified']}, "
+                        f"removed={delta['removed']}"
+                    )
+                if mismatch:
+                    append_event(
+                        "tool.delta_mismatch",
+                        {
+                            "tool": name,
+                            "summary": _summary_for(name, args),
+                            "expected": expected_list,
+                            "delta": delta,
+                            "mismatch": mismatch,
+                        },
+                        project=project,
+                    )
+                    return (
+                        f"error: predicted-delta mismatch — {mismatch}\n"
+                        f"actual delta: added={delta['added']}, "
+                        f"modified={delta['modified']}, "
+                        f"removed={delta['removed']}\n"
+                        "Re-propose with corrected expected_changes or "
+                        "different content."
+                    )
 
             preview_text = _format_staging_preview(
                 name, args, project, delta, verify_rc, verify_out, mismatch
@@ -1826,6 +1893,7 @@ def execute_with_staging(
                     err.print("editor returned no content; try again")
                     continue
                 args = edited
+                from_edit = True
                 continue
             err.print(f"unknown choice: {choice!r}")
             continue
@@ -2210,15 +2278,73 @@ def cmd_ask(prompt: str, model: Optional[str]) -> None:
     append_event("assistant.message", payload, project=project)
 
 
-def cmd_run(model: Optional[str]) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+def _tools_for_mode(mode: str) -> list[dict[str, Any]]:
+    """code/nitro = full toolset; discussion = read-only tools only."""
+    if mode == "discussion":
+        return [t for t in TOOLS if t["function"]["name"] in AUTO_EXEC_TOOLS]
+    return TOOLS
+
+
+def _protocol_for_mode(mode: str) -> str:
+    """Mode-specific Header-4 addendum prepended to the system prompt."""
+    if mode == "discussion":
+        return (
+            "MODE: discussion. You have read-only tools (read_file, list_dir). "
+            "write_file, apply_patch, run_in_sandbox, and run_shell are not "
+            "available — for code changes the user will start a `new code` "
+            "or `nitro` session."
+        )
+    if mode == "nitro":
+        return (
+            "MODE: nitro (heavy model). Same contract as code mode: "
+            "write_file and apply_patch require `expected_changes` — predict "
+            "the project-relative paths that will be added, modified, or "
+            "removed. On mismatch Michael returns an error and you re-propose "
+            "without bothering the user."
+        )
+    return (
+        "MODE: code. write_file and apply_patch require `expected_changes` — "
+        "predict the project-relative paths that will be added, modified, or "
+        "removed before each write. On mismatch Michael returns an error and "
+        "you re-propose without bothering the user."
+    )
+
+
+def _resolve_nitro_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelProfile]:
+    """Pick the heavy model for nitro: explicit --model wins, then 'nitro',
+    then 'big'. No silent fallback to the default profile."""
+    if model:
+        return cfg.get_model(model)
+    for candidate in ("nitro", "big"):
+        if candidate in cfg.models:
+            return candidate, cfg.models[candidate]
+    raise MichaelError(
+        "nitro requires a 'nitro' or 'big' model profile in config "
+        "(or pass --model NAME explicitly)"
+    )
+
+
+def _run_agent_loop(
+    project: Project,
+    cfg: Config,
+    name: str,
+    profile: ModelProfile,
+    mode: str,
+    *,
+    verb_label: str,
+) -> None:
+    """Shared agent-loop body for `run`, `new code`, `new discussion`, `nitro`."""
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
 
     client = llm_client(endpoint, profile.vllm_api_key)
     backend = make_backend(cfg)
+    tools = _tools_for_mode(mode)
+    extra_protocol = _protocol_for_mode(mode)
+    base_prompt = cfg.resolved_system_prompt()
+    system_prompt = (
+        f"{base_prompt}\n\n{extra_protocol}" if extra_protocol else base_prompt
+    )
 
     backend_label = (
         "remote-podman (vps)" if cfg.vps_active()
@@ -2226,8 +2352,8 @@ def cmd_run(model: Optional[str]) -> None:
               else "no-sandbox")
     )
     console.print(
-        f"[bold cyan]michael run[/] [dim]project={project.slug}  model={name}  "
-        f"sandbox={backend_label}[/]"
+        f"[bold cyan]michael {verb_label}[/] [dim]project={project.slug}  "
+        f"model={name}  mode={mode}  sandbox={backend_label}[/]"
     )
     console.print("[dim]empty line or 'quit' to exit[/]")
 
@@ -2247,12 +2373,17 @@ def cmd_run(model: Optional[str]) -> None:
 
         append_event(
             "prompt.sent",
-            {"prompt": user, "model": name, "served": profile.served_model_name},
+            {
+                "prompt": user,
+                "model": name,
+                "served": profile.served_model_name,
+                "mode": mode,
+            },
             project=project,
         )
 
         # Fresh brief per user prompt; tool messages only flow within this loop.
-        header = build_header(project, cfg.resolved_system_prompt())
+        header = build_header(project, system_prompt)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": header},
             {"role": "user", "content": user},
@@ -2263,7 +2394,7 @@ def cmd_run(model: Optional[str]) -> None:
                 resp = client.chat.completions.create(
                     model=profile.served_model_name,
                     messages=messages,
-                    tools=TOOLS,
+                    tools=tools,
                     tool_choice="auto",
                     stream=False,
                     timeout=float(profile.request_timeout_s),
@@ -2324,6 +2455,49 @@ def cmd_run(model: Optional[str]) -> None:
                 })
         else:
             err.print(f"hit max-turn limit ({MAX_AGENT_TURNS}); stopping")
+
+
+def cmd_run(model: Optional[str]) -> None:
+    project = require_active_project()
+    cfg = Config.load()
+    name, profile = cfg.get_model(model or None)
+    _run_agent_loop(project, cfg, name, profile, mode="code", verb_label="run")
+
+
+def cmd_new_code(model: Optional[str]) -> None:
+    """Fresh agent loop in code mode — full toolset, predicted-delta gate."""
+    project = require_active_project()
+    cfg = Config.load()
+    name, profile = cfg.get_model(model or None)
+    _run_agent_loop(
+        project, cfg, name, profile, mode="code", verb_label="new code"
+    )
+
+
+def cmd_new_discussion(model: Optional[str]) -> None:
+    """Fresh agent loop in discussion mode — read-only tools, no writes/exec."""
+    project = require_active_project()
+    cfg = Config.load()
+    name, profile = cfg.get_model(model or None)
+    _run_agent_loop(
+        project, cfg, name, profile, mode="discussion",
+        verb_label="new discussion",
+    )
+
+
+def cmd_nitro(model: Optional[str]) -> None:
+    """Fresh agent loop on the heavy model — same contract as code mode."""
+    project = require_active_project()
+    cfg = Config.load()
+    name, profile = _resolve_nitro_model(cfg, model or None)
+    console.print(
+        f"[bold yellow]⚡ nitro engaged[/] [dim]heavy model `{name}` — "
+        f"cold-start may take a few minutes; stop with `down --model {name}` "
+        "when finished[/]"
+    )
+    _run_agent_loop(
+        project, cfg, name, profile, mode="nitro", verb_label="nitro"
+    )
 
 
 def cmd_log(tail: int) -> None:
@@ -2470,10 +2644,24 @@ def show_cmd() -> None:
 
 @app.command(name="new")
 def new_cmd(
-    keyword: Optional[str] = typer.Argument(None, help="'project' or the project name"),
+    keyword: Optional[str] = typer.Argument(
+        None,
+        help="'project' (create), 'code' (code agent loop), 'discussion' "
+             "(read-only chat), or the project name.",
+    ),
     name: Optional[str] = typer.Argument(None, help="Project name (if 'project' was passed)"),
+    model: str = typer.Option(
+        "", "--model", "-m",
+        help="Model profile (only meaningful for 'new code' / 'new discussion').",
+    ),
 ) -> None:
-    """Create a new project. Usage: `new project [name]` or `new <name>`."""
+    """Create a new project, or start a fresh `code`/`discussion` agent loop."""
+    if keyword == "code":
+        cmd_new_code(model or None)
+        return
+    if keyword == "discussion":
+        cmd_new_discussion(model or None)
+        return
     if keyword == "project":
         actual_name = name
     elif keyword and name is None:
@@ -2481,6 +2669,17 @@ def new_cmd(
     else:
         actual_name = name
     cmd_new(actual_name)
+
+
+@app.command(name="nitro")
+def nitro_cmd(
+    model: str = typer.Option(
+        "", "--model", "-m",
+        help="Override the heavy-model profile (defaults to 'nitro' then 'big').",
+    ),
+) -> None:
+    """Fresh agent loop on the heavy model (cold-start aware)."""
+    cmd_nitro(model or None)
 
 
 @app.command(name="use")
@@ -2581,9 +2780,11 @@ def ssh_test_cmd() -> None:
 REPL_COMMANDS = {
     "show", "new", "use", "current", "config", "init",
     "up", "down", "status",
-    "ask", "run", "log", "sandbox", "undo", "ssh-test",
+    "ask", "run", "nitro", "log", "sandbox", "undo", "ssh-test",
     "quit", "exit", "help",
 }
+
+NEW_SUBCOMMANDS = ("project", "code", "discussion")
 
 
 def _config_is_unset() -> bool:
@@ -2628,9 +2829,12 @@ class MichaelCompleter(Completer):
             return
         if head == "new":
             if len(words) == 1 and at_boundary:
-                yield Completion("project", start_position=0)
-            elif len(words) == 2 and not at_boundary and "project".startswith(words[1]):
-                yield Completion("project", start_position=-len(words[1]))
+                for sub in NEW_SUBCOMMANDS:
+                    yield Completion(sub, start_position=0)
+            elif len(words) == 2 and not at_boundary:
+                for sub in NEW_SUBCOMMANDS:
+                    if sub.startswith(words[1]):
+                        yield Completion(sub, start_position=-len(words[1]))
             return
         if head == "log":
             prefix = words[-1] if not at_boundary else ""
@@ -2638,7 +2842,7 @@ class MichaelCompleter(Completer):
                 if f.startswith(prefix):
                     yield Completion(f, start_position=-len(prefix))
             return
-        if head in ("up", "down", "run", "ask"):
+        if head in ("up", "down", "run", "ask", "nitro"):
             prefix = words[-1] if not at_boundary else ""
             for f in self.UP_FLAGS:
                 if f.startswith(prefix):
@@ -2714,10 +2918,15 @@ def dispatch_repl(line: str) -> None:
     elif cmd == "init":
         cmd_init()
     elif cmd == "new":
-        if rest and rest[0] == "project":
-            rest = rest[1:]
-        name = " ".join(rest) if rest else None
-        cmd_new(name)
+        if rest and rest[0] == "code":
+            cmd_new_code(_opt_value(rest[1:], "--model", "-m"))
+        elif rest and rest[0] == "discussion":
+            cmd_new_discussion(_opt_value(rest[1:], "--model", "-m"))
+        else:
+            if rest and rest[0] == "project":
+                rest = rest[1:]
+            name = " ".join(rest) if rest else None
+            cmd_new(name)
     elif cmd == "use":
         if not rest:
             err.print("usage: use <slug>")
@@ -2752,6 +2961,8 @@ def dispatch_repl(line: str) -> None:
         cmd_ask(" ".join(prompt_parts), model)
     elif cmd == "run":
         cmd_run(_opt_value(rest, "--model", "-m"))
+    elif cmd == "nitro":
+        cmd_nitro(_opt_value(rest, "--model", "-m"))
     elif cmd == "log":
         n = 20
         if (v := _opt_value(rest, "--tail", "-n")) is not None:
