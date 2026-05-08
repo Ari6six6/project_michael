@@ -161,6 +161,17 @@ def _run_agent_loop(
         auto_suggest=AutoSuggestFromHistory(),
     )
 
+    append_event(
+        "agent.started",
+        {
+            "model": name,
+            "served": profile.served_model_name,
+            "mode": mode,
+            "god": god_mode,
+            "sandbox": backend_label,
+        },
+        project=project,
+    )
     while True:
         if god_mode:
             user = G._GOD_MODE_PROMPT
@@ -282,12 +293,23 @@ def _run_agent_loop(
                 messages.append({"role": "system", "content": _NUDGE_NO_JA})
                 continue
         except KeyboardInterrupt:
+            n_discarded = len(pending.change_log)
             G.err.print(f"\nturn {turn}: aborted by user; pending changes discarded")
             append_event(
                 "agent.aborted",
-                {"turn": turn, "pending": len(pending.change_log)},
+                {"turn": turn, "pending": n_discarded},
                 project=project,
             )
+            if n_discarded:
+                append_event(
+                    "pending.discarded",
+                    {
+                        "turn": turn,
+                        "count": n_discarded,
+                        "tools": [e["tool"] for e in pending.change_log],
+                    },
+                    project=project,
+                )
             pending.discard()
             if god_mode:
                 break
@@ -329,3 +351,9 @@ def _run_agent_loop(
                     )
                 pending.discard()
                 G.console.print("[yellow]rejected[/] pending changes discarded")
+
+    append_event(
+        "agent.ended",
+        {"model": name, "mode": mode, "god": god_mode},
+        project=project,
+    )
