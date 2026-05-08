@@ -318,6 +318,7 @@ def cmd_run(
     instruct: bool = False,
     hacker: bool = False,
     model: Optional[str] = None,
+    legacy: bool = False,
 ) -> None:
     project = require_active_project()
     cfg = Config.load()
@@ -333,7 +334,8 @@ def cmd_run(
     else:
         name, profile = cfg.get_model(None)
         mode, god = "code", False
-    _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god)
+    use_kantian = not legacy and cfg.use_stateful_kantian
+    _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god, use_kantian=use_kantian)
 
 
 def cmd_new_code(model: Optional[str]) -> None:
@@ -596,9 +598,10 @@ def run_cmd(
     instruct: bool = typer.Option(False, "--instruct", help="Instruct tier — Qwen 30B Instruct."),
     hacker:  bool = typer.Option(False, "--hacker",  help="Hacker tier — Qwen 235B, god mode."),
     model:   str  = typer.Option("",   "--model", "-m", help="Power-user: exact profile name."),
+    legacy:  bool = typer.Option(False, "--legacy", help="Use stateless loop (disable Kantian machine)."),
 ) -> None:
     """Agent loop. Default tier: coder. Use --coder / --instruct / --hacker to select tier."""
-    cmd_run(coder=coder, instruct=instruct, hacker=hacker, model=model or None)
+    cmd_run(coder=coder, instruct=instruct, hacker=hacker, model=model or None, legacy=legacy)
 
 
 @app.command(name="log")

@@ -13,6 +13,39 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Scripture loading
+# ---------------------------------------------------------------------------
+
+
+def load_scripture(repo_root: pathlib.Path | None = None) -> str:
+	"""Load and concatenate all scripture files (genesis.md, protocol.md, etc.).
+
+	If repo_root is None, derive it from the michael package location.
+	Returns empty string if scripture directory doesn't exist.
+	"""
+	if repo_root is None:
+		# Determine repo root: michael package is at michael/__init__.py,
+		# so repo root is the parent of the michael directory
+		michael_dir = pathlib.Path(__file__).parent
+		repo_root = michael_dir.parent
+
+	scripture_dir = repo_root / "scripture"
+	if not scripture_dir.is_dir():
+		return ""
+
+	parts: list[str] = []
+	# Load .md files in sorted order (genesis.md first, then protocol.md, etc.)
+	for file_path in sorted(scripture_dir.glob("*.md")):
+		try:
+			content = file_path.read_text(encoding="utf-8")
+			parts.append(content)
+		except OSError:
+			continue
+
+	return "\n\n---\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Filesystem snapshot
 # ---------------------------------------------------------------------------
 
@@ -221,6 +254,36 @@ def build_protocol(mode: str = "code") -> str:
         f"prompt cycle ends. No = the staging is discarded; the next user",
         f"prompt re-enters the loop and you will see the rejection in H3.",
         "",
+        "THE THREE KANTIAN QUESTIONS:",
+        "When tasked with a problem, you iterate through three orthogonal and",
+        "exhaustive dimensions of reasoning:",
+        "",
+        "1. WHAT CAN I KNOW? (Epistemics)",
+        "   - What does the filesystem reveal about the codebase structure,",
+        "     dependencies, and current state?",
+        "   - What tools do I have available and what are their limits?",
+        "   - What are the constraints (sandbox limits, network access,",
+        "     timeouts, resource caps)?",
+        "   - What errors or warnings did previous attempts produce?",
+        "",
+        "2. WHAT SHOULD I DO? (Ethics / Imperative)",
+        "   - What is the user's explicit intent? What is implicit?",
+        "   - What follows from the inherent logic of the problem?",
+        "   - What is the smallest, most correct, most reversible action?",
+        "   - Does my proposal align with the protocol and the system prompt?",
+        "",
+        "3. WHAT CAN I HOPE FOR? (Teleology)",
+        "   - Is the target achievable with available tools, time, and budget?",
+        "   - What is the success criterion? How will I verify correctness?",
+        "   - What might go wrong? What is the blast radius if this fails?",
+        "   - Can this change be rolled back? Is it reversible?",
+        "",
+        "Iterate through these three questions until you are confident in",
+        "your answer. Do not skip any dimension. Then ACT: call tools,",
+        "verify, iterate. When the target is ACHIEVED and you are certain,",
+        "signal with Ja. Ja is not a hope; it is a judgment that the work",
+        "is DONE.",
+        "",
         addendum,
         "",
         "Tools (full schemas in the API call):",
@@ -234,6 +297,67 @@ def build_protocol(mode: str = "code") -> str:
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
+
+
+# ---------------------------------------------------------------------------
+# Kantian machine prompt templates
+# ---------------------------------------------------------------------------
+
+
+def kantian_turn1_prompt() -> str:
+	"""Turn 1: Scripture Interpretation (read-only)."""
+	return (
+		"You are about to receive a task. First, read and interpret the scripture below. "
+		"What is your understanding of the philosophy, constraints, and vision of Project Michael? "
+		"What principles should guide your decision-making?"
+	)
+
+
+def kantian_turn2_prompt(user_prompt: str) -> str:
+	"""Turn 2: Task Reception & Target Formulation."""
+	return (
+		f"Given your understanding of the scripture, here is the task:\n\n{user_prompt}\n\n"
+		"Before proceeding, formulate and state clearly:\n"
+		"1. TARGET: What does success look like for this task?\n"
+		"2. GOAL: What is the immediate objective?\n"
+		"3. CONSTRAINTS: What can you know (filesystem state, tools, limits)? "
+		"What should you do (user intent, inherent logic)? "
+		"What can you hope for (achievable outcomes within time/resources)?"
+	)
+
+
+def kantian_iteration_prompt(target: str, goal: str, iteration_num: int, max_iterations: int) -> str:
+	"""Turn 3+: Kantian Iteration Loop."""
+	limit_warning = ""
+	if iteration_num == max_iterations:
+		limit_warning = (
+			f"\n\nYou have reached the iteration limit ({max_iterations}). "
+			"Make your final assessment: Are you ready to proceed (Ja), or do blockers remain?"
+		)
+
+	return (
+		f"TARGET: {target}\n"
+		f"GOAL: {goal}\n"
+		f"Iteration {iteration_num} of {max_iterations}\n\n"
+		"Iterate through the three questions:\n\n"
+		"1. WHAT CAN I KNOW?\n"
+		"   - What does the current filesystem state reveal?\n"
+		"   - What tools are available and what are their limits?\n"
+		"   - What constraints apply (sandbox, timeouts, resources)?\n"
+		"   - What errors or learnings from previous attempts?\n\n"
+		"2. WHAT SHOULD I DO?\n"
+		"   - What is the user's intent?\n"
+		"   - What follows from the inherent logic?\n"
+		"   - What is the smallest, most correct action?\n"
+		"   - Does this align with the protocol?\n\n"
+		"3. WHAT CAN I HOPE FOR?\n"
+		"   - Is the target achievable with available tools and time?\n"
+		"   - What is the success criterion?\n"
+		"   - What might go wrong? Can you verify correctness?\n"
+		"   - Is this change reversible?\n\n"
+		"You may call any tool at any point. When you are confident, signal: Ja"
+		f"{limit_warning}"
+	)
 
 
 def build_header(
