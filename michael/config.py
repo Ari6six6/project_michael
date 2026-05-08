@@ -52,7 +52,7 @@ class Config:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     system_prompt: str = G.DEFAULT_SYSTEM_PROMPT
     system_prompt_file: str = ""
-    log_responses: bool = False
+    log_responses: bool = True
     boot_poll_s: int = 10
 
     @classmethod
