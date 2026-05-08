@@ -50,16 +50,33 @@ def _tools_for_mode(mode: str) -> list[dict[str, Any]]:
 
 
 def _resolve_nitro_model(cfg: Config, model: Optional[str]) -> tuple[str, ModelProfile]:
-    """Pick the heavy model for nitro: explicit --model wins, then 'nitro', then 'big'."""
+    """Pick the heavy model for nitro: explicit --model wins, then 'hacker'/'nitro'/'big'."""
     if model:
         return cfg.get_model(model)
-    for candidate in ("nitro", "big"):
+    for candidate in ("hacker", "nitro", "big"):
         if candidate in cfg.models:
             return candidate, cfg.models[candidate]
     raise G.MichaelError(
-        "nitro requires a 'nitro' or 'big' model profile in config "
+        "nitro requires a 'hacker', 'nitro', or 'big' model profile in config "
         "(or pass --model NAME explicitly)"
     )
+
+
+def _resolve_tier(cfg: Config, tier: str) -> tuple[str, ModelProfile, str, bool]:
+    """Map a tier flag (coder/instruct/hacker) to (profile_name, profile, mode, god_mode).
+
+    Checks cfg.tier_map for user overrides first, then falls back to TIER_DEFAULTS.
+    Hacker has an extended fallback chain for backward compatibility.
+    """
+    default_profile, mode, god_mode = G.TIER_DEFAULTS[tier]
+    profile_name = cfg.tier_map.get(tier, default_profile)
+    if tier == "hacker" and profile_name not in cfg.models:
+        for candidate in ("hacker", "nitro", "big"):
+            if candidate in cfg.models:
+                profile_name = candidate
+                break
+    name, profile = cfg.get_model(profile_name)
+    return name, profile, mode, god_mode
 
 
 def _present_pending_to_user(

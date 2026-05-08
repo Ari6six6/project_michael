@@ -21,7 +21,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 import michael.globals as G
-from michael.agent import _resolve_nitro_model, _run_agent_loop, _tools_for_mode
+from michael.agent import _resolve_nitro_model, _resolve_tier, _run_agent_loop, _tools_for_mode
 from michael.backends import (
     VastClient,
     _ping_vllm,
@@ -313,50 +313,46 @@ def cmd_ask(prompt: str, model: Optional[str]) -> None:
     append_event("assistant.message", payload, project=project)
 
 
-def cmd_run(model: Optional[str]) -> None:
+def cmd_run(
+    coder: bool = False,
+    instruct: bool = False,
+    hacker: bool = False,
+    model: Optional[str] = None,
+) -> None:
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
-    _run_agent_loop(project, cfg, name, profile, mode="code", verb_label="run")
+    if model:
+        name, profile = cfg.get_model(model)
+        mode, god = "code", False
+    elif hacker:
+        name, profile, mode, god = _resolve_tier(cfg, "hacker")
+    elif instruct:
+        name, profile, mode, god = _resolve_tier(cfg, "instruct")
+    elif coder:
+        name, profile, mode, god = _resolve_tier(cfg, "coder")
+    else:
+        name, profile = cfg.get_model(None)
+        mode, god = "code", False
+    _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god)
 
 
 def cmd_new_code(model: Optional[str]) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
-    _run_agent_loop(project, cfg, name, profile, mode="code", verb_label="new code")
+    G.console.print("[yellow]'new code' is deprecated — use 'run' or 'run --coder'[/]")
+    cmd_run(coder=True, model=model)
 
 
 def cmd_new_discussion(model: Optional[str]) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
-    _run_agent_loop(
-        project, cfg, name, profile, mode="discussion", verb_label="new discussion"
-    )
+    G.console.print("[yellow]'new discussion' is deprecated — use 'run --instruct'[/]")
+    cmd_run(instruct=True, model=model)
 
 
 def cmd_nitro(model: Optional[str], god: bool = False) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = _resolve_nitro_model(cfg, model or None)
+    flag = "--hacker" if god else "--instruct"
+    G.console.print(f"[yellow]'nitro' is deprecated — use 'run {flag}'[/]")
     if god:
-        G.console.print(
-            f"[bold yellow]⚡ god mode[/] [dim]heavy model `{name}` — "
-            "hardcoded prompt, no approval gate; changes auto-apply on Ja[/]"
-        )
+        cmd_run(hacker=True, model=model)
     else:
-        G.console.print(
-            f"[bold yellow]⚡ nitro engaged[/] [dim]heavy model `{name}` — "
-            f"cold-start may take a few minutes; stop with `down --model {name}` "
-            "when finished[/]"
-        )
-    _run_agent_loop(
-        project, cfg, name, profile,
-        mode="god" if god else "nitro",
-        verb_label="nitro --god" if god else "nitro",
-        god_mode=god,
-    )
+        cmd_run(instruct=True, model=model)
 
 
 def cmd_log(tail: int) -> None:
@@ -596,10 +592,13 @@ def ask_cmd(
 
 @app.command(name="run")
 def run_cmd(
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
+    coder:   bool = typer.Option(False, "--coder",   help="Coder tier — Qwen 30B Coder."),
+    instruct: bool = typer.Option(False, "--instruct", help="Instruct tier — Qwen 30B Instruct."),
+    hacker:  bool = typer.Option(False, "--hacker",  help="Hacker tier — Qwen 235B, god mode."),
+    model:   str  = typer.Option("",   "--model", "-m", help="Power-user: exact profile name."),
 ) -> None:
-    """Multi-turn tool-calling agent loop in the active project."""
-    cmd_run(model or None)
+    """Agent loop. Default tier: coder. Use --coder / --instruct / --hacker to select tier."""
+    cmd_run(coder=coder, instruct=instruct, hacker=hacker, model=model or None)
 
 
 @app.command(name="log")
@@ -827,7 +826,12 @@ def dispatch_repl(line: str) -> None:
             return
         cmd_ask(" ".join(prompt_parts), model)
     elif cmd == "run":
-        cmd_run(_opt_value(rest, "--model", "-m"))
+        cmd_run(
+            coder="--coder" in rest,
+            instruct="--instruct" in rest,
+            hacker="--hacker" in rest,
+            model=_opt_value(rest, "--model", "-m"),
+        )
     elif cmd == "nitro":
         cmd_nitro(
             _opt_value(rest, "--model", "-m"),
