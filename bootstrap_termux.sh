@@ -26,7 +26,7 @@ fi
 echo "==> [1/6] pkg update + dependencies"
 pkg update
 pkg upgrade -y
-pkg install -y python openssh git rsync coreutils nano
+pkg install -y python openssh git rsync coreutils nano rust
 
 echo "==> [2/6] python deps"
 pip install -r "${PROJECT_DIR}/requirements.txt"
