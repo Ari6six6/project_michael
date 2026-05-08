@@ -305,24 +305,22 @@ def build_protocol(mode: str = "code") -> str:
 
 
 def kantian_turn1_prompt() -> str:
-	"""Turn 1: Scripture Interpretation (read-only)."""
+	"""Turn 1: Scripture Interpretation (full tools available)."""
 	return (
-		"You are about to receive a task. First, read and interpret the scripture below. "
-		"What is your understanding of the philosophy, constraints, and vision of Project Michael? "
-		"What principles should guide your decision-making?"
+		"Read and interpret this scripture. What is your understanding of the "
+		"philosophy, constraints, and prior work in this project? "
+		"You may call any tool to examine the codebase, run tests, or explore the filesystem."
 	)
 
 
-def kantian_turn2_prompt(user_prompt: str) -> str:
-	"""Turn 2: Task Reception & Target Formulation."""
+def kantian_turn2_prompt(user_question: str) -> str:
+	"""Turn 2: Question Clarification."""
 	return (
-		f"Given your understanding of the scripture, here is the task:\n\n{user_prompt}\n\n"
-		"Before proceeding, formulate and state clearly:\n"
-		"1. TARGET: What does success look like for this task?\n"
-		"2. GOAL: What is the immediate objective?\n"
-		"3. CONSTRAINTS: What can you know (filesystem state, tools, limits)? "
-		"What should you do (user intent, inherent logic)? "
-		"What can you hope for (achievable outcomes within time/resources)?"
+		f"Given your understanding, here is the question:\n\n{user_question}\n\n"
+		"Clarify:\n"
+		"1. What is being asked?\n"
+		"2. What is success?\n"
+		"3. What constraints apply?"
 	)
 
 
