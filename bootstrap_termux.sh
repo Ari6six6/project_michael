@@ -29,8 +29,7 @@ pkg upgrade -y
 pkg install -y python openssh git rsync coreutils nano
 
 echo "==> [2/6] python deps"
-python -m pip install --upgrade pip
-python -m pip install -r "${PROJECT_DIR}/requirements.txt"
+pip install -r "${PROJECT_DIR}/requirements.txt"
 
 echo "==> [3/6] state directory"
 install -d -m 0700 "${HOME}/.michael"
