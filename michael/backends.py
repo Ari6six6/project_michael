@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import pathlib
 import shlex
@@ -14,7 +15,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
-from openai import OpenAI
 
 import michael.globals as G
 from michael.config import Config, ModelProfile, SandboxConfig, VpsConfig
@@ -188,52 +188,124 @@ class VastClient:
 
 
 # ---------------------------------------------------------------------------
-# LLM client
+# LLM client  (httpx-based shim — no Rust/openai-SDK dependency)
 # ---------------------------------------------------------------------------
 
+class _FunctionCall:
+    __slots__ = ("name", "arguments")
+    def __init__(self, d: dict) -> None:
+        self.name: str = d.get("name", "")
+        self.arguments: str = d.get("arguments", "{}")
 
-def llm_client(endpoint: str, api_key: Optional[str]) -> OpenAI:
-    """vLLM requires a non-empty key even when launched without auth — use 'EMPTY'."""
-    return OpenAI(base_url=endpoint, api_key=api_key or "EMPTY")
+class _ToolCall:
+    __slots__ = ("id", "function")
+    def __init__(self, d: dict) -> None:
+        self.id: str = d.get("id", "")
+        self.function = _FunctionCall(d.get("function", {}))
 
+class _Message:
+    __slots__ = ("content", "tool_calls")
+    def __init__(self, d: dict) -> None:
+        self.content: str = d.get("content") or ""
+        self.tool_calls: list[_ToolCall] = [_ToolCall(tc) for tc in (d.get("tool_calls") or [])]
 
-def _usage_dict(u: Any) -> dict[str, Any]:
-    try:
-        return u.model_dump()
-    except AttributeError:
-        return {
-            "prompt_tokens": getattr(u, "prompt_tokens", 0),
-            "completion_tokens": getattr(u, "completion_tokens", 0),
-            "total_tokens": getattr(u, "total_tokens", 0),
+class _Choice:
+    __slots__ = ("message",)
+    def __init__(self, d: dict) -> None:
+        self.message = _Message(d.get("message", {}))
+
+class _ChatResponse:
+    __slots__ = ("choices",)
+    def __init__(self, d: dict) -> None:
+        self.choices = [_Choice(c) for c in d.get("choices", [])]
+
+class _Completions:
+    def __init__(self, endpoint: str, api_key: str) -> None:
+        self._endpoint = endpoint.rstrip("/")
+        self._api_key = api_key
+
+    def create(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        tools: Optional[list] = None,
+        tool_choice: Optional[str] = None,
+        stream: bool = False,
+        timeout: float = 60.0,
+        stream_options: Optional[dict] = None,
+    ) -> _ChatResponse:
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
         }
+        payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
+        if stream_options:
+            payload["stream_options"] = stream_options
+        with httpx.Client(timeout=timeout) as c:
+            r = c.post(f"{self._endpoint}/v1/chat/completions", json=payload, headers=headers)
+            r.raise_for_status()
+            return _ChatResponse(r.json())
+
+class _LlmClient:
+    def __init__(self, endpoint: str, api_key: str) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.chat = type("_Chat", (), {"completions": _Completions(endpoint, api_key)})()
+
+
+def llm_client(endpoint: str, api_key: Optional[str]) -> _LlmClient:
+    """vLLM requires a non-empty key even when launched without auth — use 'EMPTY'."""
+    return _LlmClient(endpoint, api_key or "EMPTY")
 
 
 def chat_stream(
-    client: OpenAI,
+    client: _LlmClient,
     model: str,
     messages: list[dict[str, Any]],
     *,
     timeout_s: float = 60.0,
 ) -> tuple[str, dict[str, Any]]:
     """Stream a plain (no-tools) completion to stdout. Returns (text, usage)."""
+    headers = {
+        "Authorization": f"Bearer {client.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
     chunks: list[str] = []
     usage: dict[str, Any] = {}
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True,
-        timeout=timeout_s,
-        stream_options={"include_usage": True},
-    )
-    for chunk in stream:
-        if chunk.choices:
-            delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
-            if delta:
-                chunks.append(delta)
-                G.console.out(delta, end="")
-        chunk_usage = getattr(chunk, "usage", None)
-        if chunk_usage is not None:
-            usage = _usage_dict(chunk_usage)
+    with httpx.Client(timeout=httpx.Timeout(timeout_s, connect=10.0)) as c:
+        with c.stream("POST", f"{client.endpoint}/v1/chat/completions",
+                      json=payload, headers=headers) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if choices:
+                    text = (choices[0].get("delta") or {}).get("content") or ""
+                    if text:
+                        chunks.append(text)
+                        G.console.out(text, end="")
+                u = obj.get("usage")
+                if u:
+                    usage = u
     G.console.out("")
     return "".join(chunks), usage
 
