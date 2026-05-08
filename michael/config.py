@@ -54,6 +54,7 @@ class Config:
     system_prompt_file: str = ""
     log_responses: bool = True
     boot_poll_s: int = 10
+    tier_map: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "Config":
@@ -122,17 +123,22 @@ def make_stub_config() -> Config:
         models={
             "coder": ModelProfile(
                 vast_instance_id="",
-                served_model_name="qwen3-coder",
+                served_model_name="qwen2.5-coder-32b-instruct",
             ),
-            "big": ModelProfile(
+            "instruct": ModelProfile(
                 vast_instance_id="",
-                served_model_name="qwen3",
+                served_model_name="qwen2.5-32b-instruct",
+            ),
+            "hacker": ModelProfile(
+                vast_instance_id="",
+                served_model_name="qwen2.5-72b-instruct",
             ),
         },
         default_model="coder",
         vps=VpsConfig(),
         sandbox=SandboxConfig(),
         log_responses=True,
+        tier_map={},
     )
 
 
@@ -157,4 +163,5 @@ CONFIG_HELP: dict[str, str] = {
     "system_prompt_file": "If set, read system prompt from this file.",
     "log_responses": "If true, log full LLM responses to events.jsonl.",
     "boot_poll_s": "Poll interval while waiting for vLLM to come up.",
+    "tier_map": "Override tier-to-profile mapping, e.g. {\"instruct\": \"my-70b\"}. Empty = use defaults.",
 }
