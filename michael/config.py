@@ -55,6 +55,10 @@ class Config:
     log_responses: bool = True
     boot_poll_s: int = 10
     tier_map: dict[str, str] = field(default_factory=dict)
+    use_stateful_kantian: bool = True
+    scripture_dir: str = "scripture"
+    max_kantian_iterations: int = 5
+    kantian_visible: bool = False
 
     @classmethod
     def load(cls) -> "Config":
@@ -164,4 +168,8 @@ CONFIG_HELP: dict[str, str] = {
     "log_responses": "If true, log full LLM responses to events.jsonl.",
     "boot_poll_s": "Poll interval while waiting for vLLM to come up.",
     "tier_map": "Override tier-to-profile mapping, e.g. {\"instruct\": \"my-70b\"}. Empty = use defaults.",
+    "use_stateful_kantian": "Enable the three-turn Kantian machine (default true).",
+    "scripture_dir": "Path to scripture files (relative to repo root, default 'scripture').",
+    "max_kantian_iterations": "Maximum Kantian question iterations per task (default 5).",
+    "kantian_visible": "Show Turn 1/2 output even in god mode (default false = silent).",
 }

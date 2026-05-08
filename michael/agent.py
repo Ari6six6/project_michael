@@ -31,7 +31,13 @@ from michael.tools import (
     dispatch_tool_call,
     _format_delta,
 )
-from michael.utils import build_header
+from michael.utils import (
+    build_header,
+    load_scripture,
+    kantian_turn1_prompt,
+    kantian_turn2_prompt,
+    kantian_iteration_prompt,
+)
 
 _NUDGE_NO_JA = (
     "system reminder: you ended your turn without tool calls and without "
@@ -140,7 +146,7 @@ def _present_pending_to_user(
     return choice in ("", "y", "yes")
 
 
-def _run_agent_loop(
+def _run_kantian_loop(
     project: Project,
     cfg: Config,
     name: str,
@@ -150,9 +156,408 @@ def _run_agent_loop(
     verb_label: str,
     god_mode: bool = False,
 ) -> None:
-    """Shared agent-loop body for `run`, `new code`, `new discussion`, `nitro`."""
+	"""Three-turn Kantian machine: scripture → target → iterate.
+
+	Turn 1: Read scripture, interpret (read-only)
+	Turn 2: Receive task, formulate target/goal/constraints
+	Turn 3+: Iterate through Kantian questions with full toolset
+	"""
+	endpoint = _require_endpoint(profile, name)
+	_ssh_preflight(cfg)
+
+	client = llm_client(endpoint, profile.vllm_api_key)
+	backend = make_backend(cfg)
+	tools_read_only = _tools_for_mode("discussion")  # read-only tools for Turn 1
+	tools_full = _tools_for_mode(mode)  # full toolset for Turn 3+
+	base_prompt = cfg.resolved_system_prompt()
+
+	backend_label = (
+		"remote-podman (vps)" if cfg.vps_active()
+		else ("local-podman" if isinstance(backend, LocalPodmanBackend)
+		      else "no-sandbox")
+	)
+	G.console.print(
+		f"[bold cyan]michael {verb_label}[/] [dim]project={project.slug}  "
+		f"model={name}  mode={mode}  kantian=true  sandbox={backend_label}[/]"
+	)
+	G.console.print(
+		f"[dim]Kantian machine (three-turn): scripture → target → iterate[/]"
+	)
+
+	session = PromptSession(
+		history=FileHistory(str(G.REPL_HISTORY_PATH)),
+		auto_suggest=AutoSuggestFromHistory(),
+	)
+
+	append_event(
+		"agent.started",
+		{
+			"model": name,
+			"served": profile.served_model_name,
+			"mode": mode,
+			"god": god_mode,
+			"kantian": True,
+			"sandbox": backend_label,
+		},
+		project=project,
+	)
+
+	while True:
+		# Load scripture
+		scripture = load_scripture()
+		if scripture:
+			append_event(
+				"scripture.loaded",
+				{
+					"length": len(scripture),
+					"lines": len(scripture.split("\n")),
+				},
+				project=project,
+			)
+
+		# TURN 1: Scripture Interpretation (read-only)
+		turn1_prompt = kantian_turn1_prompt()
+		if scripture:
+			turn1_msg = f"{scripture}\n\n---\n\n{turn1_prompt}"
+		else:
+			turn1_msg = turn1_prompt
+
+		header = build_header(project, base_prompt, mode=mode)
+		messages: list[dict[str, Any]] = [
+			{"role": "system", "content": header},
+			{"role": "user", "content": turn1_msg},
+		]
+
+		try:
+			G.console.print(f"[dim]· Turn 1: interpreting scripture…[/]")
+			resp = client.chat.completions.create(
+				model=profile.served_model_name,
+				messages=messages,
+				tools=tools_read_only,
+				tool_choice="auto",
+				stream=False,
+				timeout=float(profile.request_timeout_s),
+			)
+		except Exception as e:
+			G.err.print(f"LLM error (Turn 1): {e}")
+			append_event(
+				"error",
+				{"where": "kantian_turn1", "msg": str(e)},
+				project=project,
+			)
+			break
+
+		msg = resp.choices[0].message
+		turn1_content = msg.content or ""
+		turn1_tool_calls = msg.tool_calls or []
+
+		# Process any Turn 1 tool calls (read-only)
+		for tc in turn1_tool_calls:
+			tname = tc.function.name
+			try:
+				targs = json.loads(tc.function.arguments or "{}")
+			except json.JSONDecodeError:
+				targs = {}
+			dispatch_tool_call(tname, targs, project, cfg, backend, PendingChanges())
+
+		# Log Turn 1
+		if turn1_content:
+			append_event(
+				"scripture.interpreted",
+				{"interpretation": turn1_content if cfg.log_responses else "..."},
+				project=project,
+			)
+		if not cfg.kantian_visible and god_mode:
+			G.console.print(f"[dim]· Turn 1 complete (output suppressed in god mode)[/]")
+		else:
+			if turn1_content:
+				G.console.print(f"[dim]{turn1_content}[/]")
+
+		# Add Turn 1 response to messages
+		messages.append({"role": "assistant", "content": turn1_content})
+		if turn1_tool_calls:
+			messages[-1]["tool_calls"] = [
+				{
+					"id": tc.id,
+					"type": "function",
+					"function": {
+						"name": tc.function.name,
+						"arguments": tc.function.arguments,
+					},
+				}
+				for tc in turn1_tool_calls
+			]
+
+		# TURN 2: Task Reception & Target Formulation
+		if god_mode:
+			user_prompt = G._GOD_MODE_PROMPT
+		else:
+			try:
+				user_prompt = session.prompt(">>> ")
+			except (EOFError, KeyboardInterrupt):
+				break
+			user_prompt = (user_prompt or "").strip()
+			if not user_prompt or user_prompt.lower() in ("quit", "exit"):
+				break
+
+		append_event(
+			"prompt.sent",
+			{
+				"prompt": user_prompt,
+				"model": name,
+				"served": profile.served_model_name,
+				"mode": mode,
+				"turn": 2,
+			},
+			project=project,
+		)
+
+		turn2_prompt = kantian_turn2_prompt(user_prompt)
+		messages.append({"role": "user", "content": turn2_prompt})
+
+		try:
+			G.console.print(f"[dim]· Turn 2: formulating target and goal…[/]")
+			resp = client.chat.completions.create(
+				model=profile.served_model_name,
+				messages=messages,
+				tools=tools_read_only,  # Still read-only for Turn 2
+				tool_choice="auto",
+				stream=False,
+				timeout=float(profile.request_timeout_s),
+			)
+		except Exception as e:
+			G.err.print(f"LLM error (Turn 2): {e}")
+			append_event(
+				"error",
+				{"where": "kantian_turn2", "msg": str(e)},
+				project=project,
+			)
+			break
+
+		msg = resp.choices[0].message
+		turn2_content = msg.content or ""
+
+		# Parse target/goal/constraints from Turn 2
+		target = ""
+		goal = ""
+		constraints = ""
+		for line in turn2_content.split("\n"):
+			if line.startswith("TARGET:"):
+				target = line[7:].strip()
+			elif line.startswith("GOAL:"):
+				goal = line[5:].strip()
+			elif line.startswith("CONSTRAINTS:"):
+				constraints = line[12:].strip()
+
+		append_event(
+			"target.formulated",
+			{
+				"target": target,
+				"goal": goal,
+				"constraints": constraints,
+			},
+			project=project,
+		)
+
+		if not cfg.kantian_visible and god_mode:
+			G.console.print(f"[dim]· Turn 2 complete (output suppressed in god mode)[/]")
+		else:
+			if turn2_content:
+				G.console.print(f"[dim]{turn2_content}[/]")
+
+		messages.append({"role": "assistant", "content": turn2_content})
+
+		# TURN 3+: Kantian Iteration Loop (full toolset)
+		pending = PendingChanges()
+		iteration_num = 0
+		ja_received = False
+
+		try:
+			while iteration_num < cfg.max_kantian_iterations:
+				iteration_num += 1
+				iteration_prompt = kantian_iteration_prompt(
+					target, goal, iteration_num, cfg.max_kantian_iterations
+				)
+				messages.append({"role": "user", "content": iteration_prompt})
+
+				G.console.print(f"[dim]· Turn 3.{iteration_num}: iterating Kantian questions…[/]")
+				try:
+					resp = client.chat.completions.create(
+						model=profile.served_model_name,
+						messages=messages,
+						tools=tools_full,
+						tool_choice="auto",
+						stream=False,
+						timeout=float(profile.request_timeout_s),
+					)
+				except Exception as e:
+					G.err.print(f"LLM error (iteration {iteration_num}): {e}")
+					append_event(
+						"error",
+						{
+							"where": "kantian_iteration",
+							"iteration": iteration_num,
+							"msg": str(e),
+						},
+						project=project,
+					)
+					pending.discard()
+					break
+
+				msg = resp.choices[0].message
+				iteration_content = msg.content or ""
+				tool_calls = msg.tool_calls or []
+
+				# Log iteration
+				if iteration_content or tool_calls:
+					payload: dict[str, Any] = {
+						"iteration_num": iteration_num,
+						"tools_called": [tc.function.name for tc in tool_calls],
+					}
+					if cfg.log_responses and iteration_content:
+						payload["answer"] = iteration_content
+					append_event(
+						"kantian.iteration",
+						payload,
+						project=project,
+					)
+
+				# Process tool calls
+				if tool_calls:
+					for tc in tool_calls:
+						tname = tc.function.name
+						try:
+							targs = json.loads(tc.function.arguments or "{}")
+						except json.JSONDecodeError:
+							targs = {}
+						result = dispatch_tool_call(
+							tname, targs, project, cfg, backend, pending,
+						)
+						messages.append({
+							"role": "tool",
+							"tool_call_id": tc.id,
+							"content": result,
+						})
+
+				# Add assistant message to thread
+				assistant_msg: dict[str, Any] = {
+					"role": "assistant",
+					"content": iteration_content,
+				}
+				if tool_calls:
+					assistant_msg["tool_calls"] = [
+						{
+							"id": tc.id,
+							"type": "function",
+							"function": {
+								"name": tc.function.name,
+								"arguments": tc.function.arguments,
+							},
+						}
+						for tc in tool_calls
+					]
+				messages.append(assistant_msg)
+
+				# Check for Ja
+				if G._message_ends_with_ja(iteration_content):
+					ja_received = True
+					append_event(
+						"assistant.ja",
+						{
+							"iteration": iteration_num,
+							"pending": len(pending.change_log),
+						},
+						project=project,
+					)
+					break
+
+				# If no tool calls and no Ja, nudge
+				if not tool_calls and not ja_received:
+					G.console.print(
+						f"[yellow]· iteration {iteration_num}: no Ja and no tools — nudging[/]"
+					)
+					messages.append({
+						"role": "system",
+						"content": _NUDGE_NO_JA,
+					})
+
+		except KeyboardInterrupt:
+			G.err.print(f"\nIteration {iteration_num}: aborted by user")
+			append_event(
+				"agent.aborted",
+				{"iteration": iteration_num, "pending": len(pending.change_log)},
+				project=project,
+			)
+			pending.discard()
+			if god_mode:
+				break
+			continue
+
+		if not ja_received:
+			pending.discard()
+			if god_mode:
+				break
+			continue
+
+		# Execution phase (same as stateless loop)
+		if god_mode:
+			if pending.change_log:
+				summaries = commit_pending(project, pending)
+				for s in summaries:
+					G.console.print(f"[green]auto-applied[/] {s['summary']}")
+			break
+		else:
+			approved = _present_pending_to_user(project, pending, iteration_content)
+			if approved:
+				summaries = commit_pending(project, pending)
+				if summaries:
+					G.console.print(f"[green]applied[/] {len(summaries)} change(s)")
+			else:
+				for entry in pending.change_log:
+					append_event(
+						"tool.rejected",
+						{
+							"tool": entry["tool"],
+							"args": entry["args"],
+							"summary": _summary_for(entry["tool"], entry["args"]),
+							"delta": entry["delta"],
+						},
+						project=project,
+					)
+				pending.discard()
+				G.console.print("[yellow]rejected[/] pending changes discarded")
+
+	append_event(
+		"agent.ended",
+		{"model": name, "mode": mode, "god": god_mode, "kantian": True},
+		project=project,
+	)
+
+
+def _run_agent_loop(
+    project: Project,
+    cfg: Config,
+    name: str,
+    profile: ModelProfile,
+    mode: str,
+    *,
+    verb_label: str,
+    god_mode: bool = False,
+    use_kantian: bool = True,
+) -> None:
+    """Shared agent-loop body for `run`, `new code`, `new discussion`, `nitro`.
+
+    If use_kantian is True, runs the three-turn Kantian machine.
+    Otherwise, uses the stateless loop.
+    """
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
+
+    if use_kantian and cfg.use_stateful_kantian:
+        return _run_kantian_loop(
+            project, cfg, name, profile, mode,
+            verb_label=verb_label, god_mode=god_mode
+        )
 
     client = llm_client(endpoint, profile.vllm_api_key)
     backend = make_backend(cfg)

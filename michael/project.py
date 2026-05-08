@@ -15,6 +15,39 @@ import michael.globals as G
 
 
 # ---------------------------------------------------------------------------
+# Event types (append_event and iter_events)
+# ---------------------------------------------------------------------------
+#
+# Known event types (non-exhaustive):
+#
+# Project lifecycle:
+#   project.created — project initialized
+#   project.activated — project set as active
+#
+# Agent loop:
+#   prompt.sent — user entered a prompt
+#   assistant.message — LLM generated a response (full text if log_responses=true)
+#   assistant.ja — LLM signaled completion with "Ja" passcode
+#
+# Tool execution:
+#   tool.staged — tool call staged (write_file, apply_patch)
+#   tool.executed — staged changes committed to real filesystem
+#   tool.rejected — user rejected staged changes
+#   tool.verify_failed — verification script failed in staging
+#   tool.delta_mismatch — actual delta didn't match expected_changes prediction
+#
+# Kantian machine (stateful):
+#   scripture.loaded — scripture files loaded
+#   scripture.interpreted — LLM interpreted scripture (Turn 1)
+#   target.formulated — LLM formulated target/goal/constraints (Turn 2)
+#   kantian.iteration — LLM iterated through Kantian questions (Turn 3+)
+#
+# Instance management:
+#   instance.start_requested, instance.started, instance.stop_requested, instance.stopped
+#   instance.poll — periodic polling of Vast.ai instance status
+
+
+# ---------------------------------------------------------------------------
 # Project model
 # ---------------------------------------------------------------------------
 
