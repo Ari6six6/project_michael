@@ -7,18 +7,19 @@ import shutil
 import pytest
 
 import main as m
+import michael.globals as michael_globals
 
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Patch all michael path globals to live under tmp_path/.michael."""
     state = tmp_path / ".michael"
-    monkeypatch.setattr(m, "STATE_DIR", state)
-    monkeypatch.setattr(m, "GLOBAL_CONFIG_PATH", state / "config.json")
-    monkeypatch.setattr(m, "GLOBAL_EVENTS_PATH", state / "events.jsonl")
-    monkeypatch.setattr(m, "STATE_FILE_PATH", state / "state.json")
-    monkeypatch.setattr(m, "PROJECTS_DIR", state / "projects")
-    monkeypatch.setattr(m, "REPL_HISTORY_PATH", state / "repl_history")
+    monkeypatch.setattr(michael_globals, "STATE_DIR", state)
+    monkeypatch.setattr(michael_globals, "GLOBAL_CONFIG_PATH", state / "config.json")
+    monkeypatch.setattr(michael_globals, "GLOBAL_EVENTS_PATH", state / "events.jsonl")
+    monkeypatch.setattr(michael_globals, "STATE_FILE_PATH", state / "state.json")
+    monkeypatch.setattr(michael_globals, "PROJECTS_DIR", state / "projects")
+    monkeypatch.setattr(michael_globals, "REPL_HISTORY_PATH", state / "repl_history")
     state.mkdir()
     return state
 
