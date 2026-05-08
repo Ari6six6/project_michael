@@ -1,257 +1,202 @@
 # The Protocol: Stateful Kantian Machine
 
-This document describes the architecture and flow of Michael's stateful machine — the three-turn Kantian loop that governs every `michael run` invocation.
+The machine implements a **closed question-answer loop** grounded in Kant's critical philosophy.
+
+## Fundamental Truth
+
+**Question → Iterate → Ja (Answer) → Execute**
+
+User asks question. LLM answers through iteration. "Ja" is the final answer value. System executes. Done.
+
+---
 
 ## The Three-Turn Flow
 
-### Turn 1: Scripture Interpretation (Read-Only)
+### Turn 1: Scripture & Tools (Full Toolset)
 
 ```
-User invokes: michael run
+User invokes: michael run [question]
     ↓
-Load Scripture (genesis.md + protocol.md + other files)
+Load Scripture (genesis.md + protocol.md + project history)
     ↓
-Restrict toolset to: read_file, list_dir, search_memory
+Full toolset available: read_file, list_dir, write_file, apply_patch, 
+                       run_in_sandbox, run_shell, search_memory
     ↓
 Send to LLM:
-"You are about to receive a task. First, read and interpret this scripture. 
-What is your understanding of the philosophy and constraints?"
+"Read and interpret this scripture. What is your understanding of the 
+philosophy, constraints, and prior work? You may call any tool to 
+examine the codebase."
     ↓
-LLM examines scripture, calls read_file/list_dir as needed
+LLM reads scripture + explores filesystem as needed
     ↓
 LLM responds with interpretation
-    ↓
-Log event: scripture.interpreted
-    ↓
-[In normal mode: show to user]
-[In god mode: suppress output]
 ```
 
-**Purpose**: Anchor the LLM in the foundational principles before engaging the specific task.
+**Purpose**: Ground the LLM in foundation + current state, with full ability to inspect.
 
 ---
 
-### Turn 2: Task Reception & Target Formulation
+### Turn 2: Question Clarification
 
 ```
-Read user's actual prompt from stdin
+LLM reads user's actual question from stdin
     ↓
 Send to LLM:
-"Given your understanding of the scripture, here is the task: [user_prompt]
+"Given your understanding, here is the question:
 
-Formulate and state clearly:
-1. TARGET: What does success look like for this task?
-2. GOAL: What is the immediate objective?
-3. CONSTRAINTS: What you know (filesystem state, tools), what you should do (user intent), and what you can hope for (achievable outcomes)."
+[user_question]
+
+Clarify:
+1. What is being asked?
+2. What is success?
+3. What constraints apply?"
     ↓
-LLM formulates target/goal/constraints
-    ↓
-Log event: target.formulated
-    ↓
-[In normal mode: show to user]
-[In god mode: suppress output]
+LLM clarifies the question
 ```
 
-**Purpose**: Create explicit, shared understanding of the problem scope before tool invocation.
+**Purpose**: Ensure precise understanding before iteration.
 
 ---
 
-### Turn 3+: Kantian Iteration Loop (Full Toolset)
+### Turn 3+: Kantian Iteration Loop (Includes VPS Sandbox Testing)
 
 ```
-iteration_count = 0
+iteration_num = 0
 
 LOOP:
-  iteration_count += 1
+  iteration_num += 1
   
-  [If iteration_count == max_kantian_iterations (default 5)]:
-    Inject nudge: "You have reached the iteration limit (5). 
-    Make your final assessment: Are you ready to proceed (Ja), 
-    or do blockers remain? Signal your decision."
+  Send to LLM (with literal questions spelled out):
   
-  Send to LLM:
-  "Given the target and goal above, iterate through the three questions:
+  ===== THE THREE KANTIAN QUESTIONS =====
   
   1. WHAT CAN I KNOW?
-     - What does the current filesystem reveal about the problem?
-     - What tools do you have available?
-     - What are the constraints (sandbox limits, timeouts, network)?
-     - What is the current state?
+     - What does the filesystem reveal?
+     - What tools are available?
+     - What constraints exist (time, resources, environment)?
+     - What can I test?
   
   2. WHAT SHOULD I DO?
-     - What is the user's intent (explicit and implicit)?
-     - What follows from the inherent logic of the problem?
-     - What is the smallest, most correct action forward?
-     - Does this align with the protocol?
+     - What is the user intent?
+     - What follows from the logic of the problem?
+     - What is the smallest correct step?
+     - Is this reversible?
   
   3. WHAT CAN I HOPE FOR?
-     - Is the target achievable with available tools and time?
+     - Is the goal achievable?
+     - Can I verify it works?
      - What is the success criterion?
-     - What might go wrong? Can you verify correctness?
-     - Is this change reversible?
+     - What might go wrong?
   
-  You may call any tool at any point. Iterate until you are confident, 
-  then decide: Ja (proceed) or continue iterating."
+  =======================================
   
-  ↓
-  LLM answers the three questions, calls tools as needed
-  ↓
-  Log event: kantian.iteration (with iteration_num, question, answer)
-  ↓
-  [If LLM signals "Ja"]: break LOOP
-  [Else]: continue LOOP
+  Answer all three. Then if uncertain, call tools:
+  - read_file / list_dir to inspect code
+  - write_file / apply_patch to propose changes
+  - run_in_sandbox to test on VPS before committing
+  - run_shell for local inspection
+  
+  After testing, loop back or signal: Ja
 ```
 
-**Purpose**: Enforce explicit reasoning through epistemic, ethical, and teleological dimensions. The LLM gains autonomy to iterate until it achieves internal certainty.
+**VPS Sandbox Loop:**
+- When proposing changes, run_in_sandbox tests them on VPS
+- Verify before committing
+- Feed results back into next iteration
+
+**Purpose**: Iterate through three orthogonal dimensions of reasoning. Test. Refine. Until certain.
 
 ---
 
-### Turn 4: Execution Phase
+## Exit Condition: Ja
 
-```
-[Loop ended on "Ja"]
-    ↓
-Present staged changes to user:
-"The agent proposes the following changes:
-[show file diffs, tool calls executed]
+**"Ja" is not a signal. It is the final answer.**
 
-Accept? (Y/n)"
-    ↓
-[In normal mode]: wait for user input
-[In god mode]: auto-approve (Ja means auto-commit)
-    ↓
-[If approved]: 
-  - Commit staged changes to real filesystem
-  - Save trash snapshot for undo
-  - Log event: tool.executed (for each change)
-  ↓
-[If rejected]:
-  - Discard staged changes
-  - Log event: tool.rejected
-  - Return to user
-```
+When the LLM has:
+1. Answered the original question
+2. Verified the answer works (via sandbox testing)
+3. Refined through iteration
+4. Achieved certainty
 
-**Purpose**: User retains the final gate (except in god mode, where the system has full authority once LLM signals Ja).
+It ends the message with **Ja** (case-sensitive, on its own line or trailing).
+
+This contains the final answer. The system:
+- Captures it
+- Auto-executes all staged changes
+- Returns the answer + artifacts to the user
+- Loop closes
 
 ---
 
-## Event Log Architecture
+## No Gate, Always Auto-Execute
 
-Every turn is logged with full context:
+- The system is **always in god mode**
+- User asks question
+- LLM iterates through Kantian loop
+- On "Ja": changes auto-commit, no approval needed
+- User gets answer + filled project directory
+
+---
+
+## Constraints
+
+- **Max iterations:** 5 (configurable). If reached, nudge LLM: "You have reached the limit. Final answer: Ja or blockers?"
+- **Iteration counter:** visible to LLM each turn
+- **Sandbox testing:** encouraged on every risky change
+- **Scripture:** always loaded, always available for reference
+
+---
+
+## Events
+
+- `michael.run.started` — session begins
+- `scripture.loaded` — scripture files read
+- `scripture.interpreted` — Turn 1 complete
+- `question.clarified` — Turn 2 complete
+- `kantian.iteration` — Turn 3.N complete (with question, answer, tools called)
+- `sandbox.test.run` — test executed on VPS
+- `sandbox.test.passed` / `sandbox.test.failed` — result
+- `assistant.ja` — final answer received
+- `tool.executed` — changes committed
+- `michael.run.ended` — session closes
+
+---
+
+## Example Flow
 
 ```
-{
-  "seq": 1,
-  "ts": "2026-05-08T14:45:00.123456+00:00",
-  "type": "michael.run.started",
-  "payload": {"mode": "kantian", "user_prompt": "create a hello.py"}
-}
+$ michael run
 
-{
-  "seq": 2,
-  "type": "scripture.loaded",
-  "payload": {"scripture_length_chars": 5000, "file_count": 2}
-}
+>>> What's a good pattern for async error handling in this codebase?
 
-{
-  "seq": 3,
-  "type": "scripture.interpreted",
-  "payload": {"interpretation": "...full LLM response..."}
-}
+[Turn 1: Scripture interpretation]
+LLM reads genesis, protocol, project history, explores filesystem
 
-{
-  "seq": 4,
-  "type": "target.formulated",
-  "payload": {"target": "...", "goal": "...", "constraints": "..."}
-}
+[Turn 2: Question clarification]
+LLM: "You're asking about async error patterns. I'll examine the codebase,
+propose examples, test them, and suggest the best pattern."
 
-{
-  "seq": 5,
-  "type": "kantian.iteration",
-  "payload": {"iteration_num": 1, "question": "know", "answer": "...", "tools_called": ["read_file"]}
-}
+[Turn 3.1: Kantian iteration]
+1. WHAT CAN I KNOW? [reads error handling code, examines tests]
+2. WHAT SHOULD I DO? [proposes three patterns]
+3. WHAT CAN I HOPE FOR? [can verify with tests]
+→ run_in_sandbox to test pattern A
+→ test fails, refine
 
-{
-  "seq": 6,
-  "type": "kantian.iteration",
-  "payload": {"iteration_num": 2, "question": "should", "answer": "...", "tools_called": ["write_file"]}
-}
+[Turn 3.2: Kantian iteration]
+1. WHAT CAN I KNOW? [test results show issue]
+2. WHAT SHOULD I DO? [fix the pattern]
+3. WHAT CAN I HOPE FOR? [retest]
+→ run_in_sandbox again
+→ test passes
 
-{
-  "seq": 7,
-  "type": "kantian.iteration",
-  "payload": {"iteration_num": 3, "question": "hope", "answer": "...", "tools_called": []}
-}
+Ja
 
-{
-  "seq": 8,
-  "type": "assistant.ja",
-  "payload": {"iteration_count": 3, "final_message": "Ja"}
-}
+Here is the recommended async error handling pattern for your codebase:
+[answer with code examples, artifacts]
 
-{
-  "seq": 9,
-  "type": "tool.executed",
-  "payload": {"path": "hello.py", "action": "write_file", ...}
-}
+[System auto-commits, loop closes]
 ```
-
----
-
-## Backward Compatibility
-
-The flag `--legacy` disables the Kantian machine and restores the original stateless loop:
-
-```bash
-michael run                    # Uses stateful Kantian machine (default)
-michael run --legacy           # Uses old stateless loop
-michael ask "prompt" --legacy  # One-shot without scripture/three-turn
-```
-
----
-
-## God Mode Behavior
-
-`michael nitro --god` engages the heavy model with full authority:
-
-1. **Turn 1 & 2 are silent** — no output shown to user
-2. **Turn 3+ iterations are silent** — no output shown to user
-3. **On Ja**: changes are **auto-committed** without user confirmation
-4. **Result**: User sees only the final state and the changelog
-
-This is appropriate for large-scale refactoring where you trust the model's read of the full codebase.
-
----
-
-## Configuration
-
-```json
-{
-  "use_stateful_kantian": true,
-  "max_kantian_iterations": 5,
-  "kantian_visible": false,
-  "scripture_dir": "scripture"
-}
-```
-
-- `use_stateful_kantian` — enable/disable the three-turn loop globally
-- `max_kantian_iterations` — maximum iterations before nudge-to-Ja
-- `kantian_visible` — show Turn 1/2 output even in god mode
-- `scripture_dir` — path to scripture files (relative to repo root)
-
----
-
-## Invariants
-
-1. **Scripture is read-only** — Turn 1 cannot mutate the codebase
-2. **Iteration counter increases monotonically** — no infinite loops
-3. **Ja is the only exit** — the LLM must explicitly signal completion
-4. **Full context on every turn** — the LLM sees full history from the event log
-5. **Staging before execution** — all mutations are staged and verified before real commit
-
----
-
-[Add implementation notes, gotchas, or design rationale here as needed.]
 
 ---
 
