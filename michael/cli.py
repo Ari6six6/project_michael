@@ -313,27 +313,12 @@ def cmd_ask(prompt: str, model: Optional[str]) -> None:
     append_event("assistant.message", payload, project=project)
 
 
-def cmd_run(
-    coder: bool = False,
-    instruct: bool = False,
-    hacker: bool = False,
-    model: Optional[str] = None,
-    legacy: bool = False,
-) -> None:
+def cmd_run(legacy: bool = False) -> None:
     project = require_active_project()
     cfg = Config.load()
-    if model:
-        name, profile = cfg.get_model(model)
-        mode, god = "code", False
-    elif hacker:
-        name, profile, mode, god = _resolve_tier(cfg, "hacker")
-    elif instruct:
-        name, profile, mode, god = _resolve_tier(cfg, "instruct")
-    elif coder:
-        name, profile, mode, god = _resolve_tier(cfg, "coder")
-    else:
-        name, profile = cfg.get_model(None)
-        mode, god = "code", False
+    name, profile = cfg.get_model(None)
+    mode = "code"
+    god = False
     use_kantian = not legacy and cfg.use_stateful_kantian
     _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god, use_kantian=use_kantian)
 
@@ -562,19 +547,15 @@ def config_cmd() -> None:
 
 
 @app.command(name="up")
-def up_cmd(
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
-) -> None:
-    """Resume a Vast.ai instance and wait for vLLM."""
-    cmd_up(model or None)
+def up_cmd() -> None:
+    """Resume the GPU instance and wait for vLLM."""
+    cmd_up(None)
 
 
 @app.command(name="down")
-def down_cmd(
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
-) -> None:
-    """Pause a Vast.ai instance."""
-    cmd_down(model or None)
+def down_cmd() -> None:
+    """Pause the GPU instance."""
+    cmd_down(None)
 
 
 @app.command(name="status")
@@ -593,15 +574,9 @@ def ask_cmd(
 
 
 @app.command(name="run")
-def run_cmd(
-    coder:   bool = typer.Option(False, "--coder",   help="Coder tier — Qwen 30B Coder."),
-    instruct: bool = typer.Option(False, "--instruct", help="Instruct tier — Qwen 30B Instruct."),
-    hacker:  bool = typer.Option(False, "--hacker",  help="Hacker tier — Qwen 235B, god mode."),
-    model:   str  = typer.Option("",   "--model", "-m", help="Power-user: exact profile name."),
-    legacy:  bool = typer.Option(False, "--legacy", help="Use stateless loop (disable Kantian machine)."),
-) -> None:
-    """Agent loop. Default tier: coder. Use --coder / --instruct / --hacker to select tier."""
-    cmd_run(coder=coder, instruct=instruct, hacker=hacker, model=model or None, legacy=legacy)
+def run_cmd() -> None:
+    """Enter chat environment for current project."""
+    cmd_run(legacy=False)
 
 
 @app.command(name="log")
@@ -642,13 +617,11 @@ def ssh_test_cmd() -> None:
 # ---------------------------------------------------------------------------
 
 REPL_COMMANDS = {
-    "show", "new", "use", "current", "config", "init",
-    "up", "down", "status",
-    "ask", "run", "nitro", "log", "sandbox", "undo", "ssh-test",
+    "project", "new", "run", "up", "down", "config", "init",
     "quit", "exit", "help",
 }
 
-NEW_SUBCOMMANDS = ("project", "code", "discussion")
+NEW_SUBCOMMANDS = ("project",)
 
 
 def _config_is_unset() -> bool:
@@ -666,12 +639,6 @@ def _config_is_unset() -> bool:
 class MichaelCompleter(Completer):
     """Tab-completion for the REPL."""
 
-    LOG_FLAGS = ("--tail", "-n")
-    UP_FLAGS = ("--model", "-m")
-    DOWN_FLAGS = ("--model", "-m")
-    NITRO_FLAGS = ("--model", "-m", "--god")
-    UNDO_FLAGS = ("--list", "-l")
-
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
         words = text.split()
@@ -685,44 +652,11 @@ class MichaelCompleter(Completer):
             return
 
         head = words[0]
-        if head == "use":
+        if head == "project":
             prefix = words[1] if len(words) > 1 and not at_boundary else ""
             for p in list_projects():
                 if p.slug.startswith(prefix):
                     yield Completion(p.slug, start_position=-len(prefix))
-            return
-        if head == "new":
-            if len(words) == 1 and at_boundary:
-                for sub in NEW_SUBCOMMANDS:
-                    yield Completion(sub, start_position=0)
-            elif len(words) == 2 and not at_boundary:
-                for sub in NEW_SUBCOMMANDS:
-                    if sub.startswith(words[1]):
-                        yield Completion(sub, start_position=-len(words[1]))
-            return
-        if head == "log":
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.LOG_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
-            return
-        if head in ("up", "down", "run", "ask"):
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.UP_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
-            return
-        if head == "nitro":
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.NITRO_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
-            return
-        if head == "undo":
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.UNDO_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
             return
 
 
@@ -734,11 +668,10 @@ def repl() -> None:
         completer=MichaelCompleter(),
         complete_while_typing=False,
     )
-    G.console.print("hey")
+    G.console.print("[bold cyan]michael[/] [dim]— event-sourced LLM loop[/]")
     if _config_is_unset():
         G.console.print(
-            "[yellow]no config yet — type `config` to set up your vast.ai keys, "
-            "vllm key, and model[/]"
+            "[yellow]setup required[/] [dim]type: config[/]"
         )
     while True:
         try:
@@ -781,85 +714,36 @@ def dispatch_repl(line: str) -> None:
     cmd, rest = parts[0], parts[1:]
 
     if cmd == "help":
-        G.console.print("commands: " + ", ".join(sorted(REPL_COMMANDS)))
+        G.console.print(
+            "commands:\n"
+            "  project [slug]        select/list projects\n"
+            "  new [name]            create new project\n"
+            "  run                   enter chat environment\n"
+            "  up / down             start/stop GPU\n"
+            "  config                edit config\n"
+            "  init                  initialize config\n"
+            "  exit / quit           exit michael"
+        )
         return
-    if cmd == "show":
-        cmd_show()
-    elif cmd == "init":
+
+    if cmd == "init":
         cmd_init()
-    elif cmd == "new":
-        if rest and rest[0] == "code":
-            cmd_new_code(_opt_value(rest[1:], "--model", "-m"))
-        elif rest and rest[0] == "discussion":
-            cmd_new_discussion(_opt_value(rest[1:], "--model", "-m"))
-        else:
-            if rest and rest[0] == "project":
-                rest = rest[1:]
-            name = " ".join(rest) if rest else None
-            cmd_new(name)
-    elif cmd == "use":
-        if not rest:
-            G.err.print("usage: use <slug>")
-            return
-        cmd_use(rest[0])
-    elif cmd == "current":
-        cmd_current()
     elif cmd == "config":
         cmd_config()
-    elif cmd == "up":
-        cmd_up(_opt_value(rest, "--model", "-m"))
-    elif cmd == "down":
-        cmd_down(_opt_value(rest, "--model", "-m"))
-    elif cmd == "status":
-        cmd_status()
-    elif cmd == "ask":
-        model = _opt_value(rest, "--model", "-m")
-        prompt_parts = []
-        skip = 0
-        for i, tok in enumerate(rest):
-            if skip:
-                skip -= 1
-                continue
-            if tok in ("--model", "-m"):
-                skip = 1
-                continue
-            prompt_parts.append(tok)
-        if not prompt_parts:
-            G.err.print("usage: ask <prompt> [--model NAME]")
-            return
-        cmd_ask(" ".join(prompt_parts), model)
+    elif cmd == "project":
+        if rest:
+            cmd_use(rest[0])
+        else:
+            cmd_show()
+    elif cmd == "new":
+        name = " ".join(rest) if rest else None
+        cmd_new(name)
     elif cmd == "run":
-        cmd_run(
-            coder="--coder" in rest,
-            instruct="--instruct" in rest,
-            hacker="--hacker" in rest,
-            model=_opt_value(rest, "--model", "-m"),
-        )
-    elif cmd == "nitro":
-        cmd_nitro(
-            _opt_value(rest, "--model", "-m"),
-            god="--god" in rest,
-        )
-    elif cmd == "log":
-        n = 20
-        if (v := _opt_value(rest, "--tail", "-n")) is not None:
-            try:
-                n = int(v)
-            except ValueError:
-                pass
-        cmd_log(n)
-    elif cmd == "sandbox":
-        if not rest:
-            G.err.print("usage: sandbox <file>")
-            return
-        cmd_sandbox(pathlib.Path(rest[0]))
-    elif cmd == "undo":
-        list_only = "--list" in rest or "-l" in rest
-        positional = [r for r in rest if r not in ("--list", "-l")]
-        target = positional[0] if positional else None
-        cmd_undo(list_only=list_only, trash_id=target)
-    elif cmd == "ssh-test":
-        cmd_ssh_test()
+        cmd_run(legacy=False)
+    elif cmd == "up":
+        cmd_up(None)
+    elif cmd == "down":
+        cmd_down(None)
     else:
         G.err.print(f"unknown command: {cmd!r}. try 'help'.")
 
