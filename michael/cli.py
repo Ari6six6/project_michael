@@ -313,12 +313,31 @@ def cmd_ask(prompt: str, model: Optional[str]) -> None:
     append_event("assistant.message", payload, project=project)
 
 
-def cmd_run(legacy: bool = False) -> None:
+def cmd_run(
+    legacy: bool = False,
+    model: Optional[str] = None,
+    coder: bool = False,
+    instruct: bool = False,
+    hacker: bool = False,
+) -> None:
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model(None)
-    mode = "code"
-    god = False
+    if coder:
+        name, profile = cfg.get_model(model or "coder")
+        mode = "code"
+        god = False
+    elif instruct:
+        name, profile = cfg.get_model(model or "instruct")
+        mode = "discussion"
+        god = False
+    elif hacker:
+        name, profile = cfg.get_model(model or "hacker")
+        mode = "code"
+        god = True
+    else:
+        name, profile = cfg.get_model(model)
+        mode = "code"
+        god = False
     use_kantian = not legacy and cfg.use_stateful_kantian
     _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god, use_kantian=use_kantian)
 
@@ -617,11 +636,11 @@ def ssh_test_cmd() -> None:
 # ---------------------------------------------------------------------------
 
 REPL_COMMANDS = {
-    "project", "new", "run", "up", "down", "config", "init",
+    "project", "new", "run", "nitro", "up", "down", "config", "init",
     "quit", "exit", "help",
 }
 
-NEW_SUBCOMMANDS = ("project",)
+NEW_SUBCOMMANDS = ("project", "code", "discussion")
 
 
 def _config_is_unset() -> bool:
