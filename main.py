@@ -1,16 +1,13 @@
 """
 michael — air-gapped, event-sourced, AI-native control loop.
 
-This file is now a thin compatibility shim. All logic lives in the michael/ package.
-Import from michael.* submodules directly for new code.
+This file is a thin compatibility shim. All logic lives in the michael/ package.
 """
 # Re-export everything the test suite needs via `import main as m`
 import typer  # noqa: F401 — tests reference m.typer
 
 import michael.globals as _G
 
-# Path globals — tests monkeypatch michael.globals, but also expose here for
-# any code that imports directly from main.
 from michael.globals import (  # noqa: F401
     STATE_DIR,
     GLOBAL_CONFIG_PATH,
@@ -118,9 +115,6 @@ from michael.tools import (  # noqa: F401
 
 from michael.agent import (  # noqa: F401
     _NUDGE_NO_JA,
-    _tools_for_mode,
-    _resolve_nitro_model,
-    _present_pending_to_user,
     _run_agent_loop,
 )
 
@@ -137,15 +131,11 @@ from michael.cli import (  # noqa: F401
     cmd_status,
     cmd_ask,
     cmd_run,
-    cmd_new_code,
-    cmd_new_discussion,
-    cmd_nitro,
     cmd_log,
     cmd_undo,
     cmd_sandbox,
     cmd_ssh_test,
     REPL_COMMANDS,
-    NEW_SUBCOMMANDS,
     _config_is_unset,
     MichaelCompleter,
     repl,
