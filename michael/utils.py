@@ -13,39 +13,6 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Scripture loading
-# ---------------------------------------------------------------------------
-
-
-def load_scripture(repo_root: pathlib.Path | None = None) -> str:
-	"""Load and concatenate all scripture files (genesis.md, protocol.md, etc.).
-
-	If repo_root is None, derive it from the michael package location.
-	Returns empty string if scripture directory doesn't exist.
-	"""
-	if repo_root is None:
-		# Determine repo root: michael package is at michael/__init__.py,
-		# so repo root is the parent of the michael directory
-		michael_dir = pathlib.Path(__file__).parent
-		repo_root = michael_dir.parent
-
-	scripture_dir = repo_root / "scripture"
-	if not scripture_dir.is_dir():
-		return ""
-
-	parts: list[str] = []
-	# Load .md files in sorted order (genesis.md first, then protocol.md, etc.)
-	for file_path in sorted(scripture_dir.glob("*.md")):
-		try:
-			content = file_path.read_text(encoding="utf-8")
-			parts.append(content)
-		except OSError:
-			continue
-
-	return "\n\n---\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
 # Filesystem snapshot
 # ---------------------------------------------------------------------------
 
@@ -297,65 +264,6 @@ def build_protocol(mode: str = "code") -> str:
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
-
-
-# ---------------------------------------------------------------------------
-# Kantian machine prompt templates
-# ---------------------------------------------------------------------------
-
-
-def kantian_turn1_prompt() -> str:
-	"""Turn 1: Scripture Interpretation (full tools available)."""
-	return (
-		"Read and interpret this scripture. What is your understanding of the "
-		"philosophy, constraints, and prior work in this project? "
-		"You may call any tool to examine the codebase, run tests, or explore the filesystem."
-	)
-
-
-def kantian_turn2_prompt(user_question: str) -> str:
-	"""Turn 2: Question Clarification."""
-	return (
-		f"Given your understanding, here is the question:\n\n{user_question}\n\n"
-		"Clarify:\n"
-		"1. What is being asked?\n"
-		"2. What is success?\n"
-		"3. What constraints apply?"
-	)
-
-
-def kantian_iteration_prompt(target: str, goal: str, iteration_num: int, max_iterations: int) -> str:
-	"""Turn 3+: Kantian Iteration Loop."""
-	limit_warning = ""
-	if iteration_num == max_iterations:
-		limit_warning = (
-			f"\n\nYou have reached the iteration limit ({max_iterations}). "
-			"Make your final assessment: Are you ready to proceed (Ja), or do blockers remain?"
-		)
-
-	return (
-		f"TARGET: {target}\n"
-		f"GOAL: {goal}\n"
-		f"Iteration {iteration_num} of {max_iterations}\n\n"
-		"Iterate through the three questions:\n\n"
-		"1. WHAT CAN I KNOW?\n"
-		"   - What does the current filesystem state reveal?\n"
-		"   - What tools are available and what are their limits?\n"
-		"   - What constraints apply (sandbox, timeouts, resources)?\n"
-		"   - What errors or learnings from previous attempts?\n\n"
-		"2. WHAT SHOULD I DO?\n"
-		"   - What is the user's intent?\n"
-		"   - What follows from the inherent logic?\n"
-		"   - What is the smallest, most correct action?\n"
-		"   - Does this align with the protocol?\n\n"
-		"3. WHAT CAN I HOPE FOR?\n"
-		"   - Is the target achievable with available tools and time?\n"
-		"   - What is the success criterion?\n"
-		"   - What might go wrong? Can you verify correctness?\n"
-		"   - Is this change reversible?\n\n"
-		"You may call any tool at any point. When you are confident, signal: Ja"
-		f"{limit_warning}"
-	)
 
 
 def build_header(
