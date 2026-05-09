@@ -338,8 +338,7 @@ def cmd_run(
         name, profile = cfg.get_model(model)
         mode = "code"
         god = False
-    use_kantian = not legacy and cfg.use_stateful_kantian
-    _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god, use_kantian=use_kantian)
+    _run_agent_loop(project, cfg, name, profile, mode=mode, verb_label="run", god_mode=god)
 
 
 def cmd_new_code(model: Optional[str]) -> None:

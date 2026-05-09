@@ -13,39 +13,6 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Scripture loading
-# ---------------------------------------------------------------------------
-
-
-def load_scripture(repo_root: pathlib.Path | None = None) -> str:
-	"""Load and concatenate all scripture files (genesis.md, protocol.md, etc.).
-
-	If repo_root is None, derive it from the michael package location.
-	Returns empty string if scripture directory doesn't exist.
-	"""
-	if repo_root is None:
-		# Determine repo root: michael package is at michael/__init__.py,
-		# so repo root is the parent of the michael directory
-		michael_dir = pathlib.Path(__file__).parent
-		repo_root = michael_dir.parent
-
-	scripture_dir = repo_root / "scripture"
-	if not scripture_dir.is_dir():
-		return ""
-
-	parts: list[str] = []
-	# Load .md files in sorted order (genesis.md first, then protocol.md, etc.)
-	for file_path in sorted(scripture_dir.glob("*.md")):
-		try:
-			content = file_path.read_text(encoding="utf-8")
-			parts.append(content)
-		except OSError:
-			continue
-
-	return "\n\n---\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
 # Filesystem snapshot
 # ---------------------------------------------------------------------------
 
@@ -141,7 +108,12 @@ def _action_log_lines(project: "Project") -> list[str]:
         p = ev.get("payload", {}) or {}
         if t == "tool.executed":
             n += 1
-            out.append(f"[{n}] {p.get('summary', t)}")
+            line = f"[{n}] {p.get('summary', t)}"
+            brief = p.get("brief_result", "")
+            if brief:
+                first_lines = "\n    ".join(brief.splitlines()[:4])
+                line += f"\n    {first_lines}"
+            out.append(line)
         elif t == "tool.rejected":
             n += 1
             out.append(f"[{n}] {p.get('summary', t)}  [REJECTED BY USER]")
@@ -238,6 +210,12 @@ def build_protocol(mode: str = "code") -> str:
         "The user is not watching individual turns. The only ways out of the",
         "loop are the Ja passcode below, or a user-initiated abort (Ctrl-C).",
         "",
+        "LONG-TERM MEMORY:",
+        "Your past reasoning and tool results are stored. Call search_memory(query)",
+        "when you need context from previous sessions — what you explored, what",
+        "you concluded, what the sandbox returned, what failed. Use it early",
+        "before re-discovering what you already know.",
+        "",
         f"THE {ja!r} PASSCODE:",
         f"The user only sees your work when you END a message with the literal",
         f"bareword `{ja}` (case-sensitive, on its own line or as the",
@@ -253,6 +231,26 @@ def build_protocol(mode: str = "code") -> str:
         f"asks one yes/no question. Yes = the change is committed and this",
         f"prompt cycle ends. No = the staging is discarded; the next user",
         f"prompt re-enters the loop and you will see the rejection in H3.",
+        "",
+        "THE CONCEPT MANDATE (Begriff):",
+        "Before the first tool call, name the thing. A concept without a name is",
+        "darkness. With a name you have a space; with a space you can explore.",
+        "",
+        "Define four things up front:",
+        "  1. TARGET OBJECT   — what exactly are you working on?",
+        "  2. BINARY STATES   — every stateful system has exactly two values per",
+        "                       property. Name them: working/broken, passing/failing,",
+        "                       defined/undefined, present/absent. The goal state is",
+        "                       one of these. Which one?",
+        "  3. FAMILY          — what objects are adjacent to the target? What shares",
+        "                       its properties? What is related but distinct?",
+        "  4. SUCCESS STATE   — which exact configuration of binary properties",
+        "                       constitutes the answer?",
+        "",
+        "Once the concept is named and the goal state is defined, you know what",
+        "you are looking for. Only then does exploration have direction.",
+        "Don't write code until you can state the goal as a binary condition:",
+        "'this test passes', 'this function returns True', 'this file exists'.",
         "",
         "THE THREE KANTIAN QUESTIONS:",
         "When tasked with a problem, you iterate through three orthogonal and",
@@ -291,71 +289,12 @@ def build_protocol(mode: str = "code") -> str:
         "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
         "  read_file(path)                                    auto-executes",
         "  list_dir(path='.')                                 auto-executes",
-        "  search_memory(query)                               auto-executes, searches stored LLM responses",
+        "  search_memory(query)                               auto-executes, searches past reasoning and tool results",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
-
-
-# ---------------------------------------------------------------------------
-# Kantian machine prompt templates
-# ---------------------------------------------------------------------------
-
-
-def kantian_turn1_prompt() -> str:
-	"""Turn 1: Scripture Interpretation (full tools available)."""
-	return (
-		"Read and interpret this scripture. What is your understanding of the "
-		"philosophy, constraints, and prior work in this project? "
-		"You may call any tool to examine the codebase, run tests, or explore the filesystem."
-	)
-
-
-def kantian_turn2_prompt(user_question: str) -> str:
-	"""Turn 2: Question Clarification."""
-	return (
-		f"Given your understanding, here is the question:\n\n{user_question}\n\n"
-		"Clarify:\n"
-		"1. What is being asked?\n"
-		"2. What is success?\n"
-		"3. What constraints apply?"
-	)
-
-
-def kantian_iteration_prompt(target: str, goal: str, iteration_num: int, max_iterations: int) -> str:
-	"""Turn 3+: Kantian Iteration Loop."""
-	limit_warning = ""
-	if iteration_num == max_iterations:
-		limit_warning = (
-			f"\n\nYou have reached the iteration limit ({max_iterations}). "
-			"Make your final assessment: Are you ready to proceed (Ja), or do blockers remain?"
-		)
-
-	return (
-		f"TARGET: {target}\n"
-		f"GOAL: {goal}\n"
-		f"Iteration {iteration_num} of {max_iterations}\n\n"
-		"Iterate through the three questions:\n\n"
-		"1. WHAT CAN I KNOW?\n"
-		"   - What does the current filesystem state reveal?\n"
-		"   - What tools are available and what are their limits?\n"
-		"   - What constraints apply (sandbox, timeouts, resources)?\n"
-		"   - What errors or learnings from previous attempts?\n\n"
-		"2. WHAT SHOULD I DO?\n"
-		"   - What is the user's intent?\n"
-		"   - What follows from the inherent logic?\n"
-		"   - What is the smallest, most correct action?\n"
-		"   - Does this align with the protocol?\n\n"
-		"3. WHAT CAN I HOPE FOR?\n"
-		"   - Is the target achievable with available tools and time?\n"
-		"   - What is the success criterion?\n"
-		"   - What might go wrong? Can you verify correctness?\n"
-		"   - Is this change reversible?\n\n"
-		"You may call any tool at any point. When you are confident, signal: Ja"
-		f"{limit_warning}"
-	)
 
 
 def build_header(
