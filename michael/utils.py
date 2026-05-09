@@ -108,7 +108,12 @@ def _action_log_lines(project: "Project") -> list[str]:
         p = ev.get("payload", {}) or {}
         if t == "tool.executed":
             n += 1
-            out.append(f"[{n}] {p.get('summary', t)}")
+            line = f"[{n}] {p.get('summary', t)}"
+            brief = p.get("brief_result", "")
+            if brief:
+                first_lines = "\n    ".join(brief.splitlines()[:4])
+                line += f"\n    {first_lines}"
+            out.append(line)
         elif t == "tool.rejected":
             n += 1
             out.append(f"[{n}] {p.get('summary', t)}  [REJECTED BY USER]")
@@ -205,6 +210,12 @@ def build_protocol(mode: str = "code") -> str:
         "The user is not watching individual turns. The only ways out of the",
         "loop are the Ja passcode below, or a user-initiated abort (Ctrl-C).",
         "",
+        "LONG-TERM MEMORY:",
+        "Your past reasoning and tool results are stored. Call search_memory(query)",
+        "when you need context from previous sessions — what you explored, what",
+        "you concluded, what the sandbox returned, what failed. Use it early",
+        "before re-discovering what you already know.",
+        "",
         f"THE {ja!r} PASSCODE:",
         f"The user only sees your work when you END a message with the literal",
         f"bareword `{ja}` (case-sensitive, on its own line or as the",
@@ -258,7 +269,7 @@ def build_protocol(mode: str = "code") -> str:
         "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
         "  read_file(path)                                    auto-executes",
         "  list_dir(path='.')                                 auto-executes",
-        "  search_memory(query)                               auto-executes, searches stored LLM responses",
+        "  search_memory(query)                               auto-executes, searches past reasoning and tool results",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
         "",

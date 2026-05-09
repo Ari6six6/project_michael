@@ -34,11 +34,9 @@ from michael.tools import (
 from michael.utils import build_header
 
 _NUDGE_NO_JA = (
-    "system reminder: you ended your turn without tool calls and without "
-    f"the {G.JA_PASSPHRASE!r} passcode. Either use tools to keep iterating, "
-    f"or end your message with `{G.JA_PASSPHRASE}` on its own line to surface "
-    "your work to the user. Until then you are talking to Michael, not "
-    "the user."
+    "Keep going. You have full tool access — read files, run the sandbox, "
+    "explore, verify. The user is not watching yet. Surface your work with "
+    f"`{G.JA_PASSPHRASE}` only when you are certain the job is done."
 )
 
 

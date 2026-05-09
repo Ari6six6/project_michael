@@ -476,18 +476,30 @@ def _search_memory(project: Project, query: str, cfg: Config) -> str:
     q = query.lower()
     hits: list[str] = []
     for ev in iter_events(project.events_path):
-        if ev.get("type") != "assistant.message":
-            continue
-        payload = ev.get("payload") or {}
-        text = payload.get("text") or ""
-        if not text or q not in text.lower():
-            continue
-        ts = ev.get("ts", "?")
-        turn = payload.get("turn", "?")
-        excerpt = text[:500] + ("…" if len(text) > 500 else "")
-        hits.append(f"[{ts} turn={turn}]\n{excerpt}")
-        if len(hits) >= 5:
+        if len(hits) >= 8:
             break
+        ev_type = ev.get("type", "")
+        payload = ev.get("payload") or {}
+        ts = ev.get("ts", "?")
+
+        if ev_type == "assistant.message":
+            text = payload.get("text") or ""
+            if not text or q not in text.lower():
+                continue
+            turn = payload.get("turn", "?")
+            excerpt = text[:500] + ("…" if len(text) > 500 else "")
+            hits.append(f"[{ts} turn={turn} type=reasoning]\n{excerpt}")
+
+        elif ev_type == "tool.executed" and payload.get("brief_result"):
+            brief = payload["brief_result"]
+            summary = payload.get("summary", "")
+            if q not in brief.lower() and q not in summary.lower():
+                continue
+            hits.append(
+                f"[{ts} tool={payload.get('tool')} type=result]\n"
+                f"{summary}\n{brief[:400]}"
+            )
+
     if not hits:
         return f"search_memory: no matches for {query!r} in this project's history"
     return (
@@ -940,14 +952,13 @@ def dispatch_tool_call(
     except G.MichaelError as e:
         result = f"error: {e}"
     first = (result.splitlines()[0] if result else "ok")[:120]
-    append_event(
-        "tool.executed",
-        {
-            "tool": name,
-            "args": final_args,
-            "summary": f"{_summary_for(name, final_args)} → {first}",
-            "result_chars": len(result),
-        },
-        project=project,
-    )
+    payload: dict[str, Any] = {
+        "tool": name,
+        "args": final_args,
+        "summary": f"{_summary_for(name, final_args)} → {first}",
+        "result_chars": len(result),
+    }
+    if name in ("run_in_sandbox", "run_shell"):
+        payload["brief_result"] = result[:600]
+    append_event("tool.executed", payload, project=project)
     return result
