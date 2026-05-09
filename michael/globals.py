@@ -46,13 +46,6 @@ SKIP_DIRS = {
 
 AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory"}
 
-# tier flag → (canonical config profile name, agent mode, god_mode)
-TIER_DEFAULTS: dict[str, tuple[str, str, bool]] = {
-    "coder":   ("coder",   "code",  False),
-    "instruct": ("instruct", "code",  False),
-    "hacker":  ("hacker",  "nitro", True),
-}
-
 # ---------------------------------------------------------------------------
 # Domain error
 # ---------------------------------------------------------------------------

@@ -136,38 +136,19 @@ def _action_log_lines(project: "Project") -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-_MODE_ADDENDUM: dict[str, str] = {
-    "code": (
-        "MODE: code. Full toolset. write_file and apply_patch require "
-        "`expected_changes`. Predict, propose, sandbox, review, refine. "
-        "Surface to the user only with the Ja passcode."
-    ),
-    "discussion": (
-        "MODE: discussion. You have read-only tools (read_file, list_dir). "
-        "write_file, apply_patch, run_in_sandbox, and run_shell are NOT "
-        "available — for code changes the user will start a `new code` or "
-        "`nitro` session. End your message with the Ja passcode when you "
-        "are ready for the user to read your reply."
-    ),
-    "nitro": (
-        "MODE: nitro (heavy model). Same contract as code mode. The user "
-        "is paying premium GPU time for this turn — be efficient with the "
-        "loop, but do not skip estimation or the Ja gate."
-    ),
-    "god": (
-        "MODE: god (heavy model, full authority). No user approval gate: when "
-        "you emit the Ja passcode Michael will auto-commit every staged change "
-        "immediately, without asking the user. Authority is fully granted. "
-        "Assess the project in its entirety. Burn what is not working. Let "
-        "stand what is righteous. This is a one-shot session — make it count. "
-        "Do not skip estimation; the staging pipeline still runs."
-    ),
-}
+_MODE_ADDENDUM = (
+    "FULL AUTHORITY. You have the complete toolset: write_file, apply_patch, "
+    "read_file, list_dir, search_memory, run_in_sandbox, run_shell. "
+    "write_file and apply_patch require expected_changes — your prediction "
+    "of which paths will be added, modified, or removed. "
+    "When the job is done, end your message with the Ja passcode. "
+    "Changes are auto-committed immediately on Ja. Make it count."
+)
 
 
-def build_protocol(mode: str = "code") -> str:
+def build_protocol() -> str:
     """Header 4 — the protocol Bible."""
-    addendum = _MODE_ADDENDUM.get(mode, _MODE_ADDENDUM["code"])
+    addendum = _MODE_ADDENDUM
     ja = G.JA_PASSPHRASE
     return "\n".join([
         "You are connected to the user's machine through Project Michael.",
@@ -300,14 +281,12 @@ def build_protocol(mode: str = "code") -> str:
 def build_header(
     project: "Project",
     system_prompt: str,
-    *,
-    mode: str = "code",
 ) -> str:
     """Pack the four-header context package sent to a fresh LLM instance."""
     prompts = _prompt_history_lines(project)
     actions = _action_log_lines(project)
     snap = filesystem_snapshot(pathlib.Path(project.path))
-    protocol = build_protocol(mode)
+    protocol = build_protocol()
 
     return "\n".join([
         system_prompt,
