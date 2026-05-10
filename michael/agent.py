@@ -22,7 +22,7 @@ from michael.tools import (
     dispatch_tool_call,
     _format_delta,
 )
-from michael.utils import build_header
+from michael.utils import build_header, load_scripture
 
 _NUDGE_NO_JA = (
     "Keep going. You have full tool access — read files, run the sandbox, "
@@ -75,7 +75,8 @@ def _run_agent_loop(
         project=project,
     )
 
-    header = build_header(project, base_prompt)
+    scripture = load_scripture(cfg.scripture_dir)
+    header = build_header(project, base_prompt, scripture)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": header},
         {"role": "user", "content": prompt},

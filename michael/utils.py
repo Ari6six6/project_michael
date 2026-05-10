@@ -278,9 +278,25 @@ def build_protocol() -> str:
     ])
 
 
+def load_scripture(scripture_dir: str) -> str:
+    """Read all text files from scripture_dir and return concatenated content."""
+    p = pathlib.Path(scripture_dir).expanduser()
+    if not p.is_dir():
+        return ""
+    parts: list[str] = []
+    for f in sorted(p.iterdir()):
+        if f.is_file() and _is_text(f):
+            try:
+                parts.append(f"--- {f.name} ---\n{f.read_text(errors='replace')}")
+            except OSError:
+                continue
+    return "\n\n".join(parts)
+
+
 def build_header(
     project: "Project",
     system_prompt: str,
+    scripture: str = "",
 ) -> str:
     """Pack the four-header context package sent to a fresh LLM instance."""
     prompts = _prompt_history_lines(project)
@@ -288,12 +304,20 @@ def build_header(
     snap = filesystem_snapshot(pathlib.Path(project.path))
     protocol = build_protocol()
 
-    return "\n".join([
+    parts = [
         system_prompt,
         "",
         "=== H4: Protocol ===",
         protocol,
         "",
+    ]
+    if scripture:
+        parts += [
+            "=== Scripture ===",
+            scripture,
+            "",
+        ]
+    parts += [
         "=== Project ===",
         f"Name: {project.name}",
         f"Slug: {project.slug}",
@@ -307,4 +331,5 @@ def build_header(
         "",
         "=== H2: Filesystem snapshot ===",
         snap,
-    ])
+    ]
+    return "\n".join(parts)
