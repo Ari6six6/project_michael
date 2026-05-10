@@ -161,11 +161,16 @@ def test_stage_project_skips_dotted_and_skipdirs(home, workspace):
 def test_apply_in_staging_write_file_does_not_touch_real(home, workspace):
     p = m.create_project("x", workspace)
     stage = m._stage_project(p)
+    real_root = workspace.resolve()
+    ext_root = stage.parent / "_ext"
+    ext_root.mkdir(exist_ok=True)
     try:
         m._apply_in_staging(
             "write_file",
             {"path": "src/bar.py", "content": "y = 2\n"},
             stage,
+            real_root,
+            ext_root,
         )
         assert (stage / "src" / "bar.py").read_text() == "y = 2\n"
         assert not (workspace / "src" / "bar.py").exists()
@@ -173,15 +178,22 @@ def test_apply_in_staging_write_file_does_not_touch_real(home, workspace):
         shutil.rmtree(stage.parent, ignore_errors=True)
 
 
-def test_apply_in_staging_refuses_escape(home, workspace):
+def test_apply_in_staging_refuses_central_fs(home, workspace):
+    """Writing to ~/.michael/ must be blocked regardless of staging."""
     p = m.create_project("x", workspace)
     stage = m._stage_project(p)
+    real_root = workspace.resolve()
+    ext_root = stage.parent / "_ext"
+    ext_root.mkdir(exist_ok=True)
+    central = str(michael_globals.STATE_DIR / "evil.txt")
     try:
-        with pytest.raises(m.MichaelError):
+        with pytest.raises(m.MichaelError, match="Central FS violation"):
             m._apply_in_staging(
                 "write_file",
-                {"path": "../escape.txt", "content": "x"},
+                {"path": central, "content": "x"},
                 stage,
+                real_root,
+                ext_root,
             )
     finally:
         shutil.rmtree(stage.parent, ignore_errors=True)

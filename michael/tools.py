@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import typer
 
 import michael.globals as G
+from michael import permissions
 from michael.config import Config
 from michael.project import Project, append_event, iter_events
 
@@ -35,18 +36,20 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Overwrite (or create) a file in the project workspace. Path is "
-                "relative to the project root; parent dirs are created. "
-                "The change is applied to a staging copy of the project first. "
+                "Overwrite (or create) a file anywhere on the Work FS. "
+                "Path may be absolute or relative to the project root; "
+                "parent dirs are created automatically. "
+                "Writing to ~/.michael/ (the Central FS) is blocked. "
+                "The change is applied to a staging copy first. "
                 "You MUST predict the resulting filesystem delta in "
-                "`expected_changes` (every project-relative path that will be "
-                "added, modified, or removed). If reality diverges from your "
-                "prediction, Michael returns a mismatch error to you and the "
-                "user is NOT prompted — re-propose. If `verify` is provided, "
-                "it runs in the staging copy after the write; verify failures "
-                "are reported back to you. If the prediction matches and verify "
-                "passes (or is omitted), the user is shown the diff and asked "
-                "to confirm before the change is committed to the real workspace."
+                "`expected_changes` (every path that will be added, modified, "
+                "or removed — use absolute paths for files outside the project "
+                "root). If reality diverges from your prediction, Michael "
+                "returns a mismatch error and the user is NOT prompted — "
+                "re-propose. If `verify` is provided, it runs in the staging "
+                "copy after the write; verify failures roll back this call. "
+                "If prediction matches and verify passes (or is omitted), the "
+                "user is shown the diff and asked to confirm."
             ),
             "parameters": {
                 "type": "object",
@@ -199,6 +202,7 @@ def _resolve_in_project(project: Project, rel: str) -> pathlib.Path:
         candidate.relative_to(root)
     except ValueError as e:
         raise G.MichaelError(f"path escapes project root: {rel}") from e
+    permissions.assert_not_central(candidate, "access")
     return candidate
 
 
@@ -271,6 +275,30 @@ def _file_hashes(root: pathlib.Path) -> dict[str, str]:
     return out
 
 
+def _combined_hashes(
+    stage_root: pathlib.Path, ext_root: pathlib.Path
+) -> dict[str, str]:
+    """Hash every staged file.
+
+    Keys for project files are project-relative strings (e.g. ``"src/main.py"``).
+    Keys for external files are absolute path strings (e.g. ``"/tmp/foo.py"``).
+    """
+    out = _file_hashes(stage_root)
+    if ext_root.is_dir():
+        for dp, dirs, files in os.walk(ext_root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in G.SKIP_DIRS]
+            for fn in files:
+                fp = pathlib.Path(dp) / fn
+                try:
+                    data = fp.read_bytes()
+                except OSError:
+                    continue
+                rel_in_ext = fp.relative_to(ext_root)
+                abs_key = "/" + str(rel_in_ext)
+                out[abs_key] = hashlib.sha256(data).hexdigest()
+    return out
+
+
 def _diff_hashes(before: dict[str, str], after: dict[str, str]) -> dict[str, list[str]]:
     added = sorted(p for p in after if p not in before)
     removed = sorted(p for p in before if p not in after)
@@ -315,22 +343,52 @@ def _run_verify(cmd: str, cwd: pathlib.Path, *, timeout_s: int = 60) -> tuple[in
     return cp.returncode, out
 
 
-def _apply_in_staging(name: str, args: dict[str, Any], stage_root: pathlib.Path) -> None:
-    rel = str(args.get("path", ""))
-    target = (stage_root / rel).resolve()
-    try:
-        target.relative_to(stage_root.resolve())
-    except ValueError as e:
-        raise G.MichaelError(f"path escapes project root: {rel}") from e
+def _staging_target(
+    path_str: str,
+    stage_root: pathlib.Path,
+    ext_root: pathlib.Path,
+    real_project_root: pathlib.Path,
+) -> pathlib.Path:
+    """Resolve *path_str* to its location inside the staging area.
+
+    Project-relative and project-absolute paths land under *stage_root*.
+    External absolute paths land under *ext_root* mirroring the absolute path
+    (e.g. ``/tmp/foo.py`` → ``<ext_root>/tmp/foo.py``).
+    Central FS paths are rejected before reaching here, but we double-check.
+    """
+    abs_path = permissions.resolve_any(path_str, real_project_root)
+    permissions.assert_not_central(abs_path, "write")
+    if permissions.is_project_path(abs_path, real_project_root):
+        rel = abs_path.relative_to(real_project_root)
+        return (stage_root / rel).resolve()
+    # External path — mirror under ext_root
+    stripped = str(abs_path).lstrip("/")
+    return (ext_root / stripped).resolve()
+
+
+def _apply_in_staging(
+    name: str,
+    args: dict[str, Any],
+    stage_root: pathlib.Path,
+    real_project_root: pathlib.Path,
+    ext_root: pathlib.Path,
+) -> None:
+    path_str = str(args.get("path", ""))
+    target = _staging_target(path_str, stage_root, ext_root, real_project_root)
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     if name == "write_file":
-        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(str(args["content"]))
         return
 
     if name == "apply_patch":
         if not target.is_file():
-            raise G.MichaelError(f"apply_patch target does not exist: {rel}")
+            # For external files not yet copied into staging, seed from real FS.
+            abs_path = permissions.resolve_any(path_str, real_project_root)
+            if abs_path.is_file():
+                shutil.copy2(abs_path, target)
+            else:
+                raise G.MichaelError(f"apply_patch target does not exist: {path_str}")
         if not shutil.which("patch"):
             raise G.MichaelError("`patch` not installed on host (apt install patch)")
         diff = str(args["unified_diff"])
@@ -368,10 +426,15 @@ def _save_trash(
     before_dir = trash_dir / "before"
     before_dir.mkdir(exist_ok=True)
     for rel in delta["modified"] + delta["removed"]:
-        src = real_root / rel
+        if rel.startswith("/"):
+            # External file — snapshot from its real absolute path.
+            src = pathlib.Path(rel)
+            dst = before_dir / "_ext" / rel.lstrip("/")
+        else:
+            src = real_root / rel
+            dst = before_dir / rel
         if not src.is_file():
             continue
-        dst = before_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(src, dst)
@@ -392,14 +455,26 @@ def _save_trash(
     return trash_id
 
 
-def _sync_to_real(stage_root: pathlib.Path, real_root: pathlib.Path, delta: dict[str, list[str]]) -> None:
+def _sync_to_real(
+    stage_root: pathlib.Path,
+    real_root: pathlib.Path,
+    delta: dict[str, list[str]],
+    ext_root: Optional[pathlib.Path] = None,
+) -> None:
     for rel in delta["added"] + delta["modified"]:
-        src = stage_root / rel
-        dst = real_root / rel
+        if rel.startswith("/"):
+            # External path — source is mirrored under ext_root.
+            if ext_root is None:
+                continue
+            src = ext_root / rel.lstrip("/")
+            dst = pathlib.Path(rel)
+        else:
+            src = stage_root / rel
+            dst = real_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     for rel in delta["removed"]:
-        dst = real_root / rel
+        dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
             try:
                 dst.unlink()
@@ -442,14 +517,18 @@ def _undo_one(project: Project, trash_id: Optional[str] = None) -> dict[str, Any
     delta = metadata.get("delta", {}) or {}
     real_root = pathlib.Path(project.path).resolve()
     for rel in delta.get("modified", []) + delta.get("removed", []):
-        src = target / "before" / rel
+        if rel.startswith("/"):
+            src = target / "before" / "_ext" / rel.lstrip("/")
+            dst = pathlib.Path(rel)
+        else:
+            src = target / "before" / rel
+            dst = real_root / rel
         if not src.is_file():
             continue
-        dst = real_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     for rel in delta.get("added", []):
-        dst = real_root / rel
+        dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
             try:
                 dst.unlink()
@@ -516,7 +595,9 @@ def execute_tool(
     backend: "SandboxBackend",
 ) -> str:
     if name == "read_file":
-        target = _resolve_in_project(project, str(args["path"]))
+        project_root = pathlib.Path(project.path).resolve()
+        target = permissions.resolve_any(str(args["path"]), project_root)
+        permissions.assert_not_central(target, "read")
         if not target.is_file():
             return "error: not a file"
         try:
@@ -528,7 +609,9 @@ def execute_tool(
         return text
 
     if name == "list_dir":
-        target = _resolve_in_project(project, str(args.get("path", ".")))
+        project_root = pathlib.Path(project.path).resolve()
+        target = permissions.resolve_any(str(args.get("path", ".")), project_root)
+        permissions.assert_not_central(target, "read")
         if not target.is_dir():
             return "error: not a directory"
         rows = []
@@ -551,6 +634,8 @@ def execute_tool(
         return _format_proc_result(cp)
 
     if name == "run_shell":
+        if block_msg := permissions.check_shell_cmd(str(args.get("cmd", ""))):
+            return f"error: {block_msg}"
         timeout_s = int(args.get("timeout_s", 60))
         cwd = pathlib.Path(project.path).resolve()
         try:
@@ -655,9 +740,15 @@ class PendingChanges:
     stage_root: Optional[pathlib.Path] = None
     change_log: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def ext_root(self) -> Optional[pathlib.Path]:
+        """Staging area for external (non-project) file writes."""
+        return self.stage_root.parent / "_ext" if self.stage_root is not None else None
+
     def ensure_stage(self, project: Project) -> pathlib.Path:
         if self.stage_root is None:
             self.stage_root = _stage_project(project)
+            (self.stage_root.parent / "_ext").mkdir(exist_ok=True)
         return self.stage_root
 
     def discard(self) -> None:
@@ -667,9 +758,24 @@ class PendingChanges:
         self.change_log.clear()
 
 
-def _snapshot_file(stage_root: pathlib.Path, rel: str) -> tuple[bool, Optional[bytes]]:
-    target = stage_root / rel
+def _snapshot_file(
+    stage_root: pathlib.Path,
+    ext_root: pathlib.Path,
+    path_str: str,
+    real_project_root: pathlib.Path,
+) -> tuple[bool, Optional[bytes]]:
+    try:
+        target = _staging_target(path_str, stage_root, ext_root, real_project_root)
+    except G.MichaelError:
+        return False, None
     if not target.is_file():
+        # External file not yet staged — try the real filesystem.
+        abs_path = permissions.resolve_any(path_str, real_project_root)
+        if not permissions.is_project_path(abs_path, real_project_root) and abs_path.is_file():
+            try:
+                return True, abs_path.read_bytes()
+            except OSError:
+                return True, None
         return False, None
     try:
         return True, target.read_bytes()
@@ -678,9 +784,17 @@ def _snapshot_file(stage_root: pathlib.Path, rel: str) -> tuple[bool, Optional[b
 
 
 def _restore_file(
-    stage_root: pathlib.Path, rel: str, existed: bool, blob: Optional[bytes]
+    stage_root: pathlib.Path,
+    ext_root: pathlib.Path,
+    path_str: str,
+    real_project_root: pathlib.Path,
+    existed: bool,
+    blob: Optional[bytes],
 ) -> None:
-    target = stage_root / rel
+    try:
+        target = _staging_target(path_str, stage_root, ext_root, real_project_root)
+    except G.MichaelError:
+        return
     if not existed:
         if target.is_file():
             try:
@@ -724,15 +838,17 @@ def execute_with_staging(
     except G.MichaelError as e:
         return f"error: staging failed: {e}"
 
-    rel = str(args.get("path", ""))
-    existed, blob = _snapshot_file(stage_root, rel)
-    before = _file_hashes(stage_root)
+    ext_root = pending.ext_root
+    real_project_root = pathlib.Path(project.path).resolve()
+    path_str = str(args.get("path", ""))
+    existed, blob = _snapshot_file(stage_root, ext_root, path_str, real_project_root)
+    before = _combined_hashes(stage_root, ext_root)
     try:
-        _apply_in_staging(name, args, stage_root)
+        _apply_in_staging(name, args, stage_root, real_project_root, ext_root)
     except G.MichaelError as e:
-        _restore_file(stage_root, rel, existed, blob)
+        _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
         return f"error applying in staging: {e}"
-    after = _file_hashes(stage_root)
+    after = _combined_hashes(stage_root, ext_root)
     delta = _diff_hashes(before, after)
 
     verify_rc: Optional[int] = None
@@ -741,7 +857,7 @@ def execute_with_staging(
     if isinstance(verify_cmd, str) and verify_cmd.strip():
         verify_rc, verify_out = _run_verify(verify_cmd, stage_root, timeout_s=60)
         if verify_rc != 0:
-            _restore_file(stage_root, rel, existed, blob)
+            _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
             append_event(
                 "tool.verify_failed",
                 {
@@ -803,6 +919,7 @@ def commit_pending(project: Project, pending: PendingChanges) -> list[dict[str, 
     if pending.stage_root is None or not pending.change_log:
         return []
     real_root = pathlib.Path(project.path).resolve()
+    ext_root = pending.ext_root
     summaries: list[dict[str, Any]] = []
     for entry in pending.change_log:
         delta = entry["delta"]
@@ -810,7 +927,7 @@ def commit_pending(project: Project, pending: PendingChanges) -> list[dict[str, 
             project, entry["tool"], entry["args"], delta, real_root,
             verify_rc=entry.get("verify_rc"),
         )
-        _sync_to_real(pending.stage_root, real_root, delta)
+        _sync_to_real(pending.stage_root, real_root, delta, ext_root=ext_root)
         summary = (
             f"{_summary_for(entry['tool'], entry['args'])} → applied "
             f"+{len(delta['added'])} ~{len(delta['modified'])} "
