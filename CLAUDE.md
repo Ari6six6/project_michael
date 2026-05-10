@@ -33,6 +33,16 @@ for smaller models, H100s for the heavy ones. No tier switching, no mode selecti
 patching code — until it ends a message with the bareword `Ja`. On Ja, all staged changes are
 **auto-committed immediately**. No Y/n. The prompt exits. What you get is what it gave.
 
+**Dual filesystem zones:**
+| Zone | Path | LLM tool access |
+|------|------|-----------------|
+| Central FS | `~/.michael/` | Read-only. Writes blocked at Python layer before any I/O. |
+| Work FS | Everything else | Unrestricted — `write_file`/`apply_patch` accept absolute paths; `run_shell` has full system access. |
+
+The Central FS holds all headers source data (events, config, state). Michael's application code
+writes there freely; LLM tool calls are categorically blocked from doing so. Enforcement lives in
+`michael/permissions.py` and is applied inside every write path in `michael/tools.py`.
+
 ---
 
 ## Deploy Checklist
