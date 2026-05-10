@@ -3,3 +3,5 @@ typer==0.15.1
 httpx==0.28.1
 rich==13.9.4
 prompt_toolkit==3.0.50
+beautifulsoup4>=4.12
+lxml>=5.0

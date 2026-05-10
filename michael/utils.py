@@ -290,6 +290,7 @@ def build_protocol() -> str:
         "  search_memory(query)                               auto-executes, searches past reasoning and tool results",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
+        "  fetch_page(url, selector='', timeout_s=30)         auto-executes; HTTP GET, returns text/links/forms/JSON",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])

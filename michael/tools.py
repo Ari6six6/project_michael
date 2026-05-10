@@ -187,6 +187,49 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_page",
+            "description": (
+                "Fetch a URL over the internet and return its full content: "
+                "page title, meta description, cleaned body text, all "
+                "hyperlinks with anchor text, form fields, and raw JSON if "
+                "the response is a JSON API. DNS resolution, redirects, and "
+                "SSL are handled automatically. Use this to read any "
+                "publicly accessible web page or HTTP API endpoint. "
+                "Auto-executes without confirmation — it is a read-only "
+                "network fetch. To navigate deeper, call fetch_page again "
+                "on any link you find. For JavaScript-heavy pages that "
+                "render content client-side, fall back to run_shell with "
+                "curl or a headless browser command."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL including scheme (https://...).",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS selector.  When provided, only the "
+                            "text of matching elements is returned instead of "
+                            "the full page.  Example: 'table.flights' or "
+                            "'#results'."
+                        ),
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "Request timeout in seconds.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -220,6 +263,8 @@ def _summary_for(name: str, args: dict[str, Any]) -> str:
     if name == "run_shell":
         cmd = str(args.get("cmd", "?"))
         return f"run_shell({cmd[:80]}{'...' if len(cmd) > 80 else ''})"
+    if name == "fetch_page":
+        return f"fetch_page({args.get('url', '?')})"
     return f"{name}(?)"
 
 
@@ -587,6 +632,141 @@ def _search_memory(project: Project, query: str, cfg: Config) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Web fetch
+# ---------------------------------------------------------------------------
+
+_MAX_FETCH_TEXT = 25_000   # chars of body text to return
+_MAX_FETCH_LINKS = 150     # links to return
+_MAX_FETCH_JSON = 50_000   # chars of JSON to return
+
+
+def _fetch_page(url: str, selector: str = "", timeout_s: int = 30) -> str:
+    try:
+        import httpx
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        return f"error: missing dependency for fetch_page — {e}"
+
+    try:
+        with httpx.Client(
+            timeout=timeout_s,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Michael/1.0; +https://github.com/project-michael)"},
+        ) as client:
+            resp = client.get(url)
+    except httpx.TimeoutException:
+        return f"error: request timed out after {timeout_s}s — {url}"
+    except httpx.RequestError as e:
+        return f"error fetching {url}: {e}"
+
+    ct = resp.headers.get("content-type", "")
+    status_line = f"HTTP {resp.status_code}  {resp.url}"
+
+    # JSON API
+    if "json" in ct:
+        try:
+            import json as _json
+            data = resp.json()
+            raw = _json.dumps(data, indent=2, ensure_ascii=False)
+            note = f" (truncated to {_MAX_FETCH_JSON} chars)" if len(raw) > _MAX_FETCH_JSON else ""
+            return f"{status_line}\ncontent-type: {ct}\n\n{raw[:_MAX_FETCH_JSON]}{note}"
+        except Exception:
+            pass
+
+    # Plain text
+    if "text/plain" in ct:
+        body = resp.text
+        note = f" (truncated)" if len(body) > _MAX_FETCH_TEXT else ""
+        return f"{status_line}\ncontent-type: {ct}\n\n{body[:_MAX_FETCH_TEXT]}{note}"
+
+    # HTML
+    if "html" in ct or not ct.strip():
+        try:
+            soup = BeautifulSoup(resp.text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+        parts: list[str] = [status_line]
+
+        # CSS selector — focused extraction
+        if selector:
+            elements = soup.select(selector)
+            if not elements:
+                return f"{status_line}\nno elements matched selector {selector!r}"
+            text = "\n".join(el.get_text(separator=" ", strip=True) for el in elements)
+            note = " (truncated)" if len(text) > _MAX_FETCH_TEXT else ""
+            return f"{status_line}\nselector: {selector!r}\n\n{text[:_MAX_FETCH_TEXT]}{note}"
+
+        # Title + meta
+        title_tag = soup.find("title")
+        if title_tag:
+            parts.append(f"title: {title_tag.get_text(strip=True)}")
+        meta_desc = soup.find("meta", attrs={"name": "description"})
+        if meta_desc:
+            parts.append(f"meta-description: {meta_desc.get('content', '')}")
+
+        # Forms — captured BEFORE removing tags
+        forms = soup.find_all("form")
+        form_lines: list[str] = []
+        for form in forms:
+            action = form.get("action", "(no action)")
+            method = form.get("method", "get").upper()
+            form_lines.append(f"  {method} {action}")
+            for inp in form.find_all(["input", "select", "textarea", "button"]):
+                name = inp.get("name") or inp.get("id") or ""
+                kind = inp.get("type", inp.name)
+                placeholder = inp.get("placeholder", "")
+                value = inp.get("value", "")
+                label = f"[{kind}]"
+                detail = " ".join(filter(None, [f"name={name}" if name else None,
+                                                f"placeholder={placeholder!r}" if placeholder else None,
+                                                f"value={value!r}" if value else None]))
+                form_lines.append(f"    {label} {detail}")
+
+        # Strip non-content tags for clean body text
+        for tag in soup(["script", "style", "noscript", "head"]):
+            tag.decompose()
+
+        body_text = soup.get_text(separator="\n", strip=True)
+        body_lines = [ln for ln in body_text.splitlines() if ln.strip()]
+        body_str = "\n".join(body_lines)
+        note = " (truncated)" if len(body_str) > _MAX_FETCH_TEXT else ""
+        parts.append(f"\n--- BODY TEXT ---\n{body_str[:_MAX_FETCH_TEXT]}{note}")
+
+        # Links
+        links: list[str] = []
+        for a in soup.find_all("a", href=True):
+            href = str(a["href"]).strip()
+            text = a.get_text(strip=True)
+            if href and href not in ("#", "javascript:void(0)"):
+                # Resolve relative URLs
+                if href.startswith("/"):
+                    from urllib.parse import urlparse
+                    parsed = urlparse(str(resp.url))
+                    href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                entry = f"  {text[:80]:80s}  →  {href}" if text else f"  {href}"
+                links.append(entry)
+        if links:
+            note = f" (first {_MAX_FETCH_LINKS})" if len(links) > _MAX_FETCH_LINKS else ""
+            parts.append(f"\n--- LINKS ({len(links)}){note} ---")
+            parts.extend(links[:_MAX_FETCH_LINKS])
+
+        if form_lines:
+            parts.append(f"\n--- FORMS ({len(forms)}) ---")
+            parts.extend(form_lines)
+
+        return "\n".join(parts)
+
+    # Binary / unknown
+    return (
+        f"{status_line}\ncontent-type: {ct}\n"
+        f"content-length: {len(resp.content)} bytes\n"
+        "(binary or unknown content-type — not displayed; use run_shell with curl if needed)"
+    )
+
+
+
 def execute_tool(
     name: str,
     args: dict[str, Any],
@@ -653,6 +833,13 @@ def execute_tool(
 
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
+
+    if name == "fetch_page":
+        return _fetch_page(
+            url=str(args["url"]),
+            selector=str(args.get("selector", "")),
+            timeout_s=int(args.get("timeout_s", 30)),
+        )
 
     return f"error: unknown tool {name}"
 

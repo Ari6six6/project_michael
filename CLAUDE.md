@@ -178,6 +178,7 @@ No Y/n. No interactive loop. One prompt → concrete result.
 | `search_memory(query)` | Auto-executes; searches stored LLM responses in this project |
 | `run_in_sandbox(python_code)` | Isolated podman, auto-executes |
 | `run_shell(cmd, timeout_s=60)` | Runs in project workspace, auto-executes |
+| `fetch_page(url, selector='', timeout_s=30)` | Auto-executes; HTTP GET over internet — returns full page text, all links with anchor text, form fields, and raw JSON for API endpoints |
 
 ---
 
