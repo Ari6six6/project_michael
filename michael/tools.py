@@ -189,6 +189,16 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Room-scoped tool subsets
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory"}
+_PLANNING_TOOL_NAMES  = {"read_file", "list_dir", "search_memory", "write_file", "apply_patch"}
+
+TOOLS_READ_ONLY = [t for t in TOOLS if t["function"]["name"] in _READ_ONLY_TOOL_NAMES]
+TOOLS_PLANNING  = [t for t in TOOLS if t["function"]["name"] in _PLANNING_TOOL_NAMES]
+
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -1017,6 +1027,27 @@ def confirm_tool_call(
 
 
 # ---------------------------------------------------------------------------
+# Dynamic tool dispatch (for tools written by the agent to tools/<name>.py)
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_dynamic_tool(name: str, args: dict[str, Any], project: Project) -> str:
+    """Load and call a tool script from <project>/tools/<name>.py."""
+    import importlib.util as _ilu
+    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
+    if not py_file.exists():
+        return f"error: unknown tool {name!r} (not a built-in and not found in tools/)"
+    try:
+        spec = _ilu.spec_from_file_location(name, py_file)
+        mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        fn = getattr(mod, name)
+        return str(fn(**args))
+    except Exception as exc:
+        return f"error running dynamic tool {name!r}: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Master dispatch
 # ---------------------------------------------------------------------------
 
@@ -1053,6 +1084,18 @@ def dispatch_tool_call(
     if name in ("write_file", "apply_patch"):
         return execute_with_staging(name, args, project, cfg, pending)
 
+    # Dynamic tool invented by the agent (tools/<name>.py) — auto-executed, no confirmation.
+    dynamic_result = _try_dynamic_dispatch(name, args, project)
+    if dynamic_result is not None:
+        first = (dynamic_result.splitlines()[0] if dynamic_result else "ok")[:120]
+        append_event(
+            "tool.executed",
+            {"tool": name, "args": args, "summary": f"{summary} → {first}",
+             "result_chars": len(dynamic_result), "dynamic": True},
+            project=project,
+        )
+        return dynamic_result
+
     try:
         decision, final_args = confirm_tool_call(name, args, project)
     except (KeyboardInterrupt, typer.Abort):
@@ -1079,3 +1122,11 @@ def dispatch_tool_call(
         payload["brief_result"] = result[:600]
     append_event("tool.executed", payload, project=project)
     return result
+
+
+def _try_dynamic_dispatch(name: str, args: dict[str, Any], project: Project) -> Optional[str]:
+    """Return dynamic tool result if tools/<name>.py exists, else None."""
+    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
+    if not py_file.exists():
+        return None
+    return _dispatch_dynamic_tool(name, args, project)
