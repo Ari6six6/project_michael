@@ -196,13 +196,15 @@ TOOLS: list[dict[str, Any]] = [
                 "page title, meta description, cleaned body text, all "
                 "hyperlinks with anchor text, form fields, and raw JSON if "
                 "the response is a JSON API. DNS resolution, redirects, and "
-                "SSL are handled automatically. Use this to read any "
-                "publicly accessible web page or HTTP API endpoint. "
+                "SSL are handled automatically. "
+                "JavaScript-heavy SPAs are detected automatically and rendered "
+                "with a headless Chromium browser (via Playwright) if it is "
+                "installed — install with: pip install playwright && "
+                "playwright install chromium. Without Playwright, static HTML "
+                "is returned with an advisory note. "
                 "Auto-executes without confirmation — it is a read-only "
                 "network fetch. To navigate deeper, call fetch_page again "
-                "on any link you find. For JavaScript-heavy pages that "
-                "render content client-side, fall back to run_shell with "
-                "curl or a headless browser command."
+                "on any link you find."
             ),
             "parameters": {
                 "type": "object",
@@ -640,6 +642,135 @@ _MAX_FETCH_TEXT = 25_000   # chars of body text to return
 _MAX_FETCH_LINKS = 150     # links to return
 _MAX_FETCH_JSON = 50_000   # chars of JSON to return
 
+# A page is considered JS-heavy (needs headless rendering) when the visible
+# body text is very short but the document has several script tags — a
+# tell-tale sign of a client-side-rendered SPA.
+_JS_HEAVY_TEXT_THRESHOLD = 400   # visible chars
+_JS_HEAVY_SCRIPT_THRESHOLD = 4   # number of <script> tags
+
+
+def _is_js_heavy(soup: Any) -> bool:
+    """Return True if the page likely needs JS execution to show content."""
+    scripts = soup.find_all("script")
+    visible = soup.get_text(strip=True)
+    return len(scripts) >= _JS_HEAVY_SCRIPT_THRESHOLD and len(visible) < _JS_HEAVY_TEXT_THRESHOLD
+
+
+def _parse_html(html: str, base_url: str, selector: str, status_line: str) -> str:
+    """Parse HTML and extract title, body text, links, and forms."""
+    from bs4 import BeautifulSoup
+    from urllib.parse import urlparse
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    parts: list[str] = [status_line]
+
+    # CSS selector — focused extraction
+    if selector:
+        elements = soup.select(selector)
+        if not elements:
+            return f"{status_line}\nno elements matched selector {selector!r}"
+        text = "\n".join(el.get_text(separator=" ", strip=True) for el in elements)
+        note = " (truncated)" if len(text) > _MAX_FETCH_TEXT else ""
+        return f"{status_line}\nselector: {selector!r}\n\n{text[:_MAX_FETCH_TEXT]}{note}"
+
+    # Title + meta
+    title_tag = soup.find("title")
+    if title_tag:
+        parts.append(f"title: {title_tag.get_text(strip=True)}")
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    if meta_desc:
+        parts.append(f"meta-description: {meta_desc.get('content', '')}")
+
+    # Forms — captured BEFORE stripping script/style tags
+    forms = soup.find_all("form")
+    form_lines: list[str] = []
+    for form in forms:
+        action = form.get("action", "(no action)")
+        method = form.get("method", "get").upper()
+        form_lines.append(f"  {method} {action}")
+        for inp in form.find_all(["input", "select", "textarea", "button"]):
+            name = inp.get("name") or inp.get("id") or ""
+            kind = inp.get("type", inp.name)
+            placeholder = inp.get("placeholder", "")
+            value = inp.get("value", "")
+            label = f"[{kind}]"
+            detail = " ".join(filter(None, [
+                f"name={name}" if name else None,
+                f"placeholder={placeholder!r}" if placeholder else None,
+                f"value={value!r}" if value else None,
+            ]))
+            form_lines.append(f"    {label} {detail}")
+
+    # Strip non-content tags for clean body text
+    for tag in soup(["script", "style", "noscript", "head"]):
+        tag.decompose()
+
+    body_text = soup.get_text(separator="\n", strip=True)
+    body_lines = [ln for ln in body_text.splitlines() if ln.strip()]
+    body_str = "\n".join(body_lines)
+    note = " (truncated)" if len(body_str) > _MAX_FETCH_TEXT else ""
+    parts.append(f"\n--- BODY TEXT ---\n{body_str[:_MAX_FETCH_TEXT]}{note}")
+
+    # Links — resolve relative URLs to absolute
+    parsed_base = urlparse(base_url)
+    links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = str(a["href"]).strip()
+        text = a.get_text(strip=True)
+        if not href or href in ("#", "javascript:void(0)"):
+            continue
+        if href.startswith("/"):
+            href = f"{parsed_base.scheme}://{parsed_base.netloc}{href}"
+        elif not href.startswith(("http://", "https://")):
+            continue
+        entry = f"  {text[:80]:80s}  →  {href}" if text else f"  {href}"
+        links.append(entry)
+    if links:
+        note = f" (first {_MAX_FETCH_LINKS} shown)" if len(links) > _MAX_FETCH_LINKS else ""
+        parts.append(f"\n--- LINKS ({len(links)}){note} ---")
+        parts.extend(links[:_MAX_FETCH_LINKS])
+
+    if form_lines:
+        parts.append(f"\n--- FORMS ({len(forms)}) ---")
+        parts.extend(form_lines)
+
+    return "\n".join(parts)
+
+
+def _playwright_render(url: str, selector: str, timeout_s: int) -> Optional[str]:
+    """Render a page with a headless Chromium browser via Playwright.
+
+    Returns the extracted content string, or None if Playwright is not
+    installed or the render fails.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return None
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (compatible; Michael/1.0)",
+            )
+            page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
+            # Give dynamic content a moment to settle after networkidle
+            page.wait_for_timeout(1500)
+            final_url = page.url
+            html = page.content()
+            browser.close()
+        status_line = f"HTTP 200 (JS-rendered)  {final_url}"
+        return _parse_html(html, final_url, selector, status_line)
+    except PWTimeout:
+        return None
+    except Exception:
+        return None
+
 
 def _fetch_page(url: str, selector: str = "", timeout_s: int = 30) -> str:
     try:
@@ -677,86 +808,33 @@ def _fetch_page(url: str, selector: str = "", timeout_s: int = 30) -> str:
     # Plain text
     if "text/plain" in ct:
         body = resp.text
-        note = f" (truncated)" if len(body) > _MAX_FETCH_TEXT else ""
+        note = " (truncated)" if len(body) > _MAX_FETCH_TEXT else ""
         return f"{status_line}\ncontent-type: {ct}\n\n{body[:_MAX_FETCH_TEXT]}{note}"
 
     # HTML
     if "html" in ct or not ct.strip():
         try:
-            soup = BeautifulSoup(resp.text, "lxml")
+            soup_check = BeautifulSoup(resp.text, "lxml")
         except Exception:
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup_check = BeautifulSoup(resp.text, "html.parser")
 
-        parts: list[str] = [status_line]
+        # If the page is a JS-heavy SPA, try headless rendering first.
+        if _is_js_heavy(soup_check):
+            rendered = _playwright_render(url, selector, timeout_s)
+            if rendered is not None:
+                return rendered
+            # Playwright not available or failed — fall through and return
+            # the static HTML with an advisory note.
+            note_line = (
+                "\n[NOTE: page appears JavaScript-rendered (sparse static HTML + "
+                f"{len(soup_check.find_all('script'))} <script> tags). "
+                "Install playwright + run `playwright install chromium` for full "
+                "JS rendering, or call the site's underlying JSON API directly "
+                "with fetch_page on the API endpoint, or use run_shell with curl.]\n"
+            )
+            return note_line + _parse_html(resp.text, str(resp.url), selector, status_line)
 
-        # CSS selector — focused extraction
-        if selector:
-            elements = soup.select(selector)
-            if not elements:
-                return f"{status_line}\nno elements matched selector {selector!r}"
-            text = "\n".join(el.get_text(separator=" ", strip=True) for el in elements)
-            note = " (truncated)" if len(text) > _MAX_FETCH_TEXT else ""
-            return f"{status_line}\nselector: {selector!r}\n\n{text[:_MAX_FETCH_TEXT]}{note}"
-
-        # Title + meta
-        title_tag = soup.find("title")
-        if title_tag:
-            parts.append(f"title: {title_tag.get_text(strip=True)}")
-        meta_desc = soup.find("meta", attrs={"name": "description"})
-        if meta_desc:
-            parts.append(f"meta-description: {meta_desc.get('content', '')}")
-
-        # Forms — captured BEFORE removing tags
-        forms = soup.find_all("form")
-        form_lines: list[str] = []
-        for form in forms:
-            action = form.get("action", "(no action)")
-            method = form.get("method", "get").upper()
-            form_lines.append(f"  {method} {action}")
-            for inp in form.find_all(["input", "select", "textarea", "button"]):
-                name = inp.get("name") or inp.get("id") or ""
-                kind = inp.get("type", inp.name)
-                placeholder = inp.get("placeholder", "")
-                value = inp.get("value", "")
-                label = f"[{kind}]"
-                detail = " ".join(filter(None, [f"name={name}" if name else None,
-                                                f"placeholder={placeholder!r}" if placeholder else None,
-                                                f"value={value!r}" if value else None]))
-                form_lines.append(f"    {label} {detail}")
-
-        # Strip non-content tags for clean body text
-        for tag in soup(["script", "style", "noscript", "head"]):
-            tag.decompose()
-
-        body_text = soup.get_text(separator="\n", strip=True)
-        body_lines = [ln for ln in body_text.splitlines() if ln.strip()]
-        body_str = "\n".join(body_lines)
-        note = " (truncated)" if len(body_str) > _MAX_FETCH_TEXT else ""
-        parts.append(f"\n--- BODY TEXT ---\n{body_str[:_MAX_FETCH_TEXT]}{note}")
-
-        # Links
-        links: list[str] = []
-        for a in soup.find_all("a", href=True):
-            href = str(a["href"]).strip()
-            text = a.get_text(strip=True)
-            if href and href not in ("#", "javascript:void(0)"):
-                # Resolve relative URLs
-                if href.startswith("/"):
-                    from urllib.parse import urlparse
-                    parsed = urlparse(str(resp.url))
-                    href = f"{parsed.scheme}://{parsed.netloc}{href}"
-                entry = f"  {text[:80]:80s}  →  {href}" if text else f"  {href}"
-                links.append(entry)
-        if links:
-            note = f" (first {_MAX_FETCH_LINKS})" if len(links) > _MAX_FETCH_LINKS else ""
-            parts.append(f"\n--- LINKS ({len(links)}){note} ---")
-            parts.extend(links[:_MAX_FETCH_LINKS])
-
-        if form_lines:
-            parts.append(f"\n--- FORMS ({len(forms)}) ---")
-            parts.extend(form_lines)
-
-        return "\n".join(parts)
+        return _parse_html(resp.text, str(resp.url), selector, status_line)
 
     # Binary / unknown
     return (
