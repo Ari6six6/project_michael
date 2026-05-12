@@ -1,110 +1,108 @@
-# The Protocol: Stateful Kantian Machine
+# The Protocol: Four-Room Kantian Cycle
 
 The machine implements a **closed question-answer loop** grounded in Kant's critical philosophy.
 
 ## Fundamental Truth
 
-**Question → Iterate → Ja (Answer) → Execute**
+**Goal → Cycle → Ja (Room 4) → Commit**
 
-User asks question. LLM answers through iteration. "Ja" is the final answer value. System executes. Done.
-
----
-
-## The Three-Turn Flow
-
-### Turn 1: Scripture & Tools (Full Toolset)
-
-```
-User invokes: michael run [question]
-    ↓
-Load Scripture (genesis.md + protocol.md + project history)
-    ↓
-Full toolset available: read_file, list_dir, write_file, apply_patch, 
-                       run_in_sandbox, run_shell, search_memory
-    ↓
-Send to LLM:
-"Read and interpret this scripture. What is your understanding of the 
-philosophy, constraints, and prior work? You may call any tool to 
-examine the codebase."
-    ↓
-LLM reads scripture + explores filesystem as needed
-    ↓
-LLM responds with interpretation
-```
-
-**Purpose**: Ground the LLM in foundation + current state, with full ability to inspect.
+User states a goal. The agent iterates through four rooms per cycle. Room 4 is the gate: "Did we answer the goal?" Ja = done and commit. No = new cycle.
 
 ---
 
-### Turn 2: Question Clarification
+## The Four Rooms
 
-```
-LLM reads user's actual question from stdin
-    ↓
-Send to LLM:
-"Given your understanding, here is the question:
+Each room has one Kantian question. The agent iterates inside the room until it can answer with certainty, then signals **Ja** to exit.
 
-[user_question]
+### Room 1 — WHAT CAN I KNOW? (Epistemics)
 
-Clarify:
-1. What is being asked?
-2. What is success?
-3. What constraints apply?"
-    ↓
-LLM clarifies the question
-```
+- **Tools**: `read_file`, `list_dir`, `search_memory` — **read-only, no writes**
+- **Purpose**: Map the full state. Filesystem, prior tool history, constraints, open questions.
+- **Exit**: Ja when epistemic clarity is complete.
 
-**Purpose**: Ensure precise understanding before iteration.
+### Room 2 — WHAT SHOULD I DO? (Ethics)
+
+- **Tools**: Full toolset — `write_file`, `apply_patch`, `run_in_sandbox`, `run_shell`, read tools
+- **Purpose**: Implement the smallest correct action. Test before signalling done.
+- **Tool invention**: If a needed capability does not exist, write it to `tools/<name>.py`. The file must export:
+  - `TOOL_SCHEMA` — OpenAI function schema dict
+  - A callable with the same name as the schema
+  - Michael loads it as a real tool at the start of the **next cycle**
+- **Exit**: Ja when implementation is verified.
+
+### Room 3 — WHAT CAN I HOPE FOR? (Teleology)
+
+- **Tools**: `read_file`, `list_dir`, `search_memory`, `write_file`, `apply_patch`
+- **Purpose**: Reflect on what was achieved. Document what is still open. Write a note on what the next cycle should address.
+- **Exit**: Ja when the outlook is documented.
+
+### Room 4 — IS THE GOAL MET? (Completion Gate)
+
+- **Tools**: `read_file`, `list_dir`, `search_memory` — **read-only**
+- **Purpose**: Evaluate the full body of work against the original user goal.
+  - If YES with certainty → end response with **Ja** → commit all staged changes → done
+  - If NO → state exactly what is still missing → new cycle begins
+- **This is the only room where Ja triggers a commit.**
 
 ---
 
-### Turn 3+: Kantian Iteration Loop (Includes VPS Sandbox Testing)
+## Cycle Flow
 
 ```
-iteration_num = 0
-
-LOOP:
-  iteration_num += 1
-  
-  Send to LLM (with literal questions spelled out):
-  
-  ===== THE THREE KANTIAN QUESTIONS =====
-  
-  1. WHAT CAN I KNOW?
-     - What does the filesystem reveal?
-     - What tools are available?
-     - What constraints exist (time, resources, environment)?
-     - What can I test?
-  
-  2. WHAT SHOULD I DO?
-     - What is the user intent?
-     - What follows from the logic of the problem?
-     - What is the smallest correct step?
-     - Is this reversible?
-  
-  3. WHAT CAN I HOPE FOR?
-     - Is the goal achievable?
-     - Can I verify it works?
-     - What is the success criterion?
-     - What might go wrong?
-  
-  =======================================
-  
-  Answer all three. Then if uncertain, call tools:
-  - read_file / list_dir to inspect code
-  - write_file / apply_patch to propose changes
-  - run_in_sandbox to test on VPS before committing
-  - run_shell for local inspection
-  
-  After testing, loop back or signal: Ja
+User goal prompt
+      ↓
+┌─────────────── CYCLE N ───────────────────────────────────────┐
+│  [load any tools/ scripts written in previous cycle]           │
+│                                                                │
+│  Room 1 — read-only exploration          → Ja                  │
+│  Room 2 — full tools + tool invention    → Ja                  │
+│  Room 3 — outlook, document next steps   → Ja                  │
+│  Room 4 — is goal met?                                         │
+│              Ja  → commit + exit                               │
+│              No  → inject gap → CYCLE N+1                      │
+└───────────────────────────────────────────────────────────────┘
+Max cycles: 5 (configurable via MAX_AGENT_CYCLES in globals.py)
 ```
 
-**VPS Sandbox Loop:**
-- When proposing changes, run_in_sandbox tests them on VPS
-- Verify before committing
-- Feed results back into next iteration
+---
 
-**Purpose**: Iterate through three orthogonal dimensions of reasoning. Test. Refine. Until certain.
+## Message History
+
+The full conversation carries forward across all rooms and all cycles. Room 2 sees Room 1's exploration. Room 4 sees everything. Between cycles, a system message is injected describing what Room 4 found missing — this is the handoff to the next cycle.
+
+---
+
+## Tool Invention Format
+
+To invent a tool in Room 2, write `<project>/tools/<name>.py`:
+
+```python
+TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "check_port",
+        "description": "Check if a TCP port is open on a host.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "port": {"type": "integer"},
+            },
+            "required": ["host", "port"],
+        },
+    },
+}
+
+def check_port(host: str, port: int) -> str:
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return f"open"
+    except OSError:
+        return f"closed"
+```
+
+On the next cycle, `check_port` appears in Room 2's tool list and can be called by name.
 
 ---
 
@@ -112,92 +110,31 @@ LOOP:
 
 **"Ja" is not a signal. It is the final answer.**
 
-When the LLM has:
-1. Answered the original question
-2. Verified the answer works (via sandbox testing)
-3. Refined through iteration
-4. Achieved certainty
-
-It ends the message with **Ja** (case-sensitive, on its own line or trailing).
-
-This contains the final answer. The system:
-- Captures it
-- Auto-executes all staged changes
-- Returns the answer + artifacts to the user
-- Loop closes
+- Inside Rooms 1–3: Ja exits that room and advances to the next.
+- In Room 4: Ja ends the entire cycle, triggers commit, exits the agent loop.
+- Case-sensitive. Must be the trailing token of the message.
+- Rejects: `"ja"`, `"Ja, das ist..."`, empty string.
 
 ---
 
-## No Gate, Always Auto-Execute
+## Events Logged
 
-- The system is **always in god mode**
-- User asks question
-- LLM iterates through Kantian loop
-- On "Ja": changes auto-commit, no approval needed
-- User gets answer + filled project directory
-
----
-
-## Constraints
-
-- **Max iterations:** 5 (configurable). If reached, nudge LLM: "You have reached the limit. Final answer: Ja or blockers?"
-- **Iteration counter:** visible to LLM each turn
-- **Sandbox testing:** encouraged on every risky change
-- **Scripture:** always loaded, always available for reference
-
----
-
-## Events
-
-- `michael.run.started` — session begins
-- `scripture.loaded` — scripture files read
-- `scripture.interpreted` — Turn 1 complete
-- `question.clarified` — Turn 2 complete
-- `kantian.iteration` — Turn 3.N complete (with question, answer, tools called)
-- `sandbox.test.run` — test executed on VPS
-- `sandbox.test.passed` / `sandbox.test.failed` — result
-- `assistant.ja` — final answer received
-- `tool.executed` — changes committed
-- `michael.run.ended` — session closes
+| Event | When |
+|-------|------|
+| `cycle.started` | Start of each cycle |
+| `room.epistemics.entered` | Room 1 entry |
+| `room.epistemics.ja` | Room 1 exit |
+| `room.ethics.entered` | Room 2 entry |
+| `room.ethics.ja` | Room 2 exit |
+| `room.teleology.entered` | Room 3 entry |
+| `room.teleology.ja` | Room 3 exit |
+| `room.completion.entered` | Room 4 entry |
+| `room.completion.ja` | Room 4 exit (goal met) |
+| `cycle.incomplete` | Room 4 said no — new cycle |
+| `assistant.message` | Each LLM response (with room label) |
+| `tool.executed` | Tool call result |
+| `agent.ended` | Loop finished (ja: true/false, cycles: N) |
 
 ---
 
-## Example Flow
-
-```
-$ michael run
-
->>> What's a good pattern for async error handling in this codebase?
-
-[Turn 1: Scripture interpretation]
-LLM reads genesis, protocol, project history, explores filesystem
-
-[Turn 2: Question clarification]
-LLM: "You're asking about async error patterns. I'll examine the codebase,
-propose examples, test them, and suggest the best pattern."
-
-[Turn 3.1: Kantian iteration]
-1. WHAT CAN I KNOW? [reads error handling code, examines tests]
-2. WHAT SHOULD I DO? [proposes three patterns]
-3. WHAT CAN I HOPE FOR? [can verify with tests]
-→ run_in_sandbox to test pattern A
-→ test fails, refine
-
-[Turn 3.2: Kantian iteration]
-1. WHAT CAN I KNOW? [test results show issue]
-2. WHAT SHOULD I DO? [fix the pattern]
-3. WHAT CAN I HOPE FOR? [retest]
-→ run_in_sandbox again
-→ test passes
-
-Ja
-
-Here is the recommended async error handling pattern for your codebase:
-[answer with code examples, artifacts]
-
-[System auto-commits, loop closes]
-```
-
----
-
-**Last updated**: [user to fill]
+**Last updated**: 2026-05-12
