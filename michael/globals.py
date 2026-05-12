@@ -96,14 +96,16 @@ ROOMS: list[dict] = [
         "directive": (
             "ROOM 2: BUILDING. Question: What should I do?\n"
             "Full tool access. Implement the smallest correct action. Test before signalling done.\n"
-            "If you need a capability that does not exist, write it to tools/<name>.py — export "
+            "You have a personal toolbox at tools/ in this project. "
+            "Check it first (list_dir('tools/')) — you may already have what you need. "
+            "If a required capability is missing, write it to tools/<name>.py — export "
             "TOOL_SCHEMA (OpenAI function schema dict) and a callable with the same name. "
-            "It will be loaded as a real tool in the next cycle.\n"
+            "It loads as a real tool at the start of the next cycle and is yours to reuse.\n"
             "Signal Ja when the implementation is verified."
         ),
         "nudge": (
-            "Room 2: build, test, refine — or write a new tool to tools/ for next cycle. "
-            "Signal Ja when done."
+            "Room 2: build, test, refine. Check tools/ for existing capabilities before "
+            "writing new ones. Signal Ja when done."
         ),
     },
     {
