@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import atexit
+import dataclasses
+import json as _json
 import os
 import pathlib
 import shlex
@@ -14,7 +16,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
-from openai import OpenAI
 
 import michael.globals as G
 from michael.config import Config, ModelProfile, SandboxConfig, VpsConfig
@@ -188,16 +189,217 @@ class VastClient:
 
 
 # ---------------------------------------------------------------------------
-# LLM client
+# LLM client — minimal OpenAI-protocol implementation using plain httpx.
+# The openai SDK requires jiter which requires Rust; Termux can't build it.
 # ---------------------------------------------------------------------------
 
 
-def llm_client(endpoint: str, api_key: Optional[str]) -> OpenAI:
-    """vLLM requires a non-empty key even when launched without auth — use 'EMPTY'."""
-    return OpenAI(base_url=endpoint, api_key=api_key or "EMPTY")
+@dataclasses.dataclass
+class _Function:
+    name: str
+    arguments: str
+
+
+@dataclasses.dataclass
+class _ToolCall:
+    id: str
+    type: str
+    function: _Function
+
+
+@dataclasses.dataclass
+class _Delta:
+    content: Optional[str] = None
+
+
+@dataclasses.dataclass
+class _Message:
+    content: Optional[str] = None
+    tool_calls: Optional[list] = None  # list[_ToolCall]
+
+
+@dataclasses.dataclass
+class _Choice:
+    message: _Message
+    index: int = 0
+
+
+@dataclasses.dataclass
+class _StreamChoice:
+    delta: _Delta
+    index: int = 0
+
+
+@dataclasses.dataclass
+class _Usage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+@dataclasses.dataclass
+class _CompletionResponse:
+    choices: list  # list[_Choice]
+    usage: Optional[_Usage] = None
+
+
+@dataclasses.dataclass
+class _StreamChunk:
+    choices: list  # list[_StreamChoice]
+    usage: Optional[_Usage] = None
+
+
+class _Completions:
+    def __init__(self, endpoint: str, http: httpx.Client, headers: dict) -> None:
+        self._endpoint = endpoint
+        self._http = http
+        self._headers = headers
+
+    def create(
+        self,
+        *,
+        model: str,
+        messages: list,
+        tools: Optional[list] = None,
+        tool_choice: Optional[Any] = None,
+        stream: bool = False,
+        timeout: float = 60.0,
+        stream_options: Optional[dict] = None,
+        **_kw: Any,
+    ) -> Any:
+        body: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
+        if tools:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        if stream and stream_options:
+            body["stream_options"] = stream_options
+        if stream:
+            return self._stream_iter(body, timeout)
+        r = self._http.post(
+            f"{self._endpoint}/chat/completions",
+            json=body,
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        return self._parse_response(r.json())
+
+    def _stream_iter(self, body: dict, timeout: float):
+        client = httpx.Client(
+            headers=self._headers,
+            timeout=httpx.Timeout(timeout, connect=10.0),
+        )
+        try:
+            with client.stream(
+                "POST", f"{self._endpoint}/chat/completions", json=body
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line or line == "data: [DONE]":
+                        continue
+                    if line.startswith("data: "):
+                        try:
+                            yield self._parse_chunk(_json.loads(line[6:]))
+                        except (_json.JSONDecodeError, KeyError):
+                            continue
+        finally:
+            client.close()
+
+    def _parse_response(self, data: dict) -> _CompletionResponse:
+        choices = []
+        for c in data.get("choices", []):
+            m = c.get("message", {})
+            tcs = m.get("tool_calls") or []
+            tool_calls: Optional[list] = [
+                _ToolCall(
+                    id=tc.get("id", ""),
+                    type=tc.get("type", "function"),
+                    function=_Function(
+                        name=tc.get("function", {}).get("name", ""),
+                        arguments=tc.get("function", {}).get("arguments", "{}"),
+                    ),
+                )
+                for tc in tcs
+            ] or None
+            choices.append(
+                _Choice(
+                    message=_Message(content=m.get("content"), tool_calls=tool_calls),
+                    index=c.get("index", 0),
+                )
+            )
+        u = data.get("usage")
+        usage = (
+            _Usage(
+                prompt_tokens=u.get("prompt_tokens", 0),
+                completion_tokens=u.get("completion_tokens", 0),
+                total_tokens=u.get("total_tokens", 0),
+            )
+            if u
+            else None
+        )
+        return _CompletionResponse(choices=choices, usage=usage)
+
+    def _parse_chunk(self, data: dict) -> _StreamChunk:
+        choices = [
+            _StreamChoice(
+                delta=_Delta(content=c.get("delta", {}).get("content")),
+                index=c.get("index", 0),
+            )
+            for c in data.get("choices", [])
+        ]
+        u = data.get("usage")
+        usage = (
+            _Usage(
+                prompt_tokens=u.get("prompt_tokens", 0),
+                completion_tokens=u.get("completion_tokens", 0),
+                total_tokens=u.get("total_tokens", 0),
+            )
+            if u
+            else None
+        )
+        return _StreamChunk(choices=choices, usage=usage)
+
+
+class _Chat:
+    def __init__(self, completions: _Completions) -> None:
+        self.completions = completions
+
+
+class LLMClient:
+    """Minimal OpenAI-protocol HTTP client using plain httpx. No Rust/jiter required."""
+
+    def __init__(self, endpoint: str, api_key: Optional[str]) -> None:
+        self._endpoint = endpoint.rstrip("/")
+        key = api_key or "EMPTY"
+        self._headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(30.0, read=300.0),
+            headers=self._headers,
+        )
+        self.chat = _Chat(_Completions(self._endpoint, self._http, self._headers))
+
+    def close(self) -> None:
+        self._http.close()
+
+
+def llm_client(endpoint: str, api_key: Optional[str]) -> LLMClient:
+    """Return an httpx-based LLM client speaking the OpenAI REST protocol."""
+    return LLMClient(endpoint, api_key)
 
 
 def _usage_dict(u: Any) -> dict[str, Any]:
+    if u is None:
+        return {}
     try:
         return u.model_dump()
     except AttributeError:
@@ -209,7 +411,7 @@ def _usage_dict(u: Any) -> dict[str, Any]:
 
 
 def chat_stream(
-    client: OpenAI,
+    client: LLMClient,
     model: str,
     messages: list[dict[str, Any]],
     *,

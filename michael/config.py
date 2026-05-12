@@ -52,8 +52,9 @@ class Config:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     system_prompt: str = G.DEFAULT_SYSTEM_PROMPT
     system_prompt_file: str = ""
-    log_responses: bool = False
+    log_responses: bool = True
     boot_poll_s: int = 10
+    scripture_dir: str = "scripture"
 
     @classmethod
     def load(cls) -> "Config":
@@ -120,16 +121,12 @@ def make_stub_config() -> Config:
     return Config(
         vast_api_key="",
         models={
-            "coder": ModelProfile(
+            "god": ModelProfile(
                 vast_instance_id="",
-                served_model_name="qwen3-coder",
-            ),
-            "big": ModelProfile(
-                vast_instance_id="",
-                served_model_name="qwen3",
+                served_model_name="",
             ),
         },
-        default_model="coder",
+        default_model="god",
         vps=VpsConfig(),
         sandbox=SandboxConfig(),
         log_responses=True,
@@ -138,12 +135,12 @@ def make_stub_config() -> Config:
 
 CONFIG_HELP: dict[str, str] = {
     "vast_api_key": "Vast.ai console API key.",
-    "default_model": "Profile name used when no --model flag is passed.",
-    "models.<name>.vast_instance_id": "Numeric ID of the rented GPU instance.",
-    "models.<name>.served_model_name": "Matches --served-model-name on vLLM.",
-    "models.<name>.vllm_api_key": "Key vLLM was launched with (or empty).",
-    "models.<name>.vllm_internal_port": "Container-internal port (default 8000).",
-    "models.<name>.request_timeout_s": "LLM request timeout (seconds).",
+    "default_model": "Profile name to use (default: 'god').",
+    "models.god.vast_instance_id": "Numeric ID of the rented GPU instance.",
+    "models.god.served_model_name": "Matches --served-model-name on vLLM.",
+    "models.god.vllm_api_key": "Key vLLM was launched with (or empty).",
+    "models.god.vllm_internal_port": "Container-internal port (default 8000).",
+    "models.god.request_timeout_s": "LLM request timeout (seconds).",
     "vps.host": "VPS public IP/hostname (empty = no remote sandbox).",
     "vps.user": "SSH user (default: michael).",
     "vps.ssh_key_path": "Path to private key (default: ~/.ssh/id_ed25519).",
@@ -153,8 +150,9 @@ CONFIG_HELP: dict[str, str] = {
     "sandbox.cpus": "Sandbox CPU cap.",
     "sandbox.pids": "Sandbox PID cap.",
     "sandbox.timeout_s": "Default sandbox timeout (seconds).",
-    "system_prompt": "Default system prompt for chat/agent loops.",
+    "system_prompt": "Default system prompt for the agent loop.",
     "system_prompt_file": "If set, read system prompt from this file.",
     "log_responses": "If true, log full LLM responses to events.jsonl.",
     "boot_poll_s": "Poll interval while waiting for vLLM to come up.",
+    "scripture_dir": "Path to scripture files (relative to repo root, default 'scripture').",
 }

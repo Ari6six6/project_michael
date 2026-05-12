@@ -17,11 +17,10 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
 
 import michael.globals as G
-from michael.agent import _resolve_nitro_model, _run_agent_loop, _tools_for_mode
+from michael.agent import _run_agent_loop
 from michael.backends import (
     VastClient,
     _ping_vllm,
@@ -73,17 +72,15 @@ def cmd_init() -> None:
         Panel(
             "Edit ~/.michael/config.json — fill in:\n\n"
             "  [bold]vast_api_key[/]              your Vast.ai console API key\n"
-            "  [bold]default_model[/]             which profile to use by default\n"
-            "  [bold]models.<name>[/]             one entry per Vast.ai instance:\n"
-            "    vast_instance_id              numeric instance id\n"
-            "    served_model_name             matches --served-model-name on vLLM\n"
-            "    vllm_api_key                  the key vLLM was launched with\n\n"
+            "  [bold]models.god.vast_instance_id[/]  numeric instance id\n"
+            "  [bold]models.god.served_model_name[/]  matches --served-model-name on vLLM\n"
+            "  [bold]models.god.vllm_api_key[/]       the key vLLM was launched with\n\n"
             "[dim]Optional, for remote sandbox on the VPS:[/]\n"
             "  [bold]vps.host[/]                  VPS public IP/hostname\n"
             "  [bold]vps.user[/]                  ssh user (default: michael)\n"
             "  [bold]vps.ssh_key_path[/]          path to private key\n"
             "  [bold]vps.workspace_dir[/]         /home/michael/workspace\n\n"
-            "[dim]Leave vps.host empty to run chat-only (no sandbox).[/]",
+            "[dim]Leave vps.host empty to run without sandbox.[/]",
             title="checklist",
             border_style="green",
         )
@@ -165,9 +162,9 @@ def cmd_config() -> None:
     G.console.print("[green]config saved[/]")
 
 
-def cmd_up(model: Optional[str]) -> None:
+def cmd_up() -> None:
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+    name, profile = cfg.get_model()
     if not profile.vast_instance_id:
         raise G.MichaelError(f"models.{name}.vast_instance_id is not set (run `config`)")
     vast = VastClient(cfg.vast_api_key)
@@ -218,9 +215,9 @@ def cmd_up(model: Optional[str]) -> None:
         vast.close()
 
 
-def cmd_down(model: Optional[str]) -> None:
+def cmd_down() -> None:
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+    name, profile = cfg.get_model()
     if not profile.vast_instance_id:
         raise G.MichaelError(f"models.{name}.vast_instance_id is not set")
     vast = VastClient(cfg.vast_api_key)
@@ -255,7 +252,7 @@ def cmd_status() -> None:
         table.add_row("vps", f"{cfg.vps.user}@{cfg.vps.host}:{cfg.vps.port}")
         table.add_row("vps.workspace", cfg.vps.workspace_dir)
     else:
-        table.add_row("vps", "[dim]not configured (chat-only)[/]")
+        table.add_row("vps", "[dim]not configured (no sandbox)[/]")
 
     table.add_row("default model", cfg.default_model or "[dim](first available)[/]")
     if not cfg.models:
@@ -272,9 +269,9 @@ def cmd_status() -> None:
     G.console.print(table)
 
 
-def cmd_ask(prompt: str, model: Optional[str]) -> None:
+def cmd_ask(prompt: str) -> None:
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
+    name, profile = cfg.get_model()
     endpoint = _require_endpoint(profile, name)
     client = llm_client(endpoint, profile.vllm_api_key)
     project = get_active_project()
@@ -313,50 +310,11 @@ def cmd_ask(prompt: str, model: Optional[str]) -> None:
     append_event("assistant.message", payload, project=project)
 
 
-def cmd_run(model: Optional[str]) -> None:
+def cmd_run(prompt: str) -> None:
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
-    _run_agent_loop(project, cfg, name, profile, mode="code", verb_label="run")
-
-
-def cmd_new_code(model: Optional[str]) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
-    _run_agent_loop(project, cfg, name, profile, mode="code", verb_label="new code")
-
-
-def cmd_new_discussion(model: Optional[str]) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = cfg.get_model(model or None)
-    _run_agent_loop(
-        project, cfg, name, profile, mode="discussion", verb_label="new discussion"
-    )
-
-
-def cmd_nitro(model: Optional[str], god: bool = False) -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    name, profile = _resolve_nitro_model(cfg, model or None)
-    if god:
-        G.console.print(
-            f"[bold yellow]⚡ god mode[/] [dim]heavy model `{name}` — "
-            "hardcoded prompt, no approval gate; changes auto-apply on Ja[/]"
-        )
-    else:
-        G.console.print(
-            f"[bold yellow]⚡ nitro engaged[/] [dim]heavy model `{name}` — "
-            f"cold-start may take a few minutes; stop with `down --model {name}` "
-            "when finished[/]"
-        )
-    _run_agent_loop(
-        project, cfg, name, profile,
-        mode="god" if god else "nitro",
-        verb_label="nitro --god" if god else "nitro",
-        god_mode=god,
-    )
+    name, profile = cfg.get_model()
+    _run_agent_loop(project, cfg, name, profile, prompt, verb_label="run")
 
 
 def cmd_log(tail: int) -> None:
@@ -503,46 +461,10 @@ def show_cmd() -> None:
 
 @app.command(name="new")
 def new_cmd(
-    keyword: Optional[str] = typer.Argument(
-        None,
-        help="'project' (create), 'code' (code agent loop), 'discussion' "
-             "(read-only chat), or the project name.",
-    ),
-    name: Optional[str] = typer.Argument(None, help="Project name (if 'project' was passed)"),
-    model: str = typer.Option(
-        "", "--model", "-m",
-        help="Model profile (only meaningful for 'new code' / 'new discussion').",
-    ),
+    name: Optional[str] = typer.Argument(None, help="Project name."),
 ) -> None:
-    """Create a new project, or start a fresh `code`/`discussion` agent loop."""
-    if keyword == "code":
-        cmd_new_code(model or None)
-        return
-    if keyword == "discussion":
-        cmd_new_discussion(model or None)
-        return
-    if keyword == "project":
-        actual_name = name
-    elif keyword and name is None:
-        actual_name = keyword
-    else:
-        actual_name = name
-    cmd_new(actual_name)
-
-
-@app.command(name="nitro")
-def nitro_cmd(
-    model: str = typer.Option(
-        "", "--model", "-m",
-        help="Override the heavy-model profile (defaults to 'nitro' then 'big').",
-    ),
-    god: bool = typer.Option(
-        False, "--god",
-        help="God mode: hardcoded prompt, changes auto-apply on Ja (no approval gate).",
-    ),
-) -> None:
-    """Fresh agent loop on the heavy model (cold-start aware)."""
-    cmd_nitro(model or None, god=god)
+    """Create a new project."""
+    cmd_new(name)
 
 
 @app.command(name="use")
@@ -564,19 +486,15 @@ def config_cmd() -> None:
 
 
 @app.command(name="up")
-def up_cmd(
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
-) -> None:
-    """Resume a Vast.ai instance and wait for vLLM."""
-    cmd_up(model or None)
+def up_cmd() -> None:
+    """Resume the GPU instance and wait for vLLM."""
+    cmd_up()
 
 
 @app.command(name="down")
-def down_cmd(
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
-) -> None:
-    """Pause a Vast.ai instance."""
-    cmd_down(model or None)
+def down_cmd() -> None:
+    """Pause the GPU instance."""
+    cmd_down()
 
 
 @app.command(name="status")
@@ -588,18 +506,24 @@ def status_cmd() -> None:
 @app.command(name="ask")
 def ask_cmd(
     prompt: str = typer.Argument(..., help="One-shot prompt for the LLM."),
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
 ) -> None:
-    """One-shot LLM call (uses active project's brief if any)."""
-    cmd_ask(prompt, model or None)
+    """One-shot LLM call (uses active project's context if any)."""
+    cmd_ask(prompt)
 
 
-@app.command(name="run")
+@app.command(name="run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run_cmd(
-    model: str = typer.Option("", "--model", "-m", help="Model profile name."),
+    prompt: list[str] = typer.Argument(None, help="Prompt — every word after 'run' is the prompt."),
 ) -> None:
-    """Multi-turn tool-calling agent loop in the active project."""
-    cmd_run(model or None)
+    """Run the agent on a prompt. Everything after 'run' is the prompt.
+
+    Example: michael run fix the auth bug in login.py
+    """
+    text = " ".join(prompt or []).strip()
+    if not text:
+        G.err.print("michael run requires a prompt. Example: michael run fix the login bug")
+        raise typer.Exit(1)
+    cmd_run(text)
 
 
 @app.command(name="log")
@@ -640,13 +564,9 @@ def ssh_test_cmd() -> None:
 # ---------------------------------------------------------------------------
 
 REPL_COMMANDS = {
-    "show", "new", "use", "current", "config", "init",
-    "up", "down", "status",
-    "ask", "run", "nitro", "log", "sandbox", "undo", "ssh-test",
+    "project", "new", "run", "up", "down", "config", "init",
     "quit", "exit", "help",
 }
-
-NEW_SUBCOMMANDS = ("project", "code", "discussion")
 
 
 def _config_is_unset() -> bool:
@@ -664,12 +584,6 @@ def _config_is_unset() -> bool:
 class MichaelCompleter(Completer):
     """Tab-completion for the REPL."""
 
-    LOG_FLAGS = ("--tail", "-n")
-    UP_FLAGS = ("--model", "-m")
-    DOWN_FLAGS = ("--model", "-m")
-    NITRO_FLAGS = ("--model", "-m", "--god")
-    UNDO_FLAGS = ("--list", "-l")
-
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
         words = text.split()
@@ -683,44 +597,11 @@ class MichaelCompleter(Completer):
             return
 
         head = words[0]
-        if head == "use":
+        if head == "project":
             prefix = words[1] if len(words) > 1 and not at_boundary else ""
             for p in list_projects():
                 if p.slug.startswith(prefix):
                     yield Completion(p.slug, start_position=-len(prefix))
-            return
-        if head == "new":
-            if len(words) == 1 and at_boundary:
-                for sub in NEW_SUBCOMMANDS:
-                    yield Completion(sub, start_position=0)
-            elif len(words) == 2 and not at_boundary:
-                for sub in NEW_SUBCOMMANDS:
-                    if sub.startswith(words[1]):
-                        yield Completion(sub, start_position=-len(words[1]))
-            return
-        if head == "log":
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.LOG_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
-            return
-        if head in ("up", "down", "run", "ask"):
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.UP_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
-            return
-        if head == "nitro":
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.NITRO_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
-            return
-        if head == "undo":
-            prefix = words[-1] if not at_boundary else ""
-            for f in self.UNDO_FLAGS:
-                if f.startswith(prefix):
-                    yield Completion(f, start_position=-len(prefix))
             return
 
 
@@ -732,11 +613,10 @@ def repl() -> None:
         completer=MichaelCompleter(),
         complete_while_typing=False,
     )
-    G.console.print("hey")
+    G.console.print("[bold cyan]michael[/] [dim]— event-sourced LLM loop[/]")
     if _config_is_unset():
         G.console.print(
-            "[yellow]no config yet — type `config` to set up your vast.ai keys, "
-            "vllm key, and model[/]"
+            "[yellow]setup required[/] [dim]type: config[/]"
         )
     while True:
         try:
@@ -779,80 +659,39 @@ def dispatch_repl(line: str) -> None:
     cmd, rest = parts[0], parts[1:]
 
     if cmd == "help":
-        G.console.print("commands: " + ", ".join(sorted(REPL_COMMANDS)))
+        G.console.print(
+            "commands:\n"
+            "  run <prompt>          run the agent on a prompt\n"
+            "  project [slug]        select/list projects\n"
+            "  new [name]            create new project\n"
+            "  up / down             start/stop GPU\n"
+            "  config                edit config\n"
+            "  init                  initialize config\n"
+            "  exit / quit           exit michael"
+        )
         return
-    if cmd == "show":
-        cmd_show()
-    elif cmd == "init":
+
+    if cmd == "init":
         cmd_init()
-    elif cmd == "new":
-        if rest and rest[0] == "code":
-            cmd_new_code(_opt_value(rest[1:], "--model", "-m"))
-        elif rest and rest[0] == "discussion":
-            cmd_new_discussion(_opt_value(rest[1:], "--model", "-m"))
-        else:
-            if rest and rest[0] == "project":
-                rest = rest[1:]
-            name = " ".join(rest) if rest else None
-            cmd_new(name)
-    elif cmd == "use":
-        if not rest:
-            G.err.print("usage: use <slug>")
-            return
-        cmd_use(rest[0])
-    elif cmd == "current":
-        cmd_current()
     elif cmd == "config":
         cmd_config()
-    elif cmd == "up":
-        cmd_up(_opt_value(rest, "--model", "-m"))
-    elif cmd == "down":
-        cmd_down(_opt_value(rest, "--model", "-m"))
-    elif cmd == "status":
-        cmd_status()
-    elif cmd == "ask":
-        model = _opt_value(rest, "--model", "-m")
-        prompt_parts = []
-        skip = 0
-        for i, tok in enumerate(rest):
-            if skip:
-                skip -= 1
-                continue
-            if tok in ("--model", "-m"):
-                skip = 1
-                continue
-            prompt_parts.append(tok)
-        if not prompt_parts:
-            G.err.print("usage: ask <prompt> [--model NAME]")
-            return
-        cmd_ask(" ".join(prompt_parts), model)
+    elif cmd == "project":
+        if rest:
+            cmd_use(rest[0])
+        else:
+            cmd_show()
+    elif cmd == "new":
+        name = " ".join(rest) if rest else None
+        cmd_new(name)
     elif cmd == "run":
-        cmd_run(_opt_value(rest, "--model", "-m"))
-    elif cmd == "nitro":
-        cmd_nitro(
-            _opt_value(rest, "--model", "-m"),
-            god="--god" in rest,
-        )
-    elif cmd == "log":
-        n = 20
-        if (v := _opt_value(rest, "--tail", "-n")) is not None:
-            try:
-                n = int(v)
-            except ValueError:
-                pass
-        cmd_log(n)
-    elif cmd == "sandbox":
         if not rest:
-            G.err.print("usage: sandbox <file>")
+            G.err.print("run requires a prompt. Example: run fix the auth bug")
             return
-        cmd_sandbox(pathlib.Path(rest[0]))
-    elif cmd == "undo":
-        list_only = "--list" in rest or "-l" in rest
-        positional = [r for r in rest if r not in ("--list", "-l")]
-        target = positional[0] if positional else None
-        cmd_undo(list_only=list_only, trash_id=target)
-    elif cmd == "ssh-test":
-        cmd_ssh_test()
+        cmd_run(" ".join(rest))
+    elif cmd == "up":
+        cmd_up()
+    elif cmd == "down":
+        cmd_down()
     else:
         G.err.print(f"unknown command: {cmd!r}. try 'help'.")
 

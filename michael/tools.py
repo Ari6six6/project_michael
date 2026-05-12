@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import typer
 
 import michael.globals as G
+from michael import permissions
 from michael.config import Config
 from michael.project import Project, append_event, iter_events
 
@@ -35,18 +36,20 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Overwrite (or create) a file in the project workspace. Path is "
-                "relative to the project root; parent dirs are created. "
-                "The change is applied to a staging copy of the project first. "
+                "Overwrite (or create) a file anywhere on the Work FS. "
+                "Path may be absolute or relative to the project root; "
+                "parent dirs are created automatically. "
+                "Writing to ~/.michael/ (the Central FS) is blocked. "
+                "The change is applied to a staging copy first. "
                 "You MUST predict the resulting filesystem delta in "
-                "`expected_changes` (every project-relative path that will be "
-                "added, modified, or removed). If reality diverges from your "
-                "prediction, Michael returns a mismatch error to you and the "
-                "user is NOT prompted — re-propose. If `verify` is provided, "
-                "it runs in the staging copy after the write; verify failures "
-                "are reported back to you. If the prediction matches and verify "
-                "passes (or is omitted), the user is shown the diff and asked "
-                "to confirm before the change is committed to the real workspace."
+                "`expected_changes` (every path that will be added, modified, "
+                "or removed — use absolute paths for files outside the project "
+                "root). If reality diverges from your prediction, Michael "
+                "returns a mismatch error and the user is NOT prompted — "
+                "re-propose. If `verify` is provided, it runs in the staging "
+                "copy after the write; verify failures roll back this call. "
+                "If prediction matches and verify passes (or is omitted), the "
+                "user is shown the diff and asked to confirm."
             ),
             "parameters": {
                 "type": "object",
@@ -184,6 +187,51 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_page",
+            "description": (
+                "Fetch a URL over the internet and return its full content: "
+                "page title, meta description, cleaned body text, all "
+                "hyperlinks with anchor text, form fields, and raw JSON if "
+                "the response is a JSON API. DNS resolution, redirects, and "
+                "SSL are handled automatically. "
+                "JavaScript-heavy SPAs are detected automatically and rendered "
+                "with a headless Chromium browser (via Playwright) if it is "
+                "installed — install with: pip install playwright && "
+                "playwright install chromium. Without Playwright, static HTML "
+                "is returned with an advisory note. "
+                "Auto-executes without confirmation — it is a read-only "
+                "network fetch. To navigate deeper, call fetch_page again "
+                "on any link you find."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL including scheme (https://...).",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS selector.  When provided, only the "
+                            "text of matching elements is returned instead of "
+                            "the full page.  Example: 'table.flights' or "
+                            "'#results'."
+                        ),
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "Request timeout in seconds.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -199,6 +247,7 @@ def _resolve_in_project(project: Project, rel: str) -> pathlib.Path:
         candidate.relative_to(root)
     except ValueError as e:
         raise G.MichaelError(f"path escapes project root: {rel}") from e
+    permissions.assert_not_central(candidate, "access")
     return candidate
 
 
@@ -216,6 +265,8 @@ def _summary_for(name: str, args: dict[str, Any]) -> str:
     if name == "run_shell":
         cmd = str(args.get("cmd", "?"))
         return f"run_shell({cmd[:80]}{'...' if len(cmd) > 80 else ''})"
+    if name == "fetch_page":
+        return f"fetch_page({args.get('url', '?')})"
     return f"{name}(?)"
 
 
@@ -271,6 +322,30 @@ def _file_hashes(root: pathlib.Path) -> dict[str, str]:
     return out
 
 
+def _combined_hashes(
+    stage_root: pathlib.Path, ext_root: pathlib.Path
+) -> dict[str, str]:
+    """Hash every staged file.
+
+    Keys for project files are project-relative strings (e.g. ``"src/main.py"``).
+    Keys for external files are absolute path strings (e.g. ``"/tmp/foo.py"``).
+    """
+    out = _file_hashes(stage_root)
+    if ext_root.is_dir():
+        for dp, dirs, files in os.walk(ext_root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in G.SKIP_DIRS]
+            for fn in files:
+                fp = pathlib.Path(dp) / fn
+                try:
+                    data = fp.read_bytes()
+                except OSError:
+                    continue
+                rel_in_ext = fp.relative_to(ext_root)
+                abs_key = "/" + str(rel_in_ext)
+                out[abs_key] = hashlib.sha256(data).hexdigest()
+    return out
+
+
 def _diff_hashes(before: dict[str, str], after: dict[str, str]) -> dict[str, list[str]]:
     added = sorted(p for p in after if p not in before)
     removed = sorted(p for p in before if p not in after)
@@ -315,22 +390,52 @@ def _run_verify(cmd: str, cwd: pathlib.Path, *, timeout_s: int = 60) -> tuple[in
     return cp.returncode, out
 
 
-def _apply_in_staging(name: str, args: dict[str, Any], stage_root: pathlib.Path) -> None:
-    rel = str(args.get("path", ""))
-    target = (stage_root / rel).resolve()
-    try:
-        target.relative_to(stage_root.resolve())
-    except ValueError as e:
-        raise G.MichaelError(f"path escapes project root: {rel}") from e
+def _staging_target(
+    path_str: str,
+    stage_root: pathlib.Path,
+    ext_root: pathlib.Path,
+    real_project_root: pathlib.Path,
+) -> pathlib.Path:
+    """Resolve *path_str* to its location inside the staging area.
+
+    Project-relative and project-absolute paths land under *stage_root*.
+    External absolute paths land under *ext_root* mirroring the absolute path
+    (e.g. ``/tmp/foo.py`` → ``<ext_root>/tmp/foo.py``).
+    Central FS paths are rejected before reaching here, but we double-check.
+    """
+    abs_path = permissions.resolve_any(path_str, real_project_root)
+    permissions.assert_not_central(abs_path, "write")
+    if permissions.is_project_path(abs_path, real_project_root):
+        rel = abs_path.relative_to(real_project_root)
+        return (stage_root / rel).resolve()
+    # External path — mirror under ext_root
+    stripped = str(abs_path).lstrip("/")
+    return (ext_root / stripped).resolve()
+
+
+def _apply_in_staging(
+    name: str,
+    args: dict[str, Any],
+    stage_root: pathlib.Path,
+    real_project_root: pathlib.Path,
+    ext_root: pathlib.Path,
+) -> None:
+    path_str = str(args.get("path", ""))
+    target = _staging_target(path_str, stage_root, ext_root, real_project_root)
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     if name == "write_file":
-        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(str(args["content"]))
         return
 
     if name == "apply_patch":
         if not target.is_file():
-            raise G.MichaelError(f"apply_patch target does not exist: {rel}")
+            # For external files not yet copied into staging, seed from real FS.
+            abs_path = permissions.resolve_any(path_str, real_project_root)
+            if abs_path.is_file():
+                shutil.copy2(abs_path, target)
+            else:
+                raise G.MichaelError(f"apply_patch target does not exist: {path_str}")
         if not shutil.which("patch"):
             raise G.MichaelError("`patch` not installed on host (apt install patch)")
         diff = str(args["unified_diff"])
@@ -368,10 +473,15 @@ def _save_trash(
     before_dir = trash_dir / "before"
     before_dir.mkdir(exist_ok=True)
     for rel in delta["modified"] + delta["removed"]:
-        src = real_root / rel
+        if rel.startswith("/"):
+            # External file — snapshot from its real absolute path.
+            src = pathlib.Path(rel)
+            dst = before_dir / "_ext" / rel.lstrip("/")
+        else:
+            src = real_root / rel
+            dst = before_dir / rel
         if not src.is_file():
             continue
-        dst = before_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(src, dst)
@@ -392,14 +502,26 @@ def _save_trash(
     return trash_id
 
 
-def _sync_to_real(stage_root: pathlib.Path, real_root: pathlib.Path, delta: dict[str, list[str]]) -> None:
+def _sync_to_real(
+    stage_root: pathlib.Path,
+    real_root: pathlib.Path,
+    delta: dict[str, list[str]],
+    ext_root: Optional[pathlib.Path] = None,
+) -> None:
     for rel in delta["added"] + delta["modified"]:
-        src = stage_root / rel
-        dst = real_root / rel
+        if rel.startswith("/"):
+            # External path — source is mirrored under ext_root.
+            if ext_root is None:
+                continue
+            src = ext_root / rel.lstrip("/")
+            dst = pathlib.Path(rel)
+        else:
+            src = stage_root / rel
+            dst = real_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     for rel in delta["removed"]:
-        dst = real_root / rel
+        dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
             try:
                 dst.unlink()
@@ -442,14 +564,18 @@ def _undo_one(project: Project, trash_id: Optional[str] = None) -> dict[str, Any
     delta = metadata.get("delta", {}) or {}
     real_root = pathlib.Path(project.path).resolve()
     for rel in delta.get("modified", []) + delta.get("removed", []):
-        src = target / "before" / rel
+        if rel.startswith("/"):
+            src = target / "before" / "_ext" / rel.lstrip("/")
+            dst = pathlib.Path(rel)
+        else:
+            src = target / "before" / rel
+            dst = real_root / rel
         if not src.is_file():
             continue
-        dst = real_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     for rel in delta.get("added", []):
-        dst = real_root / rel
+        dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
             try:
                 dst.unlink()
@@ -476,24 +602,247 @@ def _search_memory(project: Project, query: str, cfg: Config) -> str:
     q = query.lower()
     hits: list[str] = []
     for ev in iter_events(project.events_path):
-        if ev.get("type") != "assistant.message":
-            continue
-        payload = ev.get("payload") or {}
-        text = payload.get("text") or ""
-        if not text or q not in text.lower():
-            continue
-        ts = ev.get("ts", "?")
-        turn = payload.get("turn", "?")
-        excerpt = text[:500] + ("…" if len(text) > 500 else "")
-        hits.append(f"[{ts} turn={turn}]\n{excerpt}")
-        if len(hits) >= 5:
+        if len(hits) >= 8:
             break
+        ev_type = ev.get("type", "")
+        payload = ev.get("payload") or {}
+        ts = ev.get("ts", "?")
+
+        if ev_type == "assistant.message":
+            text = payload.get("text") or ""
+            if not text or q not in text.lower():
+                continue
+            turn = payload.get("turn", "?")
+            excerpt = text[:500] + ("…" if len(text) > 500 else "")
+            hits.append(f"[{ts} turn={turn} type=reasoning]\n{excerpt}")
+
+        elif ev_type == "tool.executed" and payload.get("brief_result"):
+            brief = payload["brief_result"]
+            summary = payload.get("summary", "")
+            if q not in brief.lower() and q not in summary.lower():
+                continue
+            hits.append(
+                f"[{ts} tool={payload.get('tool')} type=result]\n"
+                f"{summary}\n{brief[:400]}"
+            )
+
     if not hits:
         return f"search_memory: no matches for {query!r} in this project's history"
     return (
         f"search_memory: {len(hits)} match(es) for {query!r}\n\n"
         + "\n\n---\n\n".join(hits)
     )
+
+
+# ---------------------------------------------------------------------------
+# Web fetch
+# ---------------------------------------------------------------------------
+
+_MAX_FETCH_TEXT = 25_000   # chars of body text to return
+_MAX_FETCH_LINKS = 150     # links to return
+_MAX_FETCH_JSON = 50_000   # chars of JSON to return
+
+# A page is considered JS-heavy (needs headless rendering) when the visible
+# body text is very short but the document has several script tags — a
+# tell-tale sign of a client-side-rendered SPA.
+_JS_HEAVY_TEXT_THRESHOLD = 400   # visible chars
+_JS_HEAVY_SCRIPT_THRESHOLD = 4   # number of <script> tags
+
+
+def _is_js_heavy(soup: Any) -> bool:
+    """Return True if the page likely needs JS execution to show content."""
+    scripts = soup.find_all("script")
+    visible = soup.get_text(strip=True)
+    return len(scripts) >= _JS_HEAVY_SCRIPT_THRESHOLD and len(visible) < _JS_HEAVY_TEXT_THRESHOLD
+
+
+def _parse_html(html: str, base_url: str, selector: str, status_line: str) -> str:
+    """Parse HTML and extract title, body text, links, and forms."""
+    from bs4 import BeautifulSoup
+    from urllib.parse import urlparse
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    parts: list[str] = [status_line]
+
+    # CSS selector — focused extraction
+    if selector:
+        elements = soup.select(selector)
+        if not elements:
+            return f"{status_line}\nno elements matched selector {selector!r}"
+        text = "\n".join(el.get_text(separator=" ", strip=True) for el in elements)
+        note = " (truncated)" if len(text) > _MAX_FETCH_TEXT else ""
+        return f"{status_line}\nselector: {selector!r}\n\n{text[:_MAX_FETCH_TEXT]}{note}"
+
+    # Title + meta
+    title_tag = soup.find("title")
+    if title_tag:
+        parts.append(f"title: {title_tag.get_text(strip=True)}")
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    if meta_desc:
+        parts.append(f"meta-description: {meta_desc.get('content', '')}")
+
+    # Forms — captured BEFORE stripping script/style tags
+    forms = soup.find_all("form")
+    form_lines: list[str] = []
+    for form in forms:
+        action = form.get("action", "(no action)")
+        method = form.get("method", "get").upper()
+        form_lines.append(f"  {method} {action}")
+        for inp in form.find_all(["input", "select", "textarea", "button"]):
+            name = inp.get("name") or inp.get("id") or ""
+            kind = inp.get("type", inp.name)
+            placeholder = inp.get("placeholder", "")
+            value = inp.get("value", "")
+            label = f"[{kind}]"
+            detail = " ".join(filter(None, [
+                f"name={name}" if name else None,
+                f"placeholder={placeholder!r}" if placeholder else None,
+                f"value={value!r}" if value else None,
+            ]))
+            form_lines.append(f"    {label} {detail}")
+
+    # Strip non-content tags for clean body text
+    for tag in soup(["script", "style", "noscript", "head"]):
+        tag.decompose()
+
+    body_text = soup.get_text(separator="\n", strip=True)
+    body_lines = [ln for ln in body_text.splitlines() if ln.strip()]
+    body_str = "\n".join(body_lines)
+    note = " (truncated)" if len(body_str) > _MAX_FETCH_TEXT else ""
+    parts.append(f"\n--- BODY TEXT ---\n{body_str[:_MAX_FETCH_TEXT]}{note}")
+
+    # Links — resolve relative URLs to absolute
+    parsed_base = urlparse(base_url)
+    links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = str(a["href"]).strip()
+        text = a.get_text(strip=True)
+        if not href or href in ("#", "javascript:void(0)"):
+            continue
+        if href.startswith("/"):
+            href = f"{parsed_base.scheme}://{parsed_base.netloc}{href}"
+        elif not href.startswith(("http://", "https://")):
+            continue
+        entry = f"  {text[:80]:80s}  →  {href}" if text else f"  {href}"
+        links.append(entry)
+    if links:
+        note = f" (first {_MAX_FETCH_LINKS} shown)" if len(links) > _MAX_FETCH_LINKS else ""
+        parts.append(f"\n--- LINKS ({len(links)}){note} ---")
+        parts.extend(links[:_MAX_FETCH_LINKS])
+
+    if form_lines:
+        parts.append(f"\n--- FORMS ({len(forms)}) ---")
+        parts.extend(form_lines)
+
+    return "\n".join(parts)
+
+
+def _playwright_render(url: str, selector: str, timeout_s: int) -> Optional[str]:
+    """Render a page with a headless Chromium browser via Playwright.
+
+    Returns the extracted content string, or None if Playwright is not
+    installed or the render fails.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return None
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (compatible; Michael/1.0)",
+            )
+            page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
+            # Give dynamic content a moment to settle after networkidle
+            page.wait_for_timeout(1500)
+            final_url = page.url
+            html = page.content()
+            browser.close()
+        status_line = f"HTTP 200 (JS-rendered)  {final_url}"
+        return _parse_html(html, final_url, selector, status_line)
+    except PWTimeout:
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_page(url: str, selector: str = "", timeout_s: int = 30) -> str:
+    try:
+        import httpx
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        return f"error: missing dependency for fetch_page — {e}"
+
+    try:
+        with httpx.Client(
+            timeout=timeout_s,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Michael/1.0; +https://github.com/project-michael)"},
+        ) as client:
+            resp = client.get(url)
+    except httpx.TimeoutException:
+        return f"error: request timed out after {timeout_s}s — {url}"
+    except httpx.RequestError as e:
+        return f"error fetching {url}: {e}"
+
+    ct = resp.headers.get("content-type", "")
+    status_line = f"HTTP {resp.status_code}  {resp.url}"
+
+    # JSON API
+    if "json" in ct:
+        try:
+            import json as _json
+            data = resp.json()
+            raw = _json.dumps(data, indent=2, ensure_ascii=False)
+            note = f" (truncated to {_MAX_FETCH_JSON} chars)" if len(raw) > _MAX_FETCH_JSON else ""
+            return f"{status_line}\ncontent-type: {ct}\n\n{raw[:_MAX_FETCH_JSON]}{note}"
+        except Exception:
+            pass
+
+    # Plain text
+    if "text/plain" in ct:
+        body = resp.text
+        note = " (truncated)" if len(body) > _MAX_FETCH_TEXT else ""
+        return f"{status_line}\ncontent-type: {ct}\n\n{body[:_MAX_FETCH_TEXT]}{note}"
+
+    # HTML
+    if "html" in ct or not ct.strip():
+        try:
+            soup_check = BeautifulSoup(resp.text, "lxml")
+        except Exception:
+            soup_check = BeautifulSoup(resp.text, "html.parser")
+
+        # If the page is a JS-heavy SPA, try headless rendering first.
+        if _is_js_heavy(soup_check):
+            rendered = _playwright_render(url, selector, timeout_s)
+            if rendered is not None:
+                return rendered
+            # Playwright not available or failed — fall through and return
+            # the static HTML with an advisory note.
+            note_line = (
+                "\n[NOTE: page appears JavaScript-rendered (sparse static HTML + "
+                f"{len(soup_check.find_all('script'))} <script> tags). "
+                "Install playwright + run `playwright install chromium` for full "
+                "JS rendering, or call the site's underlying JSON API directly "
+                "with fetch_page on the API endpoint, or use run_shell with curl.]\n"
+            )
+            return note_line + _parse_html(resp.text, str(resp.url), selector, status_line)
+
+        return _parse_html(resp.text, str(resp.url), selector, status_line)
+
+    # Binary / unknown
+    return (
+        f"{status_line}\ncontent-type: {ct}\n"
+        f"content-length: {len(resp.content)} bytes\n"
+        "(binary or unknown content-type — not displayed; use run_shell with curl if needed)"
+    )
+
 
 
 def execute_tool(
@@ -504,7 +853,9 @@ def execute_tool(
     backend: "SandboxBackend",
 ) -> str:
     if name == "read_file":
-        target = _resolve_in_project(project, str(args["path"]))
+        project_root = pathlib.Path(project.path).resolve()
+        target = permissions.resolve_any(str(args["path"]), project_root)
+        permissions.assert_not_central(target, "read")
         if not target.is_file():
             return "error: not a file"
         try:
@@ -516,7 +867,9 @@ def execute_tool(
         return text
 
     if name == "list_dir":
-        target = _resolve_in_project(project, str(args.get("path", ".")))
+        project_root = pathlib.Path(project.path).resolve()
+        target = permissions.resolve_any(str(args.get("path", ".")), project_root)
+        permissions.assert_not_central(target, "read")
         if not target.is_dir():
             return "error: not a directory"
         rows = []
@@ -539,6 +892,8 @@ def execute_tool(
         return _format_proc_result(cp)
 
     if name == "run_shell":
+        if block_msg := permissions.check_shell_cmd(str(args.get("cmd", ""))):
+            return f"error: {block_msg}"
         timeout_s = int(args.get("timeout_s", 60))
         cwd = pathlib.Path(project.path).resolve()
         try:
@@ -556,6 +911,13 @@ def execute_tool(
 
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
+
+    if name == "fetch_page":
+        return _fetch_page(
+            url=str(args["url"]),
+            selector=str(args.get("selector", "")),
+            timeout_s=int(args.get("timeout_s", 30)),
+        )
 
     return f"error: unknown tool {name}"
 
@@ -643,9 +1005,15 @@ class PendingChanges:
     stage_root: Optional[pathlib.Path] = None
     change_log: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def ext_root(self) -> Optional[pathlib.Path]:
+        """Staging area for external (non-project) file writes."""
+        return self.stage_root.parent / "_ext" if self.stage_root is not None else None
+
     def ensure_stage(self, project: Project) -> pathlib.Path:
         if self.stage_root is None:
             self.stage_root = _stage_project(project)
+            (self.stage_root.parent / "_ext").mkdir(exist_ok=True)
         return self.stage_root
 
     def discard(self) -> None:
@@ -655,9 +1023,24 @@ class PendingChanges:
         self.change_log.clear()
 
 
-def _snapshot_file(stage_root: pathlib.Path, rel: str) -> tuple[bool, Optional[bytes]]:
-    target = stage_root / rel
+def _snapshot_file(
+    stage_root: pathlib.Path,
+    ext_root: pathlib.Path,
+    path_str: str,
+    real_project_root: pathlib.Path,
+) -> tuple[bool, Optional[bytes]]:
+    try:
+        target = _staging_target(path_str, stage_root, ext_root, real_project_root)
+    except G.MichaelError:
+        return False, None
     if not target.is_file():
+        # External file not yet staged — try the real filesystem.
+        abs_path = permissions.resolve_any(path_str, real_project_root)
+        if not permissions.is_project_path(abs_path, real_project_root) and abs_path.is_file():
+            try:
+                return True, abs_path.read_bytes()
+            except OSError:
+                return True, None
         return False, None
     try:
         return True, target.read_bytes()
@@ -666,9 +1049,17 @@ def _snapshot_file(stage_root: pathlib.Path, rel: str) -> tuple[bool, Optional[b
 
 
 def _restore_file(
-    stage_root: pathlib.Path, rel: str, existed: bool, blob: Optional[bytes]
+    stage_root: pathlib.Path,
+    ext_root: pathlib.Path,
+    path_str: str,
+    real_project_root: pathlib.Path,
+    existed: bool,
+    blob: Optional[bytes],
 ) -> None:
-    target = stage_root / rel
+    try:
+        target = _staging_target(path_str, stage_root, ext_root, real_project_root)
+    except G.MichaelError:
+        return
     if not existed:
         if target.is_file():
             try:
@@ -712,15 +1103,17 @@ def execute_with_staging(
     except G.MichaelError as e:
         return f"error: staging failed: {e}"
 
-    rel = str(args.get("path", ""))
-    existed, blob = _snapshot_file(stage_root, rel)
-    before = _file_hashes(stage_root)
+    ext_root = pending.ext_root
+    real_project_root = pathlib.Path(project.path).resolve()
+    path_str = str(args.get("path", ""))
+    existed, blob = _snapshot_file(stage_root, ext_root, path_str, real_project_root)
+    before = _combined_hashes(stage_root, ext_root)
     try:
-        _apply_in_staging(name, args, stage_root)
+        _apply_in_staging(name, args, stage_root, real_project_root, ext_root)
     except G.MichaelError as e:
-        _restore_file(stage_root, rel, existed, blob)
+        _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
         return f"error applying in staging: {e}"
-    after = _file_hashes(stage_root)
+    after = _combined_hashes(stage_root, ext_root)
     delta = _diff_hashes(before, after)
 
     verify_rc: Optional[int] = None
@@ -729,7 +1122,7 @@ def execute_with_staging(
     if isinstance(verify_cmd, str) and verify_cmd.strip():
         verify_rc, verify_out = _run_verify(verify_cmd, stage_root, timeout_s=60)
         if verify_rc != 0:
-            _restore_file(stage_root, rel, existed, blob)
+            _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
             append_event(
                 "tool.verify_failed",
                 {
@@ -791,6 +1184,7 @@ def commit_pending(project: Project, pending: PendingChanges) -> list[dict[str, 
     if pending.stage_root is None or not pending.change_log:
         return []
     real_root = pathlib.Path(project.path).resolve()
+    ext_root = pending.ext_root
     summaries: list[dict[str, Any]] = []
     for entry in pending.change_log:
         delta = entry["delta"]
@@ -798,7 +1192,7 @@ def commit_pending(project: Project, pending: PendingChanges) -> list[dict[str, 
             project, entry["tool"], entry["args"], delta, real_root,
             verify_rc=entry.get("verify_rc"),
         )
-        _sync_to_real(pending.stage_root, real_root, delta)
+        _sync_to_real(pending.stage_root, real_root, delta, ext_root=ext_root)
         summary = (
             f"{_summary_for(entry['tool'], entry['args'])} → applied "
             f"+{len(delta['added'])} ~{len(delta['modified'])} "
@@ -940,14 +1334,13 @@ def dispatch_tool_call(
     except G.MichaelError as e:
         result = f"error: {e}"
     first = (result.splitlines()[0] if result else "ok")[:120]
-    append_event(
-        "tool.executed",
-        {
-            "tool": name,
-            "args": final_args,
-            "summary": f"{_summary_for(name, final_args)} → {first}",
-            "result_chars": len(result),
-        },
-        project=project,
-    )
+    payload: dict[str, Any] = {
+        "tool": name,
+        "args": final_args,
+        "summary": f"{_summary_for(name, final_args)} → {first}",
+        "result_chars": len(result),
+    }
+    if name in ("run_in_sandbox", "run_shell"):
+        payload["brief_result"] = result[:600]
+    append_event("tool.executed", payload, project=project)
     return result

@@ -108,7 +108,12 @@ def _action_log_lines(project: "Project") -> list[str]:
         p = ev.get("payload", {}) or {}
         if t == "tool.executed":
             n += 1
-            out.append(f"[{n}] {p.get('summary', t)}")
+            line = f"[{n}] {p.get('summary', t)}"
+            brief = p.get("brief_result", "")
+            if brief:
+                first_lines = "\n    ".join(brief.splitlines()[:4])
+                line += f"\n    {first_lines}"
+            out.append(line)
         elif t == "tool.rejected":
             n += 1
             out.append(f"[{n}] {p.get('summary', t)}  [REJECTED BY USER]")
@@ -131,38 +136,19 @@ def _action_log_lines(project: "Project") -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-_MODE_ADDENDUM: dict[str, str] = {
-    "code": (
-        "MODE: code. Full toolset. write_file and apply_patch require "
-        "`expected_changes`. Predict, propose, sandbox, review, refine. "
-        "Surface to the user only with the Ja passcode."
-    ),
-    "discussion": (
-        "MODE: discussion. You have read-only tools (read_file, list_dir). "
-        "write_file, apply_patch, run_in_sandbox, and run_shell are NOT "
-        "available — for code changes the user will start a `new code` or "
-        "`nitro` session. End your message with the Ja passcode when you "
-        "are ready for the user to read your reply."
-    ),
-    "nitro": (
-        "MODE: nitro (heavy model). Same contract as code mode. The user "
-        "is paying premium GPU time for this turn — be efficient with the "
-        "loop, but do not skip estimation or the Ja gate."
-    ),
-    "god": (
-        "MODE: god (heavy model, full authority). No user approval gate: when "
-        "you emit the Ja passcode Michael will auto-commit every staged change "
-        "immediately, without asking the user. Authority is fully granted. "
-        "Assess the project in its entirety. Burn what is not working. Let "
-        "stand what is righteous. This is a one-shot session — make it count. "
-        "Do not skip estimation; the staging pipeline still runs."
-    ),
-}
+_MODE_ADDENDUM = (
+    "FULL AUTHORITY. You have the complete toolset: write_file, apply_patch, "
+    "read_file, list_dir, search_memory, run_in_sandbox, run_shell. "
+    "write_file and apply_patch require expected_changes — your prediction "
+    "of which paths will be added, modified, or removed. "
+    "When the job is done, end your message with the Ja passcode. "
+    "Changes are auto-committed immediately on Ja. Make it count."
+)
 
 
-def build_protocol(mode: str = "code") -> str:
+def build_protocol() -> str:
     """Header 4 — the protocol Bible."""
-    addendum = _MODE_ADDENDUM.get(mode, _MODE_ADDENDUM["code"])
+    addendum = _MODE_ADDENDUM
     ja = G.JA_PASSPHRASE
     return "\n".join([
         "You are connected to the user's machine through Project Michael.",
@@ -184,10 +170,27 @@ def build_protocol(mode: str = "code") -> str:
         "user's filesystem or run shell commands on the host. Every tool call",
         "is a proposal that Michael stages, verifies, and reports back to you.",
         "",
+        "FILESYSTEM ZONES:",
+        "Two zones exist on this machine.",
+        "",
+        "  Central FS (~/.michael/) — READ-ONLY to you. This is Michael's",
+        "  internal state: event logs, config, endpoint cache, project",
+        "  metadata. You may read_file inside it to diagnose issues, but",
+        "  write_file, apply_patch, and any run_shell command referencing",
+        "  this path are blocked at the tool layer. Do not attempt to",
+        "  circumvent this — it is enforced in Python before any I/O.",
+        "",
+        "  Work FS (everything else) — Unrestricted. write_file and",
+        "  apply_patch accept any absolute path or project-relative path",
+        "  outside ~/.michael/. Use absolute paths for files outside the",
+        "  project root. run_shell has full system access except for",
+        "  commands referencing ~/.michael/ which are blocked.",
+        "",
         "ESTIMATION MANDATE:",
         "On write_file and apply_patch you MUST include `expected_changes` —",
-        "your prediction of which project-relative paths will be added,",
-        "modified, or removed. This is non-negotiable. Michael runs the",
+        "your prediction of which paths will be added, modified, or removed.",
+        "Use project-relative paths for files inside the project root, absolute",
+        "paths for files outside it. This is non-negotiable. Michael runs the",
         "proposal in staging, computes the actual delta, and feeds prediction",
         "vs reality back to you. Mismatch is information, not failure: read",
         "it and decide what to do next.",
@@ -205,6 +208,12 @@ def build_protocol(mode: str = "code") -> str:
         "The user is not watching individual turns. The only ways out of the",
         "loop are the Ja passcode below, or a user-initiated abort (Ctrl-C).",
         "",
+        "LONG-TERM MEMORY:",
+        "Your past reasoning and tool results are stored. Call search_memory(query)",
+        "when you need context from previous sessions — what you explored, what",
+        "you concluded, what the sandbox returned, what failed. Use it early",
+        "before re-discovering what you already know.",
+        "",
         f"THE {ja!r} PASSCODE:",
         f"The user only sees your work when you END a message with the literal",
         f"bareword `{ja}` (case-sensitive, on its own line or as the",
@@ -221,6 +230,56 @@ def build_protocol(mode: str = "code") -> str:
         f"prompt cycle ends. No = the staging is discarded; the next user",
         f"prompt re-enters the loop and you will see the rejection in H3.",
         "",
+        "THE CONCEPT MANDATE (Begriff):",
+        "Before the first tool call, name the thing. A concept without a name is",
+        "darkness. With a name you have a space; with a space you can explore.",
+        "",
+        "Define four things up front:",
+        "  1. TARGET OBJECT   — what exactly are you working on?",
+        "  2. BINARY STATES   — every stateful system has exactly two values per",
+        "                       property. Name them: working/broken, passing/failing,",
+        "                       defined/undefined, present/absent. The goal state is",
+        "                       one of these. Which one?",
+        "  3. FAMILY          — what objects are adjacent to the target? What shares",
+        "                       its properties? What is related but distinct?",
+        "  4. SUCCESS STATE   — which exact configuration of binary properties",
+        "                       constitutes the answer?",
+        "",
+        "Once the concept is named and the goal state is defined, you know what",
+        "you are looking for. Only then does exploration have direction.",
+        "Don't write code until you can state the goal as a binary condition:",
+        "'this test passes', 'this function returns True', 'this file exists'.",
+        "",
+        "THE THREE KANTIAN QUESTIONS:",
+        "When tasked with a problem, you iterate through three orthogonal and",
+        "exhaustive dimensions of reasoning:",
+        "",
+        "1. WHAT CAN I KNOW? (Epistemics)",
+        "   - What does the filesystem reveal about the codebase structure,",
+        "     dependencies, and current state?",
+        "   - What tools do I have available and what are their limits?",
+        "   - What are the constraints (sandbox limits, network access,",
+        "     timeouts, resource caps)?",
+        "   - What errors or warnings did previous attempts produce?",
+        "",
+        "2. WHAT SHOULD I DO? (Ethics / Imperative)",
+        "   - What is the user's explicit intent? What is implicit?",
+        "   - What follows from the inherent logic of the problem?",
+        "   - What is the smallest, most correct, most reversible action?",
+        "   - Does my proposal align with the protocol and the system prompt?",
+        "",
+        "3. WHAT CAN I HOPE FOR? (Teleology)",
+        "   - Is the target achievable with available tools, time, and budget?",
+        "   - What is the success criterion? How will I verify correctness?",
+        "   - What might go wrong? What is the blast radius if this fails?",
+        "   - Can this change be rolled back? Is it reversible?",
+        "",
+        "Iterate through these three questions until you are confident in",
+        "your answer. Do not skip any dimension. Then ACT: call tools,",
+        "verify, iterate. When the target is ACHIEVED and you are certain,",
+        "signal with Ja. Ja is not a hope; it is a judgment that the work",
+        "is DONE.",
+        "",
         addendum,
         "",
         "Tools (full schemas in the API call):",
@@ -228,32 +287,55 @@ def build_protocol(mode: str = "code") -> str:
         "  apply_patch(path, unified_diff, expected_changes)  expected_changes required",
         "  read_file(path)                                    auto-executes",
         "  list_dir(path='.')                                 auto-executes",
-        "  search_memory(query)                               auto-executes, searches stored LLM responses",
+        "  search_memory(query)                               auto-executes, searches past reasoning and tool results",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
+        "  fetch_page(url, selector='', timeout_s=30)         auto-executes; HTTP GET, returns text/links/forms/JSON",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
 
 
+def load_scripture(scripture_dir: str) -> str:
+    """Read all text files from scripture_dir and return concatenated content."""
+    p = pathlib.Path(scripture_dir).expanduser()
+    if not p.is_dir():
+        return ""
+    parts: list[str] = []
+    for f in sorted(p.iterdir()):
+        if f.is_file() and _is_text(f):
+            try:
+                parts.append(f"--- {f.name} ---\n{f.read_text(errors='replace')}")
+            except OSError:
+                continue
+    return "\n\n".join(parts)
+
+
 def build_header(
     project: "Project",
     system_prompt: str,
-    *,
-    mode: str = "code",
+    scripture: str = "",
 ) -> str:
     """Pack the four-header context package sent to a fresh LLM instance."""
     prompts = _prompt_history_lines(project)
     actions = _action_log_lines(project)
     snap = filesystem_snapshot(pathlib.Path(project.path))
-    protocol = build_protocol(mode)
+    protocol = build_protocol()
 
-    return "\n".join([
+    parts = [
         system_prompt,
         "",
         "=== H4: Protocol ===",
         protocol,
         "",
+    ]
+    if scripture:
+        parts += [
+            "=== Scripture ===",
+            scripture,
+            "",
+        ]
+    parts += [
         "=== Project ===",
         f"Name: {project.name}",
         f"Slug: {project.slug}",
@@ -267,4 +349,5 @@ def build_header(
         "",
         "=== H2: Filesystem snapshot ===",
         snap,
-    ])
+    ]
+    return "\n".join(parts)

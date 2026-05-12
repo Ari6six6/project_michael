@@ -28,9 +28,8 @@ pkg update
 pkg upgrade -y
 pkg install -y python openssh git rsync coreutils nano
 
-echo "==> [2/6] python deps"
-python -m pip install --upgrade pip
-python -m pip install -r "${PROJECT_DIR}/requirements.txt"
+echo "==> [2/6] python deps (openai SDK replaced by httpx — no Rust build required)"
+pip install -r "${PROJECT_DIR}/requirements.txt"
 
 echo "==> [3/6] state directory"
 install -d -m 0700 "${HOME}/.michael"

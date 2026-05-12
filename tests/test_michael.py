@@ -161,11 +161,16 @@ def test_stage_project_skips_dotted_and_skipdirs(home, workspace):
 def test_apply_in_staging_write_file_does_not_touch_real(home, workspace):
     p = m.create_project("x", workspace)
     stage = m._stage_project(p)
+    real_root = workspace.resolve()
+    ext_root = stage.parent / "_ext"
+    ext_root.mkdir(exist_ok=True)
     try:
         m._apply_in_staging(
             "write_file",
             {"path": "src/bar.py", "content": "y = 2\n"},
             stage,
+            real_root,
+            ext_root,
         )
         assert (stage / "src" / "bar.py").read_text() == "y = 2\n"
         assert not (workspace / "src" / "bar.py").exists()
@@ -173,15 +178,22 @@ def test_apply_in_staging_write_file_does_not_touch_real(home, workspace):
         shutil.rmtree(stage.parent, ignore_errors=True)
 
 
-def test_apply_in_staging_refuses_escape(home, workspace):
+def test_apply_in_staging_refuses_central_fs(home, workspace):
+    """Writing to ~/.michael/ must be blocked regardless of staging."""
     p = m.create_project("x", workspace)
     stage = m._stage_project(p)
+    real_root = workspace.resolve()
+    ext_root = stage.parent / "_ext"
+    ext_root.mkdir(exist_ok=True)
+    central = str(michael_globals.STATE_DIR / "evil.txt")
     try:
-        with pytest.raises(m.MichaelError):
+        with pytest.raises(m.MichaelError, match="Central FS violation"):
             m._apply_in_staging(
                 "write_file",
-                {"path": "../escape.txt", "content": "x"},
+                {"path": central, "content": "x"},
                 stage,
+                real_root,
+                ext_root,
             )
     finally:
         shutil.rmtree(stage.parent, ignore_errors=True)
@@ -292,54 +304,33 @@ def test_config_is_unset_when_blank(home):
 def test_config_is_unset_false_when_keys_set(home):
     cfg = m.make_stub_config()
     cfg.vast_api_key = "x"
-    cfg.models["coder"].vast_instance_id = "12345"
+    cfg.models["god"].vast_instance_id = "12345"
     cfg.save()
     assert m._config_is_unset() is False
 
 
-# ---- mode helpers --------------------------------------------------------
+# ---- single-model helpers -----------------------------------------------
 
-def test_tools_for_mode_discussion_is_read_only():
-    tools = m._tools_for_mode("discussion")
-    names = {t["function"]["name"] for t in tools}
-    assert names == m.AUTO_EXEC_TOOLS
-    assert "write_file" not in names
-    assert "run_shell" not in names
-
-
-def test_tools_for_mode_code_and_nitro_are_full():
-    code_names = {t["function"]["name"] for t in m._tools_for_mode("code")}
-    nitro_names = {t["function"]["name"] for t in m._tools_for_mode("nitro")}
+def test_full_toolset_always_available():
     full = {t["function"]["name"] for t in m.TOOLS}
-    assert code_names == full
-    assert nitro_names == full
+    assert "write_file" in full
+    assert "run_shell" in full
+    assert "read_file" in full
 
 
-def test_resolve_nitro_prefers_nitro_then_big_then_errors(home):
-    cfg = m.Config(models={"coder": m.ModelProfile()})
-    with pytest.raises(m.MichaelError):
-        m._resolve_nitro_model(cfg, None)
-
-    cfg = m.Config(models={"coder": m.ModelProfile(), "big": m.ModelProfile()})
-    name, _ = m._resolve_nitro_model(cfg, None)
-    assert name == "big"
-
-    cfg = m.Config(models={
-        "coder": m.ModelProfile(),
-        "big": m.ModelProfile(),
-        "nitro": m.ModelProfile(),
-    })
-    name, _ = m._resolve_nitro_model(cfg, None)
-    assert name == "nitro"
+def test_stub_config_has_single_god_profile():
+    cfg = m.make_stub_config()
+    assert "god" in cfg.models
+    assert cfg.default_model == "god"
+    assert len(cfg.models) == 1
 
 
-def test_resolve_nitro_explicit_model_wins(home):
-    cfg = m.Config(models={
-        "coder": m.ModelProfile(),
-        "nitro": m.ModelProfile(),
-    })
-    name, _ = m._resolve_nitro_model(cfg, "coder")
-    assert name == "coder"
+def test_get_model_returns_god_by_default(home):
+    cfg = m.make_stub_config()
+    cfg.save()
+    loaded = m.Config.load()
+    name, profile = loaded.get_model()
+    assert name == "god"
 
 
 # ---- tool schema: expected_changes is required --------------------------
@@ -511,30 +502,26 @@ def test_ja_detector_rejects_mid_sentence_and_other_languages():
 # ---- Header 4 / build_protocol ------------------------------------------
 
 def test_build_protocol_lists_four_headers():
-    text = m.build_protocol("code")
+    text = m.build_protocol()
     for h in ("H1", "H2", "H3", "H4"):
         assert h in text
 
 
 def test_build_protocol_mentions_ja_passcode_and_no_hands():
-    text = m.build_protocol("code")
+    text = m.build_protocol()
     assert "Ja" in text
     assert "passcode" in text.lower()
     assert "no hands" in text.lower() or "NO HANDS" in text
 
 
-def test_build_protocol_mode_addendum_changes():
-    code = m.build_protocol("code")
-    discussion = m.build_protocol("discussion")
-    nitro = m.build_protocol("nitro")
-    assert "MODE: code" in code
-    assert "MODE: discussion" in discussion
-    assert "MODE: nitro" in nitro
+def test_build_protocol_has_full_authority_addendum():
+    text = m.build_protocol()
+    assert "FULL AUTHORITY" in text
 
 
 def test_build_header_includes_protocol(home, workspace):
     p = m.create_project("x", workspace)
-    pkg = m.build_header(p, "system stub", mode="code")
+    pkg = m.build_header(p, "system stub")
     assert "H4: Protocol" in pkg
     assert "Ja" in pkg
     # H1/H2/H3 markers are present too.
@@ -543,7 +530,8 @@ def test_build_header_includes_protocol(home, workspace):
 
 # ---- REPL surface --------------------------------------------------------
 
-def test_repl_commands_include_nitro_and_new_subcommands():
-    assert "nitro" in m.REPL_COMMANDS
+def test_repl_commands_include_core_commands():
+    assert "run" in m.REPL_COMMANDS
     assert "new" in m.REPL_COMMANDS
-    assert set(m.NEW_SUBCOMMANDS) == {"project", "code", "discussion"}
+    assert "up" in m.REPL_COMMANDS
+    assert "down" in m.REPL_COMMANDS

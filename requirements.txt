@@ -2,5 +2,9 @@ click<8.2
 typer==0.15.1
 httpx==0.28.1
 rich==13.9.4
-openai==2.33.0
 prompt_toolkit==3.0.50
+beautifulsoup4>=4.12
+lxml>=5.0
+# optional — enables JS rendering for client-side SPAs via headless Chromium
+# install with: pip install playwright && playwright install chromium
+playwright>=1.40; python_version>="3.8"
