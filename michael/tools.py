@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
+import httpx
 import typer
 
 import michael.globals as G
@@ -185,6 +187,76 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "required": ["cmd"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browse_url",
+            "description": (
+                "Fetch a URL via HTTP/HTTPS. Runs on the phone network — never "
+                "via the VPS. Returns HTTP status, response headers, and cleaned "
+                "body text (HTML is stripped to readable text). Use "
+                "extract_links=true to also receive every href found on the page. "
+                "Use save_to to persist the full result to the concept store under "
+                "that key. Max body returned: 50 KB. Auto-executes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to fetch (http or https)."},
+                    "extract_links": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, append a list of all href links found on the page.",
+                    },
+                    "save_to": {
+                        "type": "string",
+                        "description": (
+                            "Optional concept-store key. If provided, the full response "
+                            "is saved to ~/.michael/projects/<slug>/concept/<save_to>."
+                        ),
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_concept",
+            "description": (
+                "Persist a data point to the project concept store "
+                "(~/.michael/projects/<slug>/concept/). Use this to accumulate "
+                "knowledge about a target across sessions: server headers, discovered "
+                "endpoints, inferred tech stack, working hypotheses, partial models. "
+                "Key may use forward slashes for subdirectories "
+                "(e.g. 'server/headers', 'endpoints/login'). "
+                "Content is UTF-8 — markdown, JSON, or plain text. Auto-executes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Concept key, e.g. 'server/headers' or 'model'.",
+                    },
+                    "content": {"type": "string", "description": "UTF-8 content to store."},
+                },
+                "required": ["key", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_concepts",
+            "description": (
+                "List all keys currently in the project concept store with their "
+                "modification timestamps and sizes. Auto-executes."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -587,6 +659,98 @@ def _search_memory(project: Project, query: str, cfg: Config) -> str:
     )
 
 
+_MAX_BROWSE_BODY = 50_000
+_CONCEPT_KEY_RE = re.compile(r"^[\w\-./]+$")
+
+
+def _browse_url(
+    url: str,
+    extract_links: bool,
+    save_to: Optional[str],
+    project: Project,
+    cfg: Config,
+) -> str:
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30)
+    except httpx.TimeoutException:
+        return f"error: request timed out after 30s fetching {url}"
+    except httpx.RequestError as exc:
+        return f"error: {exc}"
+
+    ct = resp.headers.get("content-type", "")
+    raw = resp.text
+
+    if "html" in ct.lower():
+        try:
+            from bs4 import BeautifulSoup  # noqa: PLC0415
+            soup = BeautifulSoup(raw, "html.parser")
+            for tag in soup(["script", "style", "noscript", "head"]):
+                tag.decompose()
+            body_text = soup.get_text(separator="\n", strip=True)
+            links = [a.get("href", "") for a in soup.find_all("a", href=True)] if extract_links else []
+        except ImportError:
+            body_text = re.sub(r"<[^>]+>", "", raw)
+            links = re.findall(r'href=["\']([^"\']+)["\']', raw) if extract_links else []
+    else:
+        body_text = raw
+        links = []
+
+    if len(body_text) > _MAX_BROWSE_BODY:
+        body_text = body_text[:_MAX_BROWSE_BODY] + f"\n[truncated — {len(body_text)} bytes total]"
+
+    header_lines = "\n".join(f"  {k}: {v}" for k, v in resp.headers.items())
+    parts = [
+        f"status: {resp.status_code}",
+        f"url: {str(resp.url)}",
+        f"headers:\n{header_lines}",
+        f"body ({len(body_text)} chars):",
+        body_text,
+    ]
+    if extract_links and links:
+        parts.append("links:\n" + "\n".join(f"  {h}" for h in links[:200]))
+
+    result = "\n".join(parts)
+    if save_to:
+        _save_concept(save_to, result, project)
+    return result
+
+
+def _save_concept(key: str, content: str, project: Project) -> str:
+    if not key or not _CONCEPT_KEY_RE.match(key):
+        return "error: invalid concept key — use alphanumeric, hyphens, dots, forward slashes only"
+    if ".." in key or key.startswith("/"):
+        return "error: invalid concept key — no '..' or leading '/'"
+    target = G.concept_dir(project) / key
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return f"error: {e}"
+    return f"concept saved: {key} ({len(content)} bytes)"
+
+
+def _list_concepts(project: Project) -> str:
+    cdir = G.concept_dir(project)
+    if not cdir.exists():
+        return "concept store is empty"
+    entries: list[tuple[str, str, int]] = []
+    for f in sorted(cdir.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(cdir).as_posix()
+        try:
+            st = f.stat()
+            ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M")
+            size = st.st_size
+        except OSError:
+            ts, size = "?", 0
+        entries.append((rel, ts, size))
+    if not entries:
+        return "concept store is empty"
+    lines = [f"  {rel}  [{ts}]  {size}b" for rel, ts, size in entries]
+    return f"concept store ({len(entries)} item(s)):\n" + "\n".join(lines)
+
+
 def execute_tool(
     name: str,
     args: dict[str, Any],
@@ -653,6 +817,21 @@ def execute_tool(
 
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
+
+    if name == "browse_url":
+        return _browse_url(
+            str(args["url"]),
+            bool(args.get("extract_links", False)),
+            args.get("save_to"),
+            project,
+            cfg,
+        )
+
+    if name == "save_concept":
+        return _save_concept(str(args["key"]), str(args["content"]), project)
+
+    if name == "list_concepts":
+        return _list_concepts(project)
 
     return f"error: unknown tool {name}"
 

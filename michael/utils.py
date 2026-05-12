@@ -1,8 +1,9 @@
-"""Filesystem snapshot and context-package builder (headers H1–H4)."""
+"""Filesystem snapshot and context-package builder (headers H1–H5)."""
 from __future__ import annotations
 
 import os
 import pathlib
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import michael.globals as G
@@ -214,6 +215,23 @@ def build_protocol() -> str:
         "you concluded, what the sandbox returned, what failed. Use it early",
         "before re-discovering what you already know.",
         "",
+        "CONCEPT STORE (persistent knowledge about a target):",
+        "You have a dedicated key-value store on the phone for each project:",
+        "~/.michael/projects/<slug>/concept/. Use it to accumulate everything",
+        "you learn about a target across sessions.",
+        "",
+        "  browse_url(url)           — fetch a URL, get headers + cleaned body",
+        "  save_concept(key, content) — persist a data point to the store",
+        "  list_concepts()            — recall what you have already learned",
+        "",
+        "Keys use forward slashes for subdirectories: 'server/headers',",
+        "'endpoints/login', 'model'. Over many sessions, these accumulate",
+        "into an inversion of the remote system — a local structural model",
+        "built by recursive exploration and hypothesis.",
+        "",
+        "H5 in the package below is the current snapshot of this concept store.",
+        "Read it before re-fetching things you already have.",
+        "",
         f"THE {ja!r} PASSCODE:",
         f"The user only sees your work when you END a message with the literal",
         f"bareword `{ja}` (case-sensitive, on its own line or as the",
@@ -290,6 +308,9 @@ def build_protocol() -> str:
         "  search_memory(query)                               auto-executes, searches past reasoning and tool results",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
+        "  browse_url(url, extract_links=False, save_to=None) auto-executes, phone network only, HTML→text",
+        "  save_concept(key, content)                         auto-executes, persists to concept store",
+        "  list_concepts()                                    auto-executes, lists concept store",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
@@ -310,16 +331,57 @@ def load_scripture(scripture_dir: str) -> str:
     return "\n\n".join(parts)
 
 
+_MAX_CONCEPT_BYTES_INLINE = 300
+_MAX_CONCEPT_TOTAL_BYTES = 20_000
+
+
+def concept_snapshot(project: "Project") -> str:
+    """H5 — concept store snapshot, inlined up to limits."""
+    cdir = G.concept_dir(project)
+    if not cdir.exists():
+        return ""
+    entries: list[tuple[str, str, str]] = []
+    total = 0
+    for f in sorted(cdir.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(cdir).as_posix()
+        try:
+            st = f.stat()
+            ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M")
+            size = st.st_size
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        excerpt = text[:_MAX_CONCEPT_BYTES_INLINE]
+        if len(text) > _MAX_CONCEPT_BYTES_INLINE:
+            excerpt += "…"
+        if total + size > _MAX_CONCEPT_TOTAL_BYTES:
+            entries.append((rel, ts, f"[{size}b — omitted: total cap reached]"))
+            continue
+        total += size
+        entries.append((rel, ts, excerpt))
+    if not entries:
+        return ""
+    lines = ["=== H5: Concept Store (persistent knowledge about target) ==="]
+    for rel, ts, body in entries:
+        lines.append(f"\n{rel}  [{ts}]:")
+        for line in body.splitlines():
+            lines.append(f"  {line}")
+    return "\n".join(lines)
+
+
 def build_header(
     project: "Project",
     system_prompt: str,
     scripture: str = "",
 ) -> str:
-    """Pack the four-header context package sent to a fresh LLM instance."""
+    """Pack the five-header context package sent to a fresh LLM instance."""
     prompts = _prompt_history_lines(project)
     actions = _action_log_lines(project)
     snap = filesystem_snapshot(pathlib.Path(project.path))
     protocol = build_protocol()
+    concepts = concept_snapshot(project)
 
     parts = [
         system_prompt,
@@ -349,4 +411,6 @@ def build_header(
         "=== H2: Filesystem snapshot ===",
         snap,
     ]
+    if concepts:
+        parts += ["", concepts]
     return "\n".join(parts)

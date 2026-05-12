@@ -6,6 +6,7 @@ tests via monkeypatch.setattr(michael.globals, "STATE_DIR", ...).
 from __future__ import annotations
 
 import pathlib
+from typing import Any
 
 from rich.console import Console
 
@@ -44,7 +45,12 @@ SKIP_DIRS = {
 # Tool routing
 # ---------------------------------------------------------------------------
 
-AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory"}
+AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory", "browse_url", "save_concept", "list_concepts"}
+
+
+def concept_dir(project: "Any") -> pathlib.Path:
+    """Return the concept store directory for a project (Central FS, written by tool layer)."""
+    return pathlib.Path(PROJECTS_DIR) / project.slug / "concept"
 
 # ---------------------------------------------------------------------------
 # Domain error
