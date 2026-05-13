@@ -1,7 +1,8 @@
 """Master exploration tool: full OS-upward recon pipeline for a target domain/URL.
 
 Runs in sequence: TCP port scan → banner grab → DNS → TLS → subdomain discovery
-→ HTTP fingerprint → common path probe → homepage link extraction.
+→ HTTP fingerprint → common path probe → homepage link extraction
+→ body-layer software fingerprinting (CMS versions, JS frameworks, error pages).
 Always runs the full pipeline — no depth switch.
 """
 from __future__ import annotations
@@ -411,5 +412,18 @@ def explore_service(target: str) -> str:
                 lines.append(f"    {l}")
     else:
         lines.append("  No links extracted")
+
+    # 8. Body-layer software fingerprinting
+    lines.append("")
+    lines.append("[BODY FINGERPRINT]")
+    try:
+        from toolbox.web_fingerprint import web_fingerprint as _wf
+        fp_report = _wf(f"{scheme}://{domain}")
+        # Strip the header line (already in our report context) and indent
+        fp_lines = fp_report.splitlines()
+        for fl in fp_lines[1:]:  # skip "=== web_fingerprint: ... ===" header
+            lines.append("  " + fl)
+    except Exception as exc:
+        lines.append(f"  (fingerprint failed: {exc})")
 
     return "\n".join(lines)
