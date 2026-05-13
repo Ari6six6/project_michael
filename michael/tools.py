@@ -1031,12 +1031,9 @@ def confirm_tool_call(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_dynamic_tool(name: str, args: dict[str, Any], project: Project) -> str:
-    """Load and call a tool script from <project>/tools/<name>.py."""
+def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: pathlib.Path) -> str:
+    """Load and call a tool script from the given py_file path."""
     import importlib.util as _ilu
-    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
-    if not py_file.exists():
-        return f"error: unknown tool {name!r} (not a built-in and not found in tools/)"
     try:
         spec = _ilu.spec_from_file_location(name, py_file)
         mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
@@ -1125,8 +1122,17 @@ def dispatch_tool_call(
 
 
 def _try_dynamic_dispatch(name: str, args: dict[str, Any], project: Project) -> Optional[str]:
-    """Return dynamic tool result if tools/<name>.py exists, else None."""
-    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
-    if not py_file.exists():
-        return None
-    return _dispatch_dynamic_tool(name, args, project)
+    """Return dynamic tool result if <name>.py exists in any dynamic tool dir, else None.
+
+    Search order (first found wins): project-local > user global > bundled.
+    """
+    search_dirs = [
+        pathlib.Path(project.path) / "tools",
+        pathlib.Path(G.GLOBAL_TOOLS_DIR),
+        pathlib.Path(__file__).parent.parent / "toolbox",
+    ]
+    for d in search_dirs:
+        py_file = d / f"{name}.py"
+        if py_file.exists():
+            return _dispatch_dynamic_tool_from_path(name, args, py_file)
+    return None
