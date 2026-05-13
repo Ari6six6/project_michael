@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 def _ssh_argv(vps: VpsConfig) -> list[str]:
-    sock = G.STATE_DIR / "ssh-%C.sock"
+    sock = pathlib.Path(tempfile.gettempdir()) / "ssh-%C.sock"
     return [
         "ssh",
         "-o", "BatchMode=yes",
@@ -67,7 +67,7 @@ def _ssh_run(
 def _ssh_close_master(vps: VpsConfig) -> None:
     if not vps.host:
         return
-    sock = G.STATE_DIR / "ssh-%C.sock"
+    sock = pathlib.Path(tempfile.gettempdir()) / "ssh-%C.sock"
     try:
         subprocess.run(
             [
