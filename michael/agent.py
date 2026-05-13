@@ -277,12 +277,19 @@ def _run_agent_loop(
             ),
         })
 
-    G.err.print(
-        f"max cycles ({G.MAX_AGENT_CYCLES}) reached without satisfying the goal"
+    from rich.panel import Panel
+    G.console.print(
+        Panel(
+            f"{gate_content}\n\n"
+            "[dim]Run [bold]michael run '<what you need>'[/bold] to continue "
+            "— Michael will pick up exactly where he left off.[/dim]",
+            title=f"⏸  Cycle limit reached ({G.MAX_AGENT_CYCLES})",
+            border_style="yellow",
+        )
     )
     pending.discard()
     append_event(
         "agent.ended",
-        {"model": name, "ja": False, "cycles": G.MAX_AGENT_CYCLES},
+        {"model": name, "ja": False, "cycles": G.MAX_AGENT_CYCLES, "blocked_on": gate_content},
         project=project,
     )
