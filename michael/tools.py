@@ -187,17 +187,34 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "commit_changes",
+            "description": (
+                "Commit all staged file changes to the project workspace. "
+                "Call this when your work is complete and you are satisfied with the result. "
+                "This is the ONLY way to apply staged write_file / apply_patch calls — "
+                "nothing is written to disk until you call commit_changes. "
+                "Do not call it unless the goal is fully met."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief description of what was done and why.",
+                    }
+                },
+                "required": ["summary"],
+            },
+        },
+    },
 ]
 
-# ---------------------------------------------------------------------------
-# Room-scoped tool subsets
-# ---------------------------------------------------------------------------
-
-_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory"}
-_PLANNING_TOOL_NAMES  = {"read_file", "list_dir", "search_memory", "write_file", "apply_patch"}
-
-TOOLS_READ_ONLY = [t for t in TOOLS if t["function"]["name"] in _READ_ONLY_TOOL_NAMES]
-TOOLS_PLANNING  = [t for t in TOOLS if t["function"]["name"] in _PLANNING_TOOL_NAMES]
+# Sentinel returned by dispatch_tool_call when commit_changes fires, so the
+# agent loop knows to exit immediately.
+COMMIT_SENTINEL = "__COMMITTED__"
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +277,7 @@ def _stage_project(project: Project) -> pathlib.Path:
     src = pathlib.Path(project.path).resolve()
     if not src.is_dir():
         raise G.MichaelError(f"project root does not exist: {src}")
-    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-"))
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-", dir="/tmp"))
     dst = parent / src.name
     shutil.copytree(src, dst, ignore=_stage_ignore, symlinks=False)
     return dst
@@ -1080,6 +1097,20 @@ def dispatch_tool_call(
 
     if name in ("write_file", "apply_patch"):
         return execute_with_staging(name, args, project, cfg, pending)
+
+    if name == "commit_changes":
+        summaries = commit_pending(project, pending)
+        if summaries:
+            for s in summaries:
+                G.console.print(f"[green]applied[/] {s['summary']}")
+        else:
+            G.console.print("[dim]no file changes staged[/]")
+        append_event(
+            "tool.executed",
+            {"tool": "commit_changes", "args": args, "summary": args.get("summary", "")},
+            project=project,
+        )
+        return COMMIT_SENTINEL
 
     # Dynamic tool invented by the agent (tools/<name>.py) — auto-executed, no confirmation.
     dynamic_result = _try_dynamic_dispatch(name, args, project)
