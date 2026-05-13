@@ -73,16 +73,30 @@ def assert_not_central(path: Path, op: str = "write") -> None:
 
     Call this before any LLM-initiated I/O to guarantee the Central FS is
     never touched by tool calls.
+
+    Exception: the global toolbox (``~/.michael/toolbox/``) is explicitly
+    writable — it is the one sub-path of the Central FS where the LLM may
+    persist tools for cross-project reuse.
     """
     root = _central_fs_root()
     try:
         path.relative_to(root)
     except ValueError:
         return  # outside Central FS — allowed
+
+    # Narrow carve-out: the global toolbox is writable by LLM tool calls.
+    global_toolbox = Path(G.GLOBAL_TOOLS_DIR).resolve()
+    try:
+        path.relative_to(global_toolbox)
+        return  # inside the toolbox — allowed
+    except ValueError:
+        pass
+
     raise G.MichaelError(
         f"Central FS violation [{op}]: {path} is inside {root}.\n"
         "Michael's internal state directory is read-only to LLM tool calls.\n"
-        "Only Michael's own application code may write there."
+        "Only Michael's own application code may write there.\n"
+        f"(Exception: {global_toolbox} is writable for cross-project tools.)"
     )
 
 

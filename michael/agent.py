@@ -32,21 +32,30 @@ _NUDGE_NO_JA = "Keep going. Signal Ja only when the job is done."
 
 
 def _load_dynamic_tools(project_path: str) -> list[dict[str, Any]]:
-    """Scan <project>/tools/ and return OpenAI tool schemas for valid tool scripts."""
-    tools_dir = pathlib.Path(project_path) / "tools"
-    if not tools_dir.exists():
-        return []
-    schemas: list[dict[str, Any]] = []
-    for py_file in sorted(tools_dir.glob("*.py")):
-        try:
-            spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
-            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-            spec.loader.exec_module(mod)  # type: ignore[union-attr]
-            if hasattr(mod, "TOOL_SCHEMA"):
-                schemas.append(mod.TOOL_SCHEMA)
-        except Exception as exc:
-            G.err.print(f"[dim]dynamic tool load failed ({py_file.name}): {exc}[/]")
-    return schemas
+    """Load tool schemas from the global toolbox and the project-local tools/ dir.
+
+    Global tools (~/.michael/toolbox/) load first; a project-local tool with
+    the same name overrides the global one.
+    """
+    seen: dict[str, dict[str, Any]] = {}  # name → schema, later entries win
+    search_dirs = [
+        pathlib.Path(G.GLOBAL_TOOLS_DIR),
+        pathlib.Path(project_path) / "tools",
+    ]
+    for tools_dir in search_dirs:
+        if not tools_dir.exists():
+            continue
+        for py_file in sorted(tools_dir.glob("*.py")):
+            try:
+                spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
+                mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                if hasattr(mod, "TOOL_SCHEMA"):
+                    name = mod.TOOL_SCHEMA.get("function", {}).get("name", py_file.stem)
+                    seen[name] = mod.TOOL_SCHEMA
+            except Exception as exc:
+                G.err.print(f"[dim]dynamic tool load failed ({py_file.name}): {exc}[/]")
+    return list(seen.values())
 
 
 def _run_room(
@@ -187,7 +196,12 @@ def _run_agent_loop(
             )
             G.console.print(f"[dim]loaded {len(dynamic)} dynamic tool(s): {names}[/]")
         full_tools = TOOLS + dynamic
-        room_tool_lists = [TOOLS_READ_ONLY, full_tools, TOOLS_PLANNING, TOOLS_READ_ONLY]
+        room_tool_lists = [
+            TOOLS_READ_ONLY + dynamic,   # Room 1: explore + call user-built tools
+            full_tools,                  # Room 2: build (full access, unchanged)
+            TOOLS_PLANNING + dynamic,    # Room 3: plot + call user-built tools
+            TOOLS_READ_ONLY + dynamic,   # Room 4: gate + call user-built tools
+        ]
 
         try:
             for room, room_tools in zip(G.ROOMS[:3], room_tool_lists[:3]):
@@ -209,7 +223,7 @@ def _run_agent_loop(
             )
             messages.append({"role": "system", "content": room4["directive"]})
             messages, gate_content = _run_room(
-                room4, messages, TOOLS_READ_ONLY,
+                room4, messages, TOOLS_READ_ONLY + dynamic,
                 project, client, profile, pending, cfg, backend,
             )
 
@@ -263,12 +277,19 @@ def _run_agent_loop(
             ),
         })
 
-    G.err.print(
-        f"max cycles ({G.MAX_AGENT_CYCLES}) reached without satisfying the goal"
+    from rich.panel import Panel
+    G.console.print(
+        Panel(
+            f"{gate_content}\n\n"
+            "[dim]Run [bold]michael run '<what you need>'[/bold] to continue "
+            "— Michael will pick up exactly where he left off.[/dim]",
+            title=f"⏸  Cycle limit reached ({G.MAX_AGENT_CYCLES})",
+            border_style="yellow",
+        )
     )
     pending.discard()
     append_event(
         "agent.ended",
-        {"model": name, "ja": False, "cycles": G.MAX_AGENT_CYCLES},
+        {"model": name, "ja": False, "cycles": G.MAX_AGENT_CYCLES, "blocked_on": gate_content},
         project=project,
     )

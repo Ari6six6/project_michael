@@ -19,6 +19,7 @@ GLOBAL_EVENTS_PATH = STATE_DIR / "events.jsonl"
 STATE_FILE_PATH = STATE_DIR / "state.json"
 PROJECTS_DIR = STATE_DIR / "projects"
 REPL_HISTORY_PATH = STATE_DIR / "repl_history"
+GLOBAL_TOOLS_DIR = STATE_DIR / "toolbox"
 
 # ---------------------------------------------------------------------------
 # Shared Rich consoles
@@ -76,7 +77,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-MAX_AGENT_CYCLES = 5
+MAX_AGENT_CYCLES = 9
 
 ROOMS: list[dict] = [
     {
@@ -96,15 +97,18 @@ ROOMS: list[dict] = [
         "directive": (
             "ROOM 2: BUILDING. Question: What should I do?\n"
             "Full tool access. Implement the smallest correct action. Test before signalling done.\n"
-            "You have a personal toolbox at tools/ in this project. "
-            "Check it first (list_dir('tools/')) — you may already have what you need. "
-            "If a required capability is missing, write it to tools/<name>.py — export "
-            "TOOL_SCHEMA (OpenAI function schema dict) and a callable with the same name. "
-            "It loads as a real tool at the start of the next cycle and is yours to reuse.\n"
+            "You have two toolboxes — check them before building anything new:\n"
+            "  • tools/          — tools for this project only\n"
+            "  • ~/.michael/toolbox/ — global tools, available in every project\n"
+            "If a required capability is missing, write it as a Python file to one of those paths. "
+            "Export TOOL_SCHEMA (OpenAI function schema dict) and a callable with the same name. "
+            "It loads as a real tool available to every room in the next cycle.\n"
+            "Use the global toolbox for general-purpose tools (port scanners, parsers, etc.) "
+            "and the local tools/ for project-specific ones.\n"
             "Signal Ja when the implementation is verified."
         ),
         "nudge": (
-            "Room 2: build, test, refine. Check tools/ for existing capabilities before "
+            "Room 2: build, test, refine. Check tools/ and ~/.michael/toolbox/ before "
             "writing new ones. Signal Ja when done."
         ),
     },
@@ -112,23 +116,31 @@ ROOMS: list[dict] = [
         "name":      "room.teleology",
         "label":     "ROOM 3 — WHAT CAN I HOPE FOR?",
         "directive": (
-            "ROOM 3: OUTLOOK. Question: What can I hope for?\n"
-            "Reflect: what was achieved this cycle? What is still open? "
-            "What should the next cycle address?\n"
-            "Signal Ja when the outlook is documented."
+            "ROOM 3: PLOTTING. Question: What can I hope for?\n"
+            "Room 2 has built or extended the toolbox. Now plot the next cycle:\n"
+            "Which tools should Room 1 call to gather the remaining unknowns? "
+            "What targets, what parameters, what data is still missing before the object of "
+            "desire can be enclosed?\n"
+            "Be concrete: name the tools, name the targets, name the open questions. "
+            "This plot becomes the agenda for the next Room 1.\n"
+            "Signal Ja when the next cycle has a clear agenda."
         ),
-        "nudge": "Room 3: document what was done and what remains. Signal Ja when complete.",
+        "nudge": (
+            "Room 3: make the next cycle's agenda concrete — tools, targets, unknowns. "
+            "Signal Ja when the plot is set."
+        ),
     },
     {
         "name":      "room.completion",
         "label":     "ROOM 4 — IS THE GOAL MET?",
         "directive": (
-            "ROOM 4: COMPLETION GATE. Question: Does the full body of work answer "
-            "the user's original question with certainty?\n"
+            "ROOM 4: COMPLETION GATE. Question: Have you enclosed the object of desire?\n"
+            "The object of desire is defined in the user's original prompt. "
+            "Ask yourself: can I answer that prompt with yes, right now, with certainty?\n"
             "If YES: end your response with Ja.\n"
-            "If NO: state exactly what is still missing. Do NOT say Ja."
+            "If NO: state exactly what is still unknown or unbuilt. Do NOT say Ja."
         ),
-        "nudge": "Room 4: answer only — is the goal fully met? Ja if yes. State what's missing if no.",
+        "nudge": "Room 4: have you enclosed the object of desire? Ja if yes. State what's missing if no.",
     },
 ]
 
