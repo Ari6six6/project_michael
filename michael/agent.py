@@ -68,9 +68,11 @@ def _run_room(
     pending: PendingChanges,
     cfg: Config,
     backend: Any,
+    max_turns: int = 8,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Iterate within one Kantian room until Ja. Returns (messages, ja_content)."""
+    """Iterate within one Kantian room up to max_turns. Returns (messages, last_content)."""
     turn = 0
+    content = ""
     while True:
         turn += 1
         G.console.print(f"[dim]· {room['label']} turn {turn}[/]")
@@ -130,8 +132,14 @@ def _run_room(
             append_event(room["name"] + ".ja", {"turn": turn}, project=project)
             return messages, content
 
+        if turn >= max_turns:
+            G.console.print(f"[dim]· {room['label']}: turn limit reached[/]")
+            break
+
         G.console.print(f"[yellow]· {room['label']}: no Ja — nudging[/]")
         messages.append({"role": "system", "content": room["nudge"]})
+
+    return messages, content
 
 
 def _run_agent_loop(
@@ -213,6 +221,7 @@ def _run_agent_loop(
                 messages, _ = _run_room(
                     room, messages, room_tools,
                     project, client, profile, pending, cfg, backend,
+                    max_turns=G.MAX_ROOM_TURNS,
                 )
                 G.console.print(f"[green]✓ {room['label']}[/]")
 
@@ -225,6 +234,7 @@ def _run_agent_loop(
             messages, gate_content = _run_room(
                 room4, messages, TOOLS_READ_ONLY + dynamic,
                 project, client, profile, pending, cfg, backend,
+                max_turns=1,
             )
 
         except KeyboardInterrupt:

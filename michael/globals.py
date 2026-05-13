@@ -78,6 +78,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 MAX_AGENT_CYCLES = 9
+MAX_ROOM_TURNS = 8
 
 ROOMS: list[dict] = [
     {
@@ -87,9 +88,9 @@ ROOMS: list[dict] = [
             "ROOM 1: EXPLORATION ONLY. Question: What can I know?\n"
             "Available tools: read_file, list_dir, search_memory — no writes.\n"
             "Map the full state: files, prior history, constraints, open questions.\n"
-            "Signal Ja when you have complete epistemic clarity."
+            "Complete your exploration then end your response."
         ),
-        "nudge": "Room 1: keep exploring. No writes yet. Signal Ja when the full picture is clear.",
+        "nudge": "Room 1: keep exploring. No writes yet. Complete your exploration then end your response.",
     },
     {
         "name":      "room.ethics",
@@ -105,11 +106,11 @@ ROOMS: list[dict] = [
             "It loads as a real tool available to every room in the next cycle.\n"
             "Use the global toolbox for general-purpose tools (port scanners, parsers, etc.) "
             "and the local tools/ for project-specific ones.\n"
-            "Signal Ja when the implementation is verified."
+            "Complete your implementation then end your response."
         ),
         "nudge": (
             "Room 2: build, test, refine. Check tools/ and ~/.michael/toolbox/ before "
-            "writing new ones. Signal Ja when done."
+            "writing new ones. Complete your implementation then end your response."
         ),
     },
     {
@@ -123,11 +124,11 @@ ROOMS: list[dict] = [
             "desire can be enclosed?\n"
             "Be concrete: name the tools, name the targets, name the open questions. "
             "This plot becomes the agenda for the next Room 1.\n"
-            "Signal Ja when the next cycle has a clear agenda."
+            "Complete your plan then end your response."
         ),
         "nudge": (
             "Room 3: make the next cycle's agenda concrete — tools, targets, unknowns. "
-            "Signal Ja when the plot is set."
+            "Complete your plan then end your response."
         ),
     },
     {
