@@ -1,7 +1,8 @@
 """Master exploration tool: full OS-upward recon pipeline for a target domain/URL.
 
 Runs in sequence: TCP port scan → banner grab → DNS → TLS → subdomain discovery
-→ HTTP fingerprint → common path probe → homepage link extraction.
+→ HTTP fingerprint → common path probe → homepage link extraction
+→ body-layer software fingerprinting (CMS versions, JS frameworks, error pages).
 Always runs the full pipeline — no depth switch.
 """
 from __future__ import annotations
@@ -411,5 +412,39 @@ def explore_service(target: str) -> str:
                 lines.append(f"    {l}")
     else:
         lines.append("  No links extracted")
+
+    def _embed(section_name: str, report: str) -> None:
+        lines.append("")
+        lines.append(f"[{section_name}]")
+        for fl in report.splitlines()[1:]:  # skip "=== tool: host ===" header
+            lines.append("  " + fl)
+
+    # 8. IP intelligence
+    try:
+        from toolbox.web_ip_intel import web_ip_intel as _ipi
+        _embed("IP INTELLIGENCE", _ipi(domain))
+    except Exception as exc:
+        lines.append(f"\n[IP INTELLIGENCE]\n  (failed: {exc})")
+
+    # 9. Body-layer software fingerprinting
+    try:
+        from toolbox.web_fingerprint import web_fingerprint as _wf
+        _embed("BODY FINGERPRINT", _wf(f"{scheme}://{domain}"))
+    except Exception as exc:
+        lines.append(f"\n[BODY FINGERPRINT]\n  (failed: {exc})")
+
+    # 10. Security posture
+    try:
+        from toolbox.web_security_posture import web_security_posture as _wsp
+        _embed("SECURITY POSTURE", _wsp(f"{scheme}://{domain}"))
+    except Exception as exc:
+        lines.append(f"\n[SECURITY POSTURE]\n  (failed: {exc})")
+
+    # 11. JS bundle analysis (if it looks like a web app)
+    try:
+        from toolbox.web_js_analyze import web_js_analyze as _wja
+        _embed("JS BUNDLE ANALYSIS", _wja(f"{scheme}://{domain}"))
+    except Exception as exc:
+        lines.append(f"\n[JS BUNDLE ANALYSIS]\n  (failed: {exc})")
 
     return "\n".join(lines)
