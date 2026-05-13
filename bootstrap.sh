@@ -177,7 +177,8 @@ chown "${USERNAME}:${USERNAME}" "${CONTAINERS_CONF_DIR}/containers.conf"
 if [[ -f "${PROJECT_DIR}/Dockerfile.sandbox" ]]; then
     install -m 0644 -o "${USERNAME}" -g "${USERNAME}" \
         "${PROJECT_DIR}/Dockerfile.sandbox" "${MICHAEL_DIR}/Dockerfile.sandbox"
-    (cd "${MICHAEL_DIR}" && sudo -u "${USERNAME}" podman build \
+    (cd "${MICHAEL_DIR}" && sudo -u "${USERNAME}" env HOME="${USER_HOME}" podman build \
+        --cgroup-manager=cgroupfs \
         -t michael-sandbox:alpine \
         -f Dockerfile.sandbox \
         .)
