@@ -46,7 +46,12 @@ from michael.project import (
     slugify,
 )
 from michael.tools import TOOLS, _list_trash, _undo_one
-from michael.utils import build_header
+from michael.utils import (
+    build_header,
+    load_scripture,
+    _prompt_history_lines,
+    _action_log_lines,
+)
 
 app = typer.Typer(
     no_args_is_help=False,
@@ -350,6 +355,24 @@ def cmd_log(tail: int) -> None:
     G.console.print(table)
 
 
+def cmd_inspect() -> None:
+    project = get_active_project()
+    if not project:
+        G.err.print("No active project. Run: michael new <name>")
+        raise typer.Exit(1)
+    cfg = Config.load()
+    scripture = load_scripture(cfg.scripture_dir)
+    header = build_header(project, cfg.resolved_system_prompt(), scripture)
+    prompts = _prompt_history_lines(project)
+    actions = _action_log_lines(project)
+    G.console.print(f"\n[bold cyan]Project:[/] {project.name}  [dim]({project.slug})[/]")
+    G.console.print(
+        f"[dim]H1 prompts: {len(prompts)} · H3 tool calls: {len(actions)} · "
+        f"context size: {len(header):,} chars[/]\n"
+    )
+    G.console.print(header)
+
+
 def cmd_undo(list_only: bool = False, trash_id: Optional[str] = None) -> None:
     project = require_active_project()
     if list_only:
@@ -532,6 +555,12 @@ def log_cmd(
 ) -> None:
     """Show the project event log (or global if no project active)."""
     cmd_log(tail)
+
+
+@app.command(name="inspect")
+def inspect_cmd() -> None:
+    """Print the full H1–H4 context package the model will receive on the next run."""
+    cmd_inspect()
 
 
 @app.command(name="sandbox")
