@@ -3,7 +3,6 @@ FROM alpine:3.21
 RUN apk add --no-cache \
         python3 py3-pip bash ca-certificates \
         build-base linux-headers libffi-dev openssl-dev \
- && python3 -m ensurepip --upgrade \
  && rm -rf /var/cache/apk/* /root/.cache
 
 RUN addgroup -S sandbox && adduser -S -G sandbox -h /home/sandbox -u 1000 sandbox
