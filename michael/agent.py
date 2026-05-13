@@ -39,8 +39,9 @@ def _load_dynamic_tools(project_path: str) -> list[dict[str, Any]]:
     """
     seen: dict[str, dict[str, Any]] = {}  # name → schema, later entries win
     search_dirs = [
-        pathlib.Path(G.GLOBAL_TOOLS_DIR),
-        pathlib.Path(project_path) / "tools",
+        pathlib.Path(__file__).parent.parent / "toolbox",  # bundled tools (lowest priority)
+        pathlib.Path(G.GLOBAL_TOOLS_DIR),                  # user global (~/.michael/toolbox/)
+        pathlib.Path(project_path) / "tools",              # project-local (highest priority)
     ]
     for tools_dir in search_dirs:
         if not tools_dir.exists():
