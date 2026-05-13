@@ -413,17 +413,38 @@ def explore_service(target: str) -> str:
     else:
         lines.append("  No links extracted")
 
-    # 8. Body-layer software fingerprinting
-    lines.append("")
-    lines.append("[BODY FINGERPRINT]")
+    def _embed(section_name: str, report: str) -> None:
+        lines.append("")
+        lines.append(f"[{section_name}]")
+        for fl in report.splitlines()[1:]:  # skip "=== tool: host ===" header
+            lines.append("  " + fl)
+
+    # 8. IP intelligence
+    try:
+        from toolbox.web_ip_intel import web_ip_intel as _ipi
+        _embed("IP INTELLIGENCE", _ipi(domain))
+    except Exception as exc:
+        lines.append(f"\n[IP INTELLIGENCE]\n  (failed: {exc})")
+
+    # 9. Body-layer software fingerprinting
     try:
         from toolbox.web_fingerprint import web_fingerprint as _wf
-        fp_report = _wf(f"{scheme}://{domain}")
-        # Strip the header line (already in our report context) and indent
-        fp_lines = fp_report.splitlines()
-        for fl in fp_lines[1:]:  # skip "=== web_fingerprint: ... ===" header
-            lines.append("  " + fl)
+        _embed("BODY FINGERPRINT", _wf(f"{scheme}://{domain}"))
     except Exception as exc:
-        lines.append(f"  (fingerprint failed: {exc})")
+        lines.append(f"\n[BODY FINGERPRINT]\n  (failed: {exc})")
+
+    # 10. Security posture
+    try:
+        from toolbox.web_security_posture import web_security_posture as _wsp
+        _embed("SECURITY POSTURE", _wsp(f"{scheme}://{domain}"))
+    except Exception as exc:
+        lines.append(f"\n[SECURITY POSTURE]\n  (failed: {exc})")
+
+    # 11. JS bundle analysis (if it looks like a web app)
+    try:
+        from toolbox.web_js_analyze import web_js_analyze as _wja
+        _embed("JS BUNDLE ANALYSIS", _wja(f"{scheme}://{domain}"))
+    except Exception as exc:
+        lines.append(f"\n[JS BUNDLE ANALYSIS]\n  (failed: {exc})")
 
     return "\n".join(lines)
