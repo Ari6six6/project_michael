@@ -160,10 +160,25 @@ aa-status || true
 echo "[9/11] michael state dir + sandbox image"
 MICHAEL_DIR="${USER_HOME}/.michael"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "${MICHAEL_DIR}"
+
+# Enable lingering so the systemd user instance starts on boot.
+loginctl enable-linger "${USERNAME}"
+
+# Rootless podman needs cgroupfs when there is no live dbus/systemd user session
+# (e.g. during bootstrap where we're running via sudo rather than a real login).
+CONTAINERS_CONF_DIR="${USER_HOME}/.config/containers"
+install -d -m 0755 -o "${USERNAME}" -g "${USERNAME}" "${CONTAINERS_CONF_DIR}"
+cat >"${CONTAINERS_CONF_DIR}/containers.conf" <<'EOF'
+[engine]
+cgroup_manager = "cgroupfs"
+EOF
+chown "${USERNAME}:${USERNAME}" "${CONTAINERS_CONF_DIR}/containers.conf"
+
 if [[ -f "${PROJECT_DIR}/Dockerfile.sandbox" ]]; then
     install -m 0644 -o "${USERNAME}" -g "${USERNAME}" \
         "${PROJECT_DIR}/Dockerfile.sandbox" "${MICHAEL_DIR}/Dockerfile.sandbox"
-    (cd "${MICHAEL_DIR}" && sudo -u "${USERNAME}" podman build \
+    (cd "${MICHAEL_DIR}" && sudo -u "${USERNAME}" env HOME="${USER_HOME}" podman build \
+        --cgroup-manager=cgroupfs \
         -t michael-sandbox:alpine \
         -f Dockerfile.sandbox \
         .)
