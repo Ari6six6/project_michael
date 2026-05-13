@@ -116,13 +116,19 @@ def cmd_new(name: Optional[str]) -> None:
     if not name:
         G.err.print("name is required")
         return
-    default_path = pathlib.Path.cwd() / slugify(name)
+    try:
+        slug_preview = slugify(name)
+    except G.MichaelError as e:
+        G.err.print(str(e))
+        return
+    default_path = pathlib.Path.home() / "projects" / slug_preview
     path_str = typer.prompt("path", default=str(default_path))
     path = pathlib.Path(path_str).expanduser().resolve()
     proj = create_project(name, path)
     set_active_slug(proj.slug)
     append_event("project.activated", {"slug": proj.slug})
     G.console.print(f"[green]created[/] {proj.slug} at {proj.path}")
+    G.console.print(f"[dim]workspace is empty — add your code there, then run: michael run <prompt>[/]")
 
 
 def cmd_use(slug: str) -> None:
@@ -465,6 +471,14 @@ def cmd_ssh_test() -> None:
     )
 
 
+def cmd_inspect() -> None:
+    project = require_active_project()
+    cfg = Config.load()
+    scripture = load_scripture(cfg.scripture_dir)
+    header = build_header(project, cfg.resolved_system_prompt(), scripture)
+    G.console.print(header)
+
+
 # ---------------------------------------------------------------------------
 # Typer command bindings
 # ---------------------------------------------------------------------------
@@ -586,6 +600,12 @@ def undo_cmd(
 def ssh_test_cmd() -> None:
     """Verify the VPS is reachable and report the SSH handshake time."""
     cmd_ssh_test()
+
+
+@app.command(name="inspect")
+def inspect_cmd() -> None:
+    """Print the H1–H4 context package that would be sent to the LLM."""
+    cmd_inspect()
 
 
 # ---------------------------------------------------------------------------

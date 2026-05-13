@@ -88,7 +88,9 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def slugify(name: str) -> str:
     s = _SLUG_RE.sub("-", name.strip().lower()).strip("-")
-    return s[:64] or "project"
+    if not s:
+        raise G.MichaelError("project name must contain at least one letter or digit")
+    return s[:64]
 
 
 def list_projects() -> list[Project]:
