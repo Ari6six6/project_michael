@@ -163,10 +163,10 @@ install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "${MICHAEL_DIR}"
 if [[ -f "${PROJECT_DIR}/Dockerfile.sandbox" ]]; then
     install -m 0644 -o "${USERNAME}" -g "${USERNAME}" \
         "${PROJECT_DIR}/Dockerfile.sandbox" "${MICHAEL_DIR}/Dockerfile.sandbox"
-    sudo -u "${USERNAME}" podman build \
+    (cd "${MICHAEL_DIR}" && sudo -u "${USERNAME}" podman build \
         -t michael-sandbox:alpine \
-        -f "${MICHAEL_DIR}/Dockerfile.sandbox" \
-        "${MICHAEL_DIR}/"
+        -f Dockerfile.sandbox \
+        .)
 else
     echo "NOTE: Dockerfile.sandbox not found in ${PROJECT_DIR}; skipping sandbox image build." >&2
 fi
