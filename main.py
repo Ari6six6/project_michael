@@ -22,10 +22,8 @@ from michael.globals import (  # noqa: F401
     SKIP_DIRS,
     AUTO_EXEC_TOOLS,
     MichaelError,
-    JA_PASSPHRASE,
     _GOD_MODE_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
-    _message_ends_with_ja,
 )
 
 from michael.config import (  # noqa: F401
@@ -77,7 +75,6 @@ from michael.utils import (  # noqa: F401
     filesystem_snapshot,
     _prompt_history_lines,
     _action_log_lines,
-    _MODE_ADDENDUM,
     build_protocol,
     build_header,
 )
@@ -114,7 +111,6 @@ from michael.tools import (  # noqa: F401
 )
 
 from michael.agent import (  # noqa: F401
-    _NUDGE_NO_JA,
     _run_agent_loop,
 )
 
