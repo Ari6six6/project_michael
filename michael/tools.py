@@ -277,7 +277,7 @@ def _stage_project(project: Project) -> pathlib.Path:
     src = pathlib.Path(project.path).resolve()
     if not src.is_dir():
         raise G.MichaelError(f"project root does not exist: {src}")
-    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-", dir="/tmp"))
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-"))
     dst = parent / src.name
     shutil.copytree(src, dst, ignore=_stage_ignore, symlinks=False)
     return dst
