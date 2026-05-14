@@ -52,7 +52,7 @@ class GpuConfig:
     ssh_user: str = "root"
     ssh_key_path: str = "~/.ssh/id_ed25519"
     vast_instance_id: str = ""
-    model_repo: str = "Qwen/Qwen3-32B-AWQ"
+    model_repo: str = "Qwen/Qwen2.5-72B-Instruct-AWQ"
     vllm_port: int = 8000
     vllm_api_key: str = ""
 
