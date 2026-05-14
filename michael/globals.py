@@ -45,7 +45,7 @@ SKIP_DIRS = {
 # Tool routing
 # ---------------------------------------------------------------------------
 
-AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory"}
+AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory", "fetch_url"}
 
 # ---------------------------------------------------------------------------
 # Domain error
