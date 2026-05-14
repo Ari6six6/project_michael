@@ -532,10 +532,7 @@ def cmd_log(tail: int) -> None:
 
 
 def cmd_inspect() -> None:
-    project = get_active_project()
-    if not project:
-        G.err.print("No active project. Run: michael new <name>")
-        raise typer.Exit(1)
+    project = require_active_project()
     cfg = Config.load()
     scripture = load_scripture(cfg.scripture_dir)
     header = build_header(project, cfg.resolved_system_prompt(), scripture)
@@ -639,14 +636,6 @@ def cmd_ssh_test() -> None:
             border_style="green",
         )
     )
-
-
-def cmd_inspect() -> None:
-    project = require_active_project()
-    cfg = Config.load()
-    scripture = load_scripture(cfg.scripture_dir)
-    header = build_header(project, cfg.resolved_system_prompt(), scripture)
-    G.console.print(header)
 
 
 # ---------------------------------------------------------------------------
@@ -784,18 +773,12 @@ def ssh_test_cmd() -> None:
     cmd_ssh_test()
 
 
-@app.command(name="inspect")
-def inspect_cmd() -> None:
-    """Print the H1–H4 context package that would be sent to the LLM."""
-    cmd_inspect()
-
-
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 
 REPL_COMMANDS = {
-    "project", "new", "run", "up", "down", "config", "init",
+    "project", "new", "run", "up", "down", "gpu", "config", "init",
     "quit", "exit", "help",
 }
 
