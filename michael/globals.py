@@ -60,6 +60,8 @@ class MichaelError(RuntimeError):
 # Agent protocol constants
 # ---------------------------------------------------------------------------
 
+JA_PASSPHRASE = "Ja"
+
 _GOD_MODE_PROMPT = (
     "Assess the full state of this project. "
     "Burn what is not working. "
@@ -76,3 +78,14 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 MAX_AGENT_TURNS = 60
+
+
+def _message_ends_with_ja(text: str) -> bool:
+    """True iff the message's trailing token is the bareword JA_PASSPHRASE."""
+    if not text:
+        return False
+    stripped = text.rstrip().rstrip(".!?;:")
+    if not stripped:
+        return False
+    last_token = stripped.rsplit(None, 1)[-1]
+    return last_token == JA_PASSPHRASE
