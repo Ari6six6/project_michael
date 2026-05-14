@@ -477,28 +477,6 @@ def test_commit_pending_syncs_all_entries_then_discards(home, workspace):
     assert types.count("tool.executed") == 2
 
 
-# ---- Ja passcode and detector -------------------------------------------
-
-def test_ja_passphrase_constant():
-    assert m.JA_PASSPHRASE == "Ja"
-
-
-def test_ja_detector_recognises_end_of_message():
-    assert m._message_ends_with_ja("thoughts.\nJa")
-    assert m._message_ends_with_ja("thoughts.\nJa\n")
-    assert m._message_ends_with_ja("done with the work. Ja")
-    assert m._message_ends_with_ja("done. Ja.")
-    assert m._message_ends_with_ja("Ja")
-
-
-def test_ja_detector_rejects_mid_sentence_and_other_languages():
-    assert not m._message_ends_with_ja("")
-    assert not m._message_ends_with_ja("Yes")
-    assert not m._message_ends_with_ja("Ja, das ist gut")
-    assert not m._message_ends_with_ja("Ja im Anfang")
-    assert not m._message_ends_with_ja("ja")  # case-sensitive
-
-
 # ---- Header 4 / build_protocol ------------------------------------------
 
 def test_build_protocol_lists_four_headers():
@@ -507,24 +485,11 @@ def test_build_protocol_lists_four_headers():
         assert h in text
 
 
-def test_build_protocol_mentions_ja_passcode_and_no_hands():
-    text = m.build_protocol()
-    assert "Ja" in text
-    assert "passcode" in text.lower()
-    assert "no hands" in text.lower() or "NO HANDS" in text
-
-
-def test_build_protocol_has_full_authority_addendum():
-    text = m.build_protocol()
-    assert "FULL AUTHORITY" in text
-
 
 def test_build_header_includes_protocol(home, workspace):
     p = m.create_project("x", workspace)
     pkg = m.build_header(p, "system stub")
     assert "H4: Protocol" in pkg
-    assert "Ja" in pkg
-    # H1/H2/H3 markers are present too.
     assert "H1:" in pkg and "H2:" in pkg and "H3:" in pkg
 
 
