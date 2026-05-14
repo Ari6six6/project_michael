@@ -315,6 +315,15 @@ def cmd_gpu_up() -> None:
             if not booted:
                 raise G.MichaelError(f"instance did not respond to SSH within {_max_boot}s")
         except G.MichaelError as e:
+            if "404" in str(e) or "no_such_instance" in str(e):
+                G.console.print("[yellow]Instance not found — it was probably destroyed. Clearing stale config…[/]")
+                gpu.vast_instance_id = ""
+                gpu.ssh_host = ""
+                cfg.gpu = gpu
+                cfg.save()
+                raise G.MichaelError(
+                    "Stale GPU config cleared. Run `michael gpu up` again and paste the new SSH string."
+                ) from e
             raise G.MichaelError(f"failed to start instance: {e}") from e
     else:
         # ── Verify connectivity (no API, assume already running) ──
@@ -352,7 +361,7 @@ def cmd_gpu_up() -> None:
             f"nohup vllm serve {gpu.model_repo} "
             f"--host 0.0.0.0 --port {gpu.vllm_port} "
             f"--dtype auto --gpu-memory-utilization 0.95 "
-            f"--max-model-len 8192 "
+            f"--max-model-len 16384 "
             f"{api_key_flag}"
             f"> /tmp/vllm.log 2>&1 & echo $!"
         )
