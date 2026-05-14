@@ -6,10 +6,14 @@ import json
 import pathlib
 from typing import Any
 
+import httpx
 import michael.globals as G
 from michael.backends import (
     LocalPodmanBackend,
+    _ensure_tunnel,
+    _ping_vllm,
     _require_endpoint,
+    _restart_vllm_on_gpu,
     _ssh_preflight,
     llm_client,
     make_backend,
@@ -68,6 +72,12 @@ def _run_agent_loop(
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
 
+    if cfg.gpu.ssh_host:
+        _ensure_tunnel(cfg.gpu)
+        if not _ping_vllm(endpoint, profile.vllm_api_key):
+            G.console.print("[yellow]vLLM unreachable — auto-restarting...[/]")
+            _restart_vllm_on_gpu(cfg.gpu)
+
     client = llm_client(endpoint, profile.vllm_api_key)
     backend = make_backend(cfg)
     base_prompt = cfg.resolved_system_prompt()
@@ -110,14 +120,30 @@ def _run_agent_loop(
     try:
         for turn in range(1, G.MAX_AGENT_TURNS + 1):
             G.console.print(f"[dim]· turn {turn}[/]")
-            resp = client.chat.completions.create(
-                model=profile.served_model_name,
-                messages=messages,
-                tools=all_tools,
-                tool_choice="auto",
-                stream=False,
-                timeout=float(profile.request_timeout_s),
-            )
+            try:
+                resp = client.chat.completions.create(
+                    model=profile.served_model_name,
+                    messages=messages,
+                    tools=all_tools,
+                    tool_choice="auto",
+                    stream=False,
+                    timeout=float(profile.request_timeout_s),
+                )
+            except httpx.HTTPStatusError as _exc:
+                if _exc.response.status_code == 400 and cfg.gpu.ssh_host:
+                    G.console.print("[yellow]400 from vLLM — restarting with correct flags...[/]")
+                    _restart_vllm_on_gpu(cfg.gpu)
+                    client = llm_client(endpoint, profile.vllm_api_key)
+                    resp = client.chat.completions.create(
+                        model=profile.served_model_name,
+                        messages=messages,
+                        tools=all_tools,
+                        tool_choice="auto",
+                        stream=False,
+                        timeout=float(profile.request_timeout_s),
+                    )
+                else:
+                    raise
             choice = resp.choices[0]
             content = choice.content or ""
 
