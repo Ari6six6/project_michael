@@ -6,7 +6,6 @@ import json
 import pathlib
 from typing import Any
 
-import httpx
 import michael.globals as G
 from michael.backends import (
     LocalPodmanBackend,
@@ -120,30 +119,14 @@ def _run_agent_loop(
     try:
         for turn in range(1, G.MAX_AGENT_TURNS + 1):
             G.console.print(f"[dim]· turn {turn}[/]")
-            try:
-                resp = client.chat.completions.create(
-                    model=profile.served_model_name,
-                    messages=messages,
-                    tools=all_tools,
-                    tool_choice="auto",
-                    stream=False,
-                    timeout=float(profile.request_timeout_s),
-                )
-            except httpx.HTTPStatusError as _exc:
-                if _exc.response.status_code == 400 and cfg.gpu.ssh_host:
-                    G.console.print("[yellow]400 from vLLM — restarting with correct flags...[/]")
-                    _restart_vllm_on_gpu(cfg.gpu)
-                    client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
-                    resp = client.chat.completions.create(
-                        model=profile.served_model_name,
-                        messages=messages,
-                        tools=all_tools,
-                        tool_choice="auto",
-                        stream=False,
-                        timeout=float(profile.request_timeout_s),
-                    )
-                else:
-                    raise
+            resp = client.chat.completions.create(
+                model=profile.served_model_name,
+                messages=messages,
+                tools=all_tools,
+                tool_choice="auto",
+                stream=False,
+                timeout=float(profile.request_timeout_s),
+            )
             choice = resp.choices[0]
             content = choice.content or ""
 
