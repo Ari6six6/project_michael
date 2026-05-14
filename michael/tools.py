@@ -257,9 +257,9 @@ def _summary_for(name: str, args: dict[str, Any]) -> str:
 def _format_proc_result(cp: subprocess.CompletedProcess) -> str:
     out = [f"rc={cp.returncode}"]
     if cp.stdout:
-        out.append(f"stdout (truncated):\n{cp.stdout[-2000:]}")
+        out.append(f"stdout (first 2000 chars):\n{cp.stdout[:2000]}")
     if cp.stderr:
-        out.append(f"stderr (truncated):\n{cp.stderr[-1000:]}")
+        out.append(f"stderr (first 500 chars):\n{cp.stderr[:500]}")
     return "\n".join(out)
 
 
