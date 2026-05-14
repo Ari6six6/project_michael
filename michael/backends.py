@@ -355,10 +355,13 @@ class _CompletionResponse:
 
 
 class _Completions:
-    def __init__(self, endpoint: str, http: httpx.Client, headers: dict) -> None:
+    def __init__(
+        self, endpoint: str, http: httpx.Client, headers: dict, enable_thinking: bool = False
+    ) -> None:
         self._endpoint = endpoint
         self._http = http
         self._headers = headers
+        self._enable_thinking = enable_thinking
 
     def create(
         self,
@@ -375,7 +378,7 @@ class _Completions:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
         if tools:
             body["tools"] = tools
-        else:
+        if self._enable_thinking:
             body["chat_template_kwargs"] = {"enable_thinking": True}
         if tool_choice is not None:
             body["tool_choice"] = tool_choice
@@ -389,7 +392,13 @@ class _Completions:
             timeout=timeout,
         )
         r.raise_for_status()
-        return self._parse_response(r.json())
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise G.MichaelError(
+                f"vLLM returned non-JSON response: {exc} — body: {r.text[:200]!r}"
+            ) from exc
+        return self._parse_response(data)
 
     def _stream_iter(self, body: dict, timeout: float):
         client = httpx.Client(
@@ -459,20 +468,20 @@ class _ChatCompletions:
 
 
 class LLMClient:
-    def __init__(self, endpoint: str, api_key: str = "") -> None:
+    def __init__(self, endpoint: str, api_key: str = "", enable_thinking: bool = False) -> None:
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self._http = httpx.Client(headers=headers, timeout=120)
-        _completions = _Completions(endpoint, self._http, headers)
+        _completions = _Completions(endpoint, self._http, headers, enable_thinking)
         self.chat = _ChatCompletions(_completions)
 
     def close(self) -> None:
         self._http.close()
 
 
-def llm_client(endpoint: str, api_key: str = "") -> LLMClient:
-    return LLMClient(endpoint, api_key)
+def llm_client(endpoint: str, api_key: str = "", enable_thinking: bool = False) -> LLMClient:
+    return LLMClient(endpoint, api_key, enable_thinking)
 
 
 def _require_endpoint(profile: ModelProfile, name: str) -> str:

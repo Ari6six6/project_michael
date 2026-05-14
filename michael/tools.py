@@ -983,6 +983,7 @@ def execute_with_staging(
 
     mismatch = _check_expected(expected_list, delta)
     if mismatch:
+        _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
         append_event(
             "tool.delta_mismatch",
             {
@@ -994,6 +995,14 @@ def execute_with_staging(
             },
             project=project,
         )
+        return (
+            f"mismatch: prediction and reality diverge — {mismatch}.\n"
+            f"predicted: {sorted(expected_list)}\n"
+            f"actual:    added={delta['added']}  "
+            f"modified={delta['modified']}  removed={delta['removed']}\n"
+            "This call was rolled back. Correct expected_changes and re-propose."
+        )
+
     append_event(
         "tool.staged",
         {

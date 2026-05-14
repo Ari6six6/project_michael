@@ -78,7 +78,7 @@ def _run_agent_loop(
             G.console.print("[yellow]vLLM unreachable — auto-restarting...[/]")
             _restart_vllm_on_gpu(cfg.gpu)
 
-    client = llm_client(endpoint, profile.vllm_api_key)
+    client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
     backend = make_backend(cfg)
     base_prompt = cfg.resolved_system_prompt()
 
@@ -133,7 +133,7 @@ def _run_agent_loop(
                 if _exc.response.status_code == 400 and cfg.gpu.ssh_host:
                     G.console.print("[yellow]400 from vLLM — restarting with correct flags...[/]")
                     _restart_vllm_on_gpu(cfg.gpu)
-                    client = llm_client(endpoint, profile.vllm_api_key)
+                    client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
                     resp = client.chat.completions.create(
                         model=profile.served_model_name,
                         messages=messages,
