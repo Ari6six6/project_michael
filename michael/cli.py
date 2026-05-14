@@ -362,6 +362,7 @@ def cmd_gpu_up() -> None:
             f"--host 0.0.0.0 --port {gpu.vllm_port} "
             f"--dtype auto --gpu-memory-utilization 0.95 "
             f"--max-model-len 8192 "
+            f"--enable-auto-tool-choice --tool-call-parser hermes "
             f"{api_key_flag}"
             f"> /tmp/vllm.log 2>&1 & echo $!"
         )
