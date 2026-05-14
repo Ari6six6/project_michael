@@ -23,6 +23,7 @@ import michael.globals as G
 from michael.agent import _run_agent_loop
 from michael.backends import (
     VastClient,
+    _build_vllm_cmd,
     _gpu_ssh_run,
     _gpu_ssh_stream,
     _ping_vllm,
@@ -356,17 +357,7 @@ def cmd_gpu_up() -> None:
         _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=10)
         time.sleep(2)
 
-        api_key_flag = f"--api-key {gpu.vllm_api_key} " if gpu.vllm_api_key else ""
-        vllm_cmd = (
-            f"nohup vllm serve {gpu.model_repo} "
-            f"--host 0.0.0.0 --port {gpu.vllm_port} "
-            f"--dtype auto --gpu-memory-utilization 0.95 "
-            f"--max-model-len 8192 "
-            f"--enable-auto-tool-choice --tool-call-parser hermes "
-            f"{api_key_flag}"
-            f"> /tmp/vllm.log 2>&1 & echo $!"
-        )
-        cp = _gpu_ssh_run(gpu, vllm_cmd, timeout=30)
+        cp = _gpu_ssh_run(gpu, _build_vllm_cmd(gpu), timeout=30)
         pid = cp.stdout.strip()
         G.console.print(f"[cyan]vLLM starting[/] (PID {pid}) — model download may take 20–40 min on first boot")
         G.console.print("[dim]tailing /tmp/vllm.log for progress…[/]")
