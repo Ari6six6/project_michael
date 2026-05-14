@@ -292,14 +292,39 @@ def cmd_gpu_up() -> None:
         cfg.save()
         G.console.print(f"[green]GPU config saved[/] ({gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port})")
 
-    # ── Verify connectivity ──
-    G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-    cp = _gpu_ssh_run(gpu, "echo ok", timeout=20)
-    if cp.returncode != 0:
-        raise G.MichaelError(
-            f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
-            "Check ssh_key_path in config or try ssh manually."
-        )
+    # ── Power on via Vast.ai API if we have the instance ID ──
+    if gpu.vast_instance_id and cfg.vast_api_key:
+        G.console.print(f"[dim]starting instance {gpu.vast_instance_id} via Vast.ai API…[/]")
+        try:
+            vast = VastClient(cfg.vast_api_key)
+            vast.start(gpu.vast_instance_id)
+            vast.close()
+            G.console.print("[dim]start requested — waiting for SSH to come up…[/]")
+            _poll_s = 10
+            _max_boot = 300
+            _elapsed = 0
+            booted = False
+            while _elapsed < _max_boot:
+                time.sleep(_poll_s)
+                _elapsed += _poll_s
+                cp = _gpu_ssh_run(gpu, "echo ok", timeout=10)
+                if cp.returncode == 0:
+                    booted = True
+                    break
+                G.console.print(f"[dim]· {_elapsed}s — waiting for SSH…[/]")
+            if not booted:
+                raise G.MichaelError(f"instance did not respond to SSH within {_max_boot}s")
+        except G.MichaelError as e:
+            raise G.MichaelError(f"failed to start instance: {e}") from e
+    else:
+        # ── Verify connectivity (no API, assume already running) ──
+        G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
+        cp = _gpu_ssh_run(gpu, "echo ok", timeout=20)
+        if cp.returncode != 0:
+            raise G.MichaelError(
+                f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
+                "Check ssh_key_path in config or try ssh manually."
+            )
 
     # ── Install vLLM if missing ──
     cp = _gpu_ssh_run(gpu, "python3 -c 'import vllm' 2>/dev/null && echo installed || echo missing")
@@ -356,7 +381,6 @@ def cmd_gpu_up() -> None:
         if "ready" in cp.stdout:
             endpoint_ready = True
             break
-        # Show last 2 lines of vllm.log for progress
         log_cp = _gpu_ssh_run(gpu, "tail -2 /tmp/vllm.log 2>/dev/null || true", timeout=10)
         tail = log_cp.stdout.strip().replace("\n", " | ")
         G.console.print(f"[dim]· {_elapsed}s — {tail or 'loading…'}[/]")
@@ -399,9 +423,12 @@ def cmd_gpu_down() -> None:
     if not gpu.ssh_host:
         raise G.MichaelError("no GPU configured — run `michael gpu up` first")
 
-    G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-    _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=15)
-    G.console.print("[yellow]vLLM stopped[/]")
+    # Kill vLLM via SSH (best-effort — instance may already be off)
+    cp = _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=15)
+    if cp.returncode == 0:
+        G.console.print("[yellow]vLLM stopped[/]")
+    else:
+        G.console.print("[dim]SSH unreachable — skipping vLLM kill (instance likely already off)[/]")
 
     if gpu.vast_instance_id and cfg.vast_api_key:
         vast = VastClient(cfg.vast_api_key)
@@ -695,13 +722,13 @@ def down_cmd() -> None:
 
 @gpu_app.command("up")
 def gpu_up_cmd() -> None:
-    """Install vLLM on the GPU, start Qwen3-72B-AWQ, print the port-forward command."""
+    """Start the Vast.ai instance, install vLLM, serve the model, print port-forward."""
     cmd_gpu_up()
 
 
 @gpu_app.command("down")
 def gpu_down_cmd() -> None:
-    """Kill vLLM on the GPU and stop the Vast.ai instance."""
+    """Kill vLLM and stop the Vast.ai instance via API."""
     cmd_gpu_down()
 
 
@@ -879,7 +906,7 @@ def dispatch_repl(line: str) -> None:
             "  project [slug]        select/list projects\n"
             "  new [name]            create new project\n"
             "  up / down             start/stop GPU (legacy — needs config.json)\n"
-            "  gpu up / gpu down     install vLLM, start model, print port-forward\n"
+            "  gpu up / gpu down     start instance, install vLLM, serve model\n"
             "  config                edit config\n"
             "  init                  initialize config\n"
             "  exit / quit           exit michael"
