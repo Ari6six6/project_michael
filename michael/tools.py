@@ -187,13 +187,51 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch the content of a URL and return the response body as text. "
+                "Useful for reading documentation, APIs, raw files, or any web resource. "
+                "Responses larger than 100 KB are truncated. Auto-executes — no confirmation needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch.",
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "HEAD"],
+                        "description": "HTTP method (default: GET).",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers as key-value pairs.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional request body (for POST).",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Request timeout in seconds (default: 15).",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
 # Room-scoped tool subsets
 # ---------------------------------------------------------------------------
 
-_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory"}
+_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory", "fetch_url"}
 _PLANNING_TOOL_NAMES  = {"read_file", "list_dir", "search_memory", "write_file", "apply_patch"}
 
 TOOLS_READ_ONLY = [t for t in TOOLS if t["function"]["name"] in _READ_ONLY_TOOL_NAMES]
@@ -663,6 +701,42 @@ def execute_tool(
 
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
+
+    if name == "fetch_url":
+        import httpx
+
+        url = str(args.get("url", ""))
+        if not url:
+            return "error: url is required"
+        method = str(args.get("method", "GET")).upper()
+        headers = args.get("headers") or {}
+        body = args.get("body")
+        timeout_s = int(args.get("timeout_s", 15))
+        _MAX_RESPONSE_BYTES = 100_000
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout_s) as client:
+                resp = client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    content=body.encode() if isinstance(body, str) else None,
+                )
+        except httpx.TimeoutException:
+            return f"error: request timed out after {timeout_s}s"
+        except httpx.RequestError as exc:
+            return f"error: {exc}"
+        content_type = resp.headers.get("content-type", "")
+        try:
+            text = resp.text
+        except Exception:
+            text = resp.content.decode("utf-8", errors="replace")
+        truncated = len(text) > _MAX_RESPONSE_BYTES
+        body_out = text[:_MAX_RESPONSE_BYTES]
+        parts = [f"status: {resp.status_code}", f"content-type: {content_type}"]
+        if truncated:
+            parts.append(f"(truncated to {_MAX_RESPONSE_BYTES} bytes)")
+        parts.append(body_out)
+        return "\n".join(parts)
 
     return f"error: unknown tool {name}"
 
