@@ -44,12 +44,27 @@ class SandboxConfig:
 
 
 @dataclass
+class GpuConfig:
+    """Direct SSH + vLLM config for a rented GPU (A100 / etc.)."""
+
+    ssh_host: str = ""
+    ssh_port: int = 22
+    ssh_user: str = "root"
+    ssh_key_path: str = "~/.ssh/id_ed25519"
+    vast_instance_id: str = ""
+    model_repo: str = "Qwen/Qwen3-72B-AWQ"
+    vllm_port: int = 8000
+    vllm_api_key: str = ""
+
+
+@dataclass
 class Config:
     vast_api_key: str = ""
     models: dict[str, ModelProfile] = field(default_factory=dict)
     default_model: str = ""
     vps: VpsConfig = field(default_factory=VpsConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    gpu: GpuConfig = field(default_factory=GpuConfig)
     system_prompt: str = G.DEFAULT_SYSTEM_PROMPT
     system_prompt_file: str = ""
     log_responses: bool = True
@@ -85,9 +100,13 @@ class Config:
         valid_sb = set(SandboxConfig.__dataclass_fields__)
         sandbox = SandboxConfig(**{k: v for k, v in sb_raw.items() if k in valid_sb})
 
-        valid = set(cls.__dataclass_fields__) - {"models", "vps", "sandbox"}
+        gpu_raw = data.pop("gpu", None) or {}
+        valid_gpu = set(GpuConfig.__dataclass_fields__)
+        gpu = GpuConfig(**{k: v for k, v in gpu_raw.items() if k in valid_gpu})
+
+        valid = set(cls.__dataclass_fields__) - {"models", "vps", "sandbox", "gpu"}
         clean = {k: v for k, v in data.items() if k in valid}
-        return cls(models=models, vps=vps, sandbox=sandbox, **clean)
+        return cls(models=models, vps=vps, sandbox=sandbox, gpu=gpu, **clean)
 
     def save(self) -> None:
         G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)

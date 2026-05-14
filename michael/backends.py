@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 import michael.globals as G
-from michael.config import Config, ModelProfile, SandboxConfig, VpsConfig
+from michael.config import Config, GpuConfig, ModelProfile, SandboxConfig, VpsConfig
 from michael.project import append_event, replay_global
 
 if TYPE_CHECKING:
@@ -98,6 +98,116 @@ def _ssh_preflight(cfg: Config) -> None:
         )
     append_event("ssh.health", {"host": cfg.vps.host, "ok": True})
     atexit.register(_ssh_close_master, cfg.vps)
+
+
+# ---------------------------------------------------------------------------
+# GPU SSH helpers (direct SSH to Vast.ai GPU instance, no ControlMaster)
+# ---------------------------------------------------------------------------
+
+
+def parse_vast_ssh_cmd(ssh_str: str) -> tuple[str, str, int]:
+    """Parse a Vast.ai SSH string into (user, host, port).
+
+    Accepts formats like:
+      ssh root@1.2.3.4 -p 10022
+      ssh -p 10022 root@1.2.3.4
+      ssh root@ssh4.vast.ai -p 54321
+    """
+    try:
+        tokens = shlex.split(ssh_str)
+    except ValueError as e:
+        raise G.MichaelError(f"could not parse SSH command: {e}") from e
+
+    tokens = [t for t in tokens if t != "ssh"]
+    port = 22
+    user_host: Optional[str] = None
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-p" and i + 1 < len(tokens):
+            try:
+                port = int(tokens[i + 1])
+            except ValueError:
+                pass
+            i += 2
+            continue
+        if tok.startswith("-p") and len(tok) > 2:
+            try:
+                port = int(tok[2:])
+            except ValueError:
+                pass
+            i += 1
+            continue
+        if tok.startswith("-") and not tok.startswith("-p"):
+            i += 1
+            continue
+        if "@" in tok:
+            user_host = tok
+        i += 1
+
+    if not user_host:
+        raise G.MichaelError(
+            f"could not find user@host in SSH string: {ssh_str!r}"
+        )
+    parts = user_host.split("@", 1)
+    return parts[0], parts[1], port
+
+
+def _gpu_ssh_argv(gpu: GpuConfig) -> list[str]:
+    return [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        "-i", os.path.expanduser(gpu.ssh_key_path),
+        "-p", str(gpu.ssh_port),
+        f"{gpu.ssh_user}@{gpu.ssh_host}",
+    ]
+
+
+def _gpu_ssh_run(
+    gpu: GpuConfig,
+    cmd: str,
+    *,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        _gpu_ssh_argv(gpu) + [cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _gpu_ssh_stream(gpu: GpuConfig, cmd: str, *, timeout: int = 600) -> int:
+    """Run cmd on GPU with live stdout/stderr streamed to terminal."""
+    proc = subprocess.Popen(
+        _gpu_ssh_argv(gpu) + [cmd],
+        stdout=None,
+        stderr=None,
+    )
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise G.MichaelError(f"GPU command timed out after {timeout}s")
+    return proc.returncode
+
+
+def gpu_port_forward_cmd(gpu: GpuConfig) -> str:
+    key = os.path.expanduser(gpu.ssh_key_path)
+    return (
+        f"ssh -p {gpu.ssh_port} {gpu.ssh_user}@{gpu.ssh_host} "
+        f"-L {gpu.vllm_port}:localhost:{gpu.vllm_port} "
+        f"-N -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-i {key}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +293,10 @@ class VastClient:
         if host_port is None:
             return None
         return f"http://{ip}:{host_port}/v1"
+
+    def list(self) -> list[dict[str, Any]]:
+        data = self._wrap("list", lambda: self._client.get(f"{self.base}/instances/"))
+        return data.get("instances", []) or []
 
     def close(self) -> None:
         self._client.close()
