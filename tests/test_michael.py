@@ -370,7 +370,7 @@ def test_execute_with_staging_missing_expected_returns_error_to_llm(home, worksp
     assert "tool.delta_missing" in types
 
 
-def test_execute_with_staging_mismatch_is_review_data_not_rejection(home, workspace):
+def test_execute_with_staging_mismatch_rolls_back_and_errors(home, workspace):
     p = m.create_project("x", workspace)
     cfg = m.Config()
     pending = m.PendingChanges()
@@ -384,18 +384,17 @@ def test_execute_with_staging_mismatch_is_review_data_not_rejection(home, worksp
         },
         p, cfg, pending,
     )
-    # Mismatch is information, not auto-rejection — no error: prefix.
-    assert not result.startswith("error:")
+    # Mismatch is an error: rolled back, LLM told to re-propose.
+    assert result.startswith("mismatch:")
     assert "predicted:" in result and "actual:" in result
-    assert "src/bar.py" in result
-    # Real workspace untouched; staging holds the change for the LLM to review.
+    # Change was rolled back — not in change_log.
+    assert len(pending.change_log) == 0
+    # Real workspace untouched.
     assert not (workspace / "src" / "bar.py").exists()
-    assert pending.stage_root is not None
-    assert len(pending.change_log) == 1
     events = m.iter_events(p.events_path)
     types = [e.get("type") for e in events]
     assert "tool.delta_mismatch" in types
-    assert "tool.staged" in types
+    assert "tool.staged" not in types
 
 
 def test_execute_with_staging_review_returns_diff_without_prompt(home, workspace, monkeypatch):

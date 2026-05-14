@@ -20,6 +20,7 @@ class ModelProfile:
     vllm_api_key: str = ""
     request_timeout_s: int = 120
     endpoint: Optional[str] = None
+    enable_thinking: bool = False
 
 
 @dataclass

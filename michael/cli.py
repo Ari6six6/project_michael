@@ -482,7 +482,7 @@ def cmd_ask(prompt: str) -> None:
     cfg = Config.load()
     name, profile = cfg.get_model()
     endpoint = _require_endpoint(profile, name)
-    client = llm_client(endpoint, profile.vllm_api_key)
+    client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
     project = get_active_project()
     if project is not None:
         append_event(
