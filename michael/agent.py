@@ -118,8 +118,8 @@ def _run_agent_loop(
                 stream=False,
                 timeout=float(profile.request_timeout_s),
             )
-            msg = resp.choices[0].message
-            content = msg.content or ""
+            choice = resp.choices[0]
+            content = choice.content or ""
 
             if content:
                 payload: dict[str, Any] = {"chars": len(content), "turn": turn}
@@ -127,7 +127,7 @@ def _run_agent_loop(
                     payload["text"] = content
                 append_event("assistant.message", payload, project=project)
 
-            tool_calls = msg.tool_calls or []
+            tool_calls = choice.tool_calls or []
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:
                 assistant_msg["tool_calls"] = [
@@ -135,8 +135,8 @@ def _run_agent_loop(
                         "id": tc.id,
                         "type": "function",
                         "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
                         },
                     }
                     for tc in tool_calls
@@ -152,13 +152,13 @@ def _run_agent_loop(
 
             committed = False
             for tc in tool_calls:
-                G.console.print(f"[dim]· tool {tc.function.name}[/]")
+                G.console.print(f"[dim]· tool {tc.name}[/]")
                 try:
-                    targs = json.loads(tc.function.arguments or "{}")
+                    targs = json.loads(tc.arguments or "{}")
                 except json.JSONDecodeError:
                     targs = {}
                 result = dispatch_tool_call(
-                    tc.function.name, targs, project, cfg, backend, pending
+                    tc.name, targs, project, cfg, backend, pending
                 )
                 if result == COMMIT_SENTINEL:
                     committed = True
