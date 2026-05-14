@@ -159,8 +159,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "run_in_sandbox",
             "description": (
-                "Run Python code in an isolated podman sandbox: no network, "
-                "read-only mount, dropped caps. Requires user confirmation."
+                "Run Python code in an isolated podman sandbox: NO network access, "
+                "read-only mount, dropped caps. Requires user confirmation. "
+                "Do NOT use this for anything that needs internet (HTTP requests, "
+                "APIs, web scraping) — use run_shell instead for those."
             ),
             "parameters": {
                 "type": "object",
@@ -175,6 +177,8 @@ TOOLS: list[dict[str, Any]] = [
             "name": "run_shell",
             "description": (
                 "Run a shell command in the project workspace (NOT sandboxed). "
+                "Has full network access — use this for curl, wget, API calls, "
+                "web requests, or any command needing the internet. "
                 "Requires user confirmation."
             ),
             "parameters": {
