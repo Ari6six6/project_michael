@@ -28,6 +28,25 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Tiny I/O helpers — silence expected OSError noise
+# ---------------------------------------------------------------------------
+
+
+def _safe_read(p: pathlib.Path) -> Optional[bytes]:
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+def _safe_unlink(p: pathlib.Path) -> None:
+    try:
+        p.unlink()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Tool schemas (passed to the LLM as `tools=[...]`)
 # ---------------------------------------------------------------------------
 
@@ -37,20 +56,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Overwrite (or create) a file anywhere on the Work FS. "
-                "Path may be absolute or relative to the project root; "
-                "parent dirs are created automatically. "
-                "Writing to ~/.michael/ (the Central FS) is blocked. "
-                "The change is applied to a staging copy first. "
-                "You MUST predict the resulting filesystem delta in "
-                "`expected_changes` (every path that will be added, modified, "
-                "or removed — use absolute paths for files outside the project "
-                "root). If reality diverges from your prediction, Michael "
-                "returns a mismatch error and the user is NOT prompted — "
-                "re-propose. If `verify` is provided, it runs in the staging "
-                "copy after the write; verify failures roll back this call. "
-                "If prediction matches and verify passes (or is omitted), the "
-                "user is shown the diff and asked to confirm."
+                "Write or overwrite a file on the Work FS (Central FS is blocked). "
+                "Requires expected_changes — your prediction of which paths change. "
+                "Mismatch with reality is returned as an error; re-propose. "
+                "Optional verify runs in staging; failure rolls back the call."
             ),
             "parameters": {
                 "type": "object",
@@ -107,10 +116,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "search_memory",
             "description": (
-                "Search past LLM responses stored in this project's event log for a "
-                "query string (case-insensitive substring match). Returns up to 5 "
-                "matching excerpts with timestamps. Auto-executes — no confirmation "
-                "needed. Only works when log_responses=true in config."
+                "Case-insensitive search of past LLM responses in this project's event log. "
+                "Returns up to 5 excerpts with timestamps. Auto-executes. Requires log_responses=true."
             ),
             "parameters": {
                 "type": "object",
@@ -129,11 +136,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "apply_patch",
             "description": (
-                "Apply a unified diff to a file. Goes through the same "
-                "staging + predicted-delta + verify + user-confirm flow as "
-                "write_file: `expected_changes` is required, mismatches are "
-                "returned to you, and the user is only prompted on a clean "
-                "match."
+                "Apply a unified diff to a file. Same staging + expected_changes + verify "
+                "flow as write_file."
             ),
             "parameters": {
                 "type": "object",
@@ -412,9 +416,8 @@ def _file_hashes(root: pathlib.Path) -> dict[str, str]:
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in G.SKIP_DIRS]
         for fn in files:
             fp = dp_path / fn
-            try:
-                data = fp.read_bytes()
-            except OSError:
+            data = _safe_read(fp)
+            if data is None:
                 continue
             rel = str(fp.relative_to(root))
             out[rel] = hashlib.sha256(data).hexdigest()
@@ -435,9 +438,8 @@ def _combined_hashes(
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in G.SKIP_DIRS]
             for fn in files:
                 fp = pathlib.Path(dp) / fn
-                try:
-                    data = fp.read_bytes()
-                except OSError:
+                data = _safe_read(fp)
+                if data is None:
                     continue
                 rel_in_ext = fp.relative_to(ext_root)
                 abs_key = "/" + str(rel_in_ext)
@@ -622,10 +624,7 @@ def _sync_to_real(
     for rel in delta["removed"]:
         dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
-            try:
-                dst.unlink()
-            except OSError:
-                pass
+            _safe_unlink(dst)
 
 
 def _list_trash(project: Project) -> list[dict[str, Any]]:
@@ -676,10 +675,7 @@ def _undo_one(project: Project, trash_id: Optional[str] = None) -> dict[str, Any
     for rel in delta.get("added", []):
         dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
-            try:
-                dst.unlink()
-            except OSError:
-                pass
+            _safe_unlink(dst)
     shutil.rmtree(target, ignore_errors=True)
     return metadata
 
@@ -1024,15 +1020,9 @@ def _snapshot_file(
         # External file not yet staged — try the real filesystem.
         abs_path = permissions.resolve_any(path_str, real_project_root)
         if not permissions.is_project_path(abs_path, real_project_root) and abs_path.is_file():
-            try:
-                return True, abs_path.read_bytes()
-            except OSError:
-                return True, None
+            return True, _safe_read(abs_path)
         return False, None
-    try:
-        return True, target.read_bytes()
-    except OSError:
-        return True, None
+    return True, _safe_read(target)
 
 
 def _restore_file(
@@ -1049,10 +1039,7 @@ def _restore_file(
         return
     if not existed:
         if target.is_file():
-            try:
-                target.unlink()
-            except OSError:
-                pass
+            _safe_unlink(target)
         return
     if blob is None:
         return
@@ -1303,6 +1290,25 @@ def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: p
 # ---------------------------------------------------------------------------
 
 
+def _log_and_return(
+    name: str, args: dict[str, Any], result: str, project: Project,
+    *, dynamic: bool = False,
+) -> str:
+    first = (result.splitlines()[0] if result else "ok")[:120]
+    payload: dict[str, Any] = {
+        "tool": name,
+        "args": args,
+        "summary": f"{_summary_for(name, args)} → {first}",
+        "result_chars": len(result),
+    }
+    if dynamic:
+        payload["dynamic"] = True
+    if name in ("run_in_sandbox", "run_shell"):
+        payload["brief_result"] = result[:600]
+    append_event("tool.executed", payload, project=project)
+    return result
+
+
 def dispatch_tool_call(
     name: str,
     args: dict[str, Any],
@@ -1312,25 +1318,12 @@ def dispatch_tool_call(
     pending: PendingChanges,
 ) -> str:
     """Route one LLM tool call to the right handler."""
-    summary = _summary_for(name, args)
-
     if name in G.AUTO_EXEC_TOOLS:
         try:
             result = execute_tool(name, args, project, cfg, backend)
         except G.MichaelError as e:
             result = f"error: {e}"
-        first = (result.splitlines()[0] if result else "ok")[:120]
-        append_event(
-            "tool.executed",
-            {
-                "tool": name,
-                "args": args,
-                "summary": f"{summary} → {first}",
-                "result_chars": len(result),
-            },
-            project=project,
-        )
-        return result
+        return _log_and_return(name, args, result, project)
 
     if name in ("write_file", "apply_patch"):
         return execute_with_staging(name, args, project, cfg, pending)
@@ -1349,17 +1342,9 @@ def dispatch_tool_call(
         )
         return COMMIT_SENTINEL
 
-    # Dynamic tool invented by the agent (tools/<name>.py) — auto-executed, no confirmation.
     dynamic_result = _try_dynamic_dispatch(name, args, project)
     if dynamic_result is not None:
-        first = (dynamic_result.splitlines()[0] if dynamic_result else "ok")[:120]
-        append_event(
-            "tool.executed",
-            {"tool": name, "args": args, "summary": f"{summary} → {first}",
-             "result_chars": len(dynamic_result), "dynamic": True},
-            project=project,
-        )
-        return dynamic_result
+        return _log_and_return(name, args, dynamic_result, project, dynamic=True)
 
     try:
         decision, final_args = confirm_tool_call(name, args, project)
@@ -1368,7 +1353,7 @@ def dispatch_tool_call(
     if decision == "no":
         append_event(
             "tool.rejected",
-            {"tool": name, "args": args, "summary": summary},
+            {"tool": name, "args": args, "summary": _summary_for(name, args)},
             project=project,
         )
         return "[user rejected this tool call]"
@@ -1376,17 +1361,7 @@ def dispatch_tool_call(
         result = execute_tool(name, final_args, project, cfg, backend)
     except G.MichaelError as e:
         result = f"error: {e}"
-    first = (result.splitlines()[0] if result else "ok")[:120]
-    payload: dict[str, Any] = {
-        "tool": name,
-        "args": final_args,
-        "summary": f"{_summary_for(name, final_args)} → {first}",
-        "result_chars": len(result),
-    }
-    if name in ("run_in_sandbox", "run_shell"):
-        payload["brief_result"] = result[:600]
-    append_event("tool.executed", payload, project=project)
-    return result
+    return _log_and_return(name, final_args, result, project)
 
 
 def _try_dynamic_dispatch(name: str, args: dict[str, Any], project: Project) -> Optional[str]:

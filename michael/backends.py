@@ -354,6 +354,18 @@ class _CompletionResponse:
     usage: Optional[dict]
 
 
+def _parse_tool_calls(tcs: list) -> Optional[list]:
+    result = [
+        _ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in tcs
+    ]
+    return result or None
+
+
 class _Completions:
     def __init__(
         self, endpoint: str, http: httpx.Client, headers: dict, enable_thinking: bool = False
@@ -425,15 +437,7 @@ class _Completions:
         choices = []
         for c in data.get("choices", []):
             m = c.get("message", {})
-            tcs = m.get("tool_calls") or []
-            tool_calls: Optional[list] = [
-                _ToolCall(
-                    id=tc.get("id", ""),
-                    name=tc.get("function", {}).get("name", ""),
-                    arguments=tc.get("function", {}).get("arguments", ""),
-                )
-                for tc in tcs
-            ] or None
+            tool_calls = _parse_tool_calls(m.get("tool_calls") or [])
             choices.append(
                 _Choice(
                     content=m.get("content"),
@@ -446,15 +450,7 @@ class _Completions:
     def _parse_chunk(self, data: dict) -> _Choice:
         c = data.get("choices", [{}])[0]
         delta = c.get("delta", {})
-        tcs = delta.get("tool_calls") or []
-        tool_calls: Optional[list] = [
-            _ToolCall(
-                id=tc.get("id", ""),
-                name=(tc.get("function") or {}).get("name", ""),
-                arguments=(tc.get("function") or {}).get("arguments", ""),
-            )
-            for tc in tcs
-        ] or None
+        tool_calls = _parse_tool_calls(delta.get("tool_calls") or [])
         return _Choice(
             content=delta.get("content"),
             tool_calls=tool_calls,
