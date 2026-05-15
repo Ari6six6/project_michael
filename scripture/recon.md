@@ -73,6 +73,16 @@ Lives in the project root so H2 (filesystem snapshot) picks it up on every run.
 ## Open Questions
 <!-- What to investigate next. These become the agenda for the next run. -->
 
+## Expected vs Observed Filesystem
+<!-- TODO: run source_map for each detected version and populate this table.
+     | Path | In Source | Observed | Finding |
+     |------|-----------|----------|---------|
+     | wp-login.php      | yes | 200 OK | — (normal) |
+     | readme.html       | yes | 200 OK | version disclosure |
+     | wp-admin/install.php | yes | 403  | hardened |
+     | xmlrpc.php        | yes | 200 OK | attack surface |
+-->
+
 ## Recon History
 <!-- One line per run: timestamp, tools used, key findings -->
 ```
@@ -146,3 +156,35 @@ This is the agenda for the next run. Every recon session should end with:
 - What version needs CVE lookup?
 
 These become the implicit prompt for the next `michael run`.
+
+---
+
+## Source Mapping: Version → Expected Filesystem
+
+When a version is confirmed, call `source_map(package, version)`. This fetches the
+canonical directory and file structure from the public source (GitHub, npm, PyPI) —
+no cloning, just the tree via API.
+
+**Workflow:**
+1. Version confirmed in recon output → call `source_map(package, version)`
+2. Cross-reference the `[INTERESTING PATHS]` output against `web_http_probe` results
+3. Classify each interesting path:
+   - **200 + expected** — normal, note it
+   - **403/404 + expected** — hardened, note it
+   - **200 + sensitive** (install scripts, config templates, backup dirs) — **finding**
+   - **200 + unexpected** — custom code or leaked artifact — **investigate**
+4. Populate `## Expected vs Observed Filesystem` in the target model
+
+**Classification table:**
+
+| In Source | Observed | Classification |
+|-----------|----------|----------------|
+| yes       | 200 OK   | normal or finding (depends on sensitivity) |
+| yes       | 403/404  | hardened — note it, try bypass if relevant |
+| yes       | 301/302  | redirect — follow and re-classify |
+| no        | 200 OK   | custom code, plugin, or leaked artifact — investigate |
+| no        | 403/404  | expected (custom path, not worth pursuing) |
+
+**Before committing** any recon session: list all detected versions and confirm
+`source_map` was called for each. If skipped (e.g. version too ambiguous, no public
+repo found), document why in the target model.
