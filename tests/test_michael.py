@@ -501,3 +501,52 @@ def test_repl_commands_include_core_commands():
     assert "new" in m.REPL_COMMANDS
     assert "up" in m.REPL_COMMANDS
     assert "down" in m.REPL_COMMANDS
+
+
+# ---- workbench -----------------------------------------------------------
+
+import michael.workbench as wb
+
+
+def test_workbench_project_root_outside_context_raises():
+    with pytest.raises(RuntimeError, match="no active project"):
+        wb.project_root()
+
+
+def test_workbench_project_root_inside_context(home, workspace):
+    p = m.create_project("wb-test", workspace)
+    token = wb._set_context(p)
+    try:
+        assert wb.project_root() == pathlib.Path(p.path)
+        assert wb.project_slug() == p.slug
+    finally:
+        wb._reset_context(token)
+
+
+def test_workbench_context_cleared_after_reset(home, workspace):
+    p = m.create_project("wb-reset", workspace)
+    token = wb._set_context(p)
+    wb._reset_context(token)
+    with pytest.raises(RuntimeError, match="no active project"):
+        wb.project_root()
+
+
+def test_workbench_read_file_blocks_central_fs(home, workspace):
+    p = m.create_project("wb-perm", workspace)
+    token = wb._set_context(p)
+    try:
+        central_path = str(michael_globals.STATE_DIR / "secret.txt")
+        with pytest.raises(m.MichaelError, match="Central FS violation"):
+            wb.read_file(central_path)
+    finally:
+        wb._reset_context(token)
+
+
+def test_workbench_run_shell_blocks_central_fs_reference(home, workspace):
+    p = m.create_project("wb-shell", workspace)
+    token = wb._set_context(p)
+    try:
+        with pytest.raises(m.MichaelError):
+            wb.run_shell("cat ~/.michael/config.json")
+    finally:
+        wb._reset_context(token)
