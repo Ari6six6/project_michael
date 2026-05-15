@@ -378,7 +378,20 @@ def cmd_gpu_up() -> None:
                     break
                 G.console.print(f"[dim]· {_elapsed}s — waiting for SSH…[/]")
             if not booted:
-                raise G.MichaelError(f"instance did not respond to SSH within {_max_boot}s")
+                api_status = "unknown"
+                try:
+                    _vc = VastClient(cfg.vast_api_key)
+                    inst = _vc.get(gpu.vast_instance_id)
+                    _vc.close()
+                    api_status = inst.get("actual_status") or inst.get("status", "unknown")
+                except G.MichaelError:
+                    pass
+                raise G.MichaelError(
+                    f"instance did not respond to SSH within {_max_boot}s "
+                    f"(Vast.ai reports instance as: {api_status})\n"
+                    "If the instance is running, SSH may still be initialising — "
+                    "try again: michael gpu up"
+                )
         except G.MichaelError as e:
             if "404" in str(e) or "no_such_instance" in str(e):
                 G.console.print("[yellow]Instance not found — it was probably destroyed. Clearing stale config…[/]")
