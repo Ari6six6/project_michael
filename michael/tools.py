@@ -301,6 +301,34 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_model",
+            "description": (
+                "Load a structured AppModel for a known target. Returns JSON with "
+                "base_url, auth pattern, endpoint signatures, stack, and notes "
+                "synthesized from recon. Auto-executes — no confirmation needed. "
+                "Call this as soon as you identify the target system, before writing "
+                "any HTTP calls or target-specific tools. If no model exists, the "
+                "response tells you what models are available and how to build one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "App or API name, e.g. 'cloudflare-api' or 'wordpress'.",
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "Version string, e.g. 'v4' or '6.4.2'.",
+                    },
+                },
+                "required": ["name", "version"],
+            },
+        },
+    },
 ]
 
 # Sentinel returned by dispatch_tool_call when commit_changes fires, so the
@@ -858,6 +886,25 @@ def execute_tool(
             parts.append(f"(truncated to {_MAX_RESPONSE_BYTES} bytes)")
         parts.append(body_out)
         return "\n".join(parts)
+
+    if name == "load_model":
+        from dataclasses import asdict as _asdict
+        from michael.appmodel import load_model as _load_model, list_models as _list_models
+        model_name_arg = str(args.get("name", ""))
+        model_ver_arg = str(args.get("version", ""))
+        if not model_name_arg or not model_ver_arg:
+            return "load_model: both 'name' and 'version' are required"
+        try:
+            model = _load_model(project, model_name_arg, model_ver_arg)
+            return json.dumps(_asdict(model), indent=2)
+        except G.MichaelError:
+            available = [f"{mo.name} {mo.version}" for mo in _list_models(project)]
+            hint = (
+                f"Available models: {available}" if available
+                else "No models built yet — run recon (recon_passive/explore_service), "
+                     "then write models/<name>-<version>.json with base_url, auth, endpoints, stack, notes."
+            )
+            return f"No model for {model_name_arg!r} {model_ver_arg!r}. {hint}"
 
     return f"error: unknown tool {name}"
 

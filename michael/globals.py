@@ -22,6 +22,8 @@ REPL_HISTORY_PATH = STATE_DIR / "repl_history"
 GLOBAL_TOOLS_DIR = STATE_DIR / "toolbox"
 TOOLS_CATALOG_PATH = STATE_DIR / "tools_catalog.json"
 
+MODELS_SUBDIR = "models"   # relative to project.path
+
 # Workbench — standard topology for built tools
 WORKBENCH_DIR = pathlib.Path.home() / "workbench"
 MICHAEL_BIN_DIR = WORKBENCH_DIR / "bin"
@@ -50,7 +52,7 @@ SKIP_DIRS = {
 # Tool routing
 # ---------------------------------------------------------------------------
 
-AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory", "fetch_url", "search_tools", "forge_tool"}
+AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory", "fetch_url", "search_tools", "forge_tool", "load_model"}
 
 # ---------------------------------------------------------------------------
 # Domain error

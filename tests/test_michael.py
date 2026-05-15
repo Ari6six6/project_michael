@@ -550,3 +550,39 @@ def test_workbench_run_shell_blocks_central_fs_reference(home, workspace):
             wb.run_shell("cat ~/.michael/config.json")
     finally:
         wb._reset_context(token)
+
+
+# ---- appmodel ------------------------------------------------------------
+
+import michael.appmodel as am
+
+
+def test_appmodel_save_and_load(home, workspace):
+    p = m.create_project("am-test", workspace)
+    model = am.make_model(
+        "testapp", "v1",
+        base_url="https://api.example.com",
+        auth={"type": "bearer"},
+        notes="test model",
+    )
+    am.save_model(p, model)
+    loaded = am.load_model(p, "testapp", "v1")
+    assert loaded.name == "testapp"
+    assert loaded.version == "v1"
+    assert loaded.base_url == "https://api.example.com"
+    assert loaded.auth == {"type": "bearer"}
+    assert loaded.notes == "test model"
+
+
+def test_appmodel_list_returns_all(home, workspace):
+    p = m.create_project("am-list", workspace)
+    am.save_model(p, am.make_model("app-a", "1.0"))
+    am.save_model(p, am.make_model("app-b", "2.0"))
+    models = am.list_models(p)
+    assert {mo.name for mo in models} == {"app-a", "app-b"}
+
+
+def test_appmodel_missing_raises(home, workspace):
+    p = m.create_project("am-miss", workspace)
+    with pytest.raises(m.MichaelError, match="no model"):
+        am.load_model(p, "ghost", "v0")
