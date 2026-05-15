@@ -225,8 +225,12 @@ def _run_agent_loop(
                     ok, probe_out = _probe_deliverable(project, run_cmd)
                     if ok:
                         register_deliverable(project, deliverable, run_cmd)
+                        installed = G.MICHAEL_BIN_DIR / project.slug
                         G.console.print(Panel(
-                            f"[bold]{deliverable}[/]\nrun: [cyan]{run_cmd}[/]\n\n[dim]{probe_out[:300]}[/]",
+                            f"[bold]{deliverable}[/]\n"
+                            f"installed: [cyan]{installed}[/]\n\n"
+                            f"[dim]{probe_out[:300]}[/]\n\n"
+                            f"[dim]Add to PATH: export PATH=\"{G.MICHAEL_BIN_DIR}:$PATH\"[/]",
                             title="⚡ Committed + Delivered",
                             border_style="green",
                         ))

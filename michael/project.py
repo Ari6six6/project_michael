@@ -301,15 +301,19 @@ def detect_deliverable(project: "Project") -> Optional[tuple[str, str]]:
 
 
 def register_deliverable(project: "Project", deliverable: str, run_cmd: str) -> None:
-    """Register the project's deliverable in the global catalog."""
+    """Register the deliverable in the catalog and auto-install a wrapper into workbench/bin."""
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    wrapper = G.MICHAEL_BIN_DIR / project.slug
+    wrapper.write_text(f"#!/bin/bash\nexec {run_cmd} \"$@\"\n")
+    wrapper.chmod(0o755)
+
     catalog = load_catalog()
-    existing = catalog.get(project.slug, {})
     catalog[project.slug] = {
         "slug": project.slug,
         "name": project.name,
         "deliverable": deliverable,
         "run_cmd": run_cmd,
-        "installed_as": existing.get("installed_as"),
+        "installed_as": str(wrapper),
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     save_catalog(catalog)

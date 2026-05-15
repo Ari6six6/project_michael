@@ -739,6 +739,13 @@ def cmd_install(slug: Optional[str]) -> None:
     )
 
 
+def cmd_path() -> None:
+    p = get_active_project()
+    if not p:
+        raise G.MichaelError("no active project")
+    G.console.print(p.path)
+
+
 def cmd_deliver() -> None:
     project = require_active_project()
     det = detect_deliverable(project)
@@ -748,7 +755,9 @@ def cmd_deliver() -> None:
     register_deliverable(project, deliverable, run_cmd)
     G.console.print(
         Panel(
-            f"[bold green]delivered[/] {deliverable}\nrun: [cyan]{run_cmd}[/]",
+            f"[bold green]delivered[/] {deliverable}\n"
+            f"installed: [cyan]{G.MICHAEL_BIN_DIR / project.slug}[/]\n\n"
+            f"[dim]Add to PATH: export PATH=\"{G.MICHAEL_BIN_DIR}:$PATH\"[/]",
             title="michael deliver",
             border_style="green",
         )
@@ -1017,18 +1026,24 @@ def catalog_cmd() -> None:
     cmd_catalog()
 
 
-@app.command(name="install")
-def install_cmd(
-    slug: Optional[str] = typer.Argument(None, help="Tool slug to install (default: active project)."),
-) -> None:
-    """Symlink a delivered tool into ~/workbench/bin/ for PATH access."""
-    cmd_install(slug)
+@app.command(name="path")
+def path_cmd() -> None:
+    """Print the active project's workspace path (useful for cd $(michael path))."""
+    cmd_path()
 
 
 @app.command(name="deliver")
 def deliver_cmd() -> None:
-    """Detect and register the active project's deliverable in the catalog."""
+    """Detect, register, and install the active project's deliverable."""
     cmd_deliver()
+
+
+@app.command(name="install", hidden=True)
+def install_cmd(
+    slug: Optional[str] = typer.Argument(None, help="Tool slug to reinstall."),
+) -> None:
+    """Reinstall a delivered tool's wrapper script (repair command)."""
+    cmd_install(slug)
 
 
 @tools_app.command(name="list")
@@ -1168,8 +1183,8 @@ def dispatch_repl(line: str) -> None:
             "  tools run <name> [key=value ...]  run a dynamic tool directly\n"
             "  tools show <name>                 print tool source\n"
             "  catalog                           list all delivered tools\n"
-            "  install [slug]                    symlink tool into ~/workbench/bin/\n"
-            "  deliver                           register active project's deliverable\n"
+            "  path                              print active project workspace path\n"
+            "  deliver                           detect + install active project's deliverable\n"
             "  config                            edit config\n"
             "  init                              initialize config\n"
             "  exit / quit                       exit michael"
@@ -1223,8 +1238,8 @@ def dispatch_repl(line: str) -> None:
             G.err.print("usage: tools list | tools run <name> [key=value ...] | tools show <name>")
     elif cmd == "catalog":
         cmd_catalog()
-    elif cmd == "install":
-        cmd_install(rest[0] if rest else None)
+    elif cmd == "path":
+        cmd_path()
     elif cmd == "deliver":
         cmd_deliver()
     else:
