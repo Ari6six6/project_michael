@@ -428,18 +428,27 @@ def cmd_gpu_up() -> None:
         f"curl -sf http://localhost:{gpu.vllm_port}/v1/models > /dev/null 2>&1 && echo ready || echo down",
     )
     already_ready = "ready" in cp.stdout
+    needs_restart = not already_ready
 
-    if not already_ready:
-        # Kill any stale process first
+    if already_ready:
+        flag_check = _gpu_ssh_run(
+            gpu,
+            "ps aux | grep 'vllm serve' | grep -v grep | grep -c 'enable-auto-tool-choice' 2>/dev/null || echo 0",
+            timeout=10,
+        )
+        if flag_check.stdout.strip() == "0":
+            G.console.print("[yellow]vLLM running without --enable-auto-tool-choice — restarting...[/]")
+            needs_restart = True
+
+    if needs_restart:
         _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=10)
         time.sleep(2)
-
         cp = _gpu_ssh_run(gpu, _build_vllm_cmd(gpu), timeout=30)
         pid = cp.stdout.strip()
         G.console.print(f"[cyan]vLLM starting[/] (PID {pid}) — model download may take 20–40 min on first boot")
         G.console.print("[dim]tailing /tmp/vllm.log for progress…[/]")
     else:
-        G.console.print("[dim]vLLM already serving, skipping start[/]")
+        G.console.print("[dim]vLLM already serving with correct flags, skipping start[/]")
 
     # ── Poll until /v1/models responds ──
     _max_wait_s = 5400  # 90 min

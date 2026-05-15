@@ -403,6 +403,8 @@ class _Completions:
             json=body,
             timeout=timeout,
         )
+        if not r.is_success:
+            G.err.print(f"[dim]vLLM {r.status_code}: {r.text[:300]}[/]")
         r.raise_for_status()
         try:
             data = r.json()

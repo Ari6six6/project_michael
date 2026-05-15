@@ -153,14 +153,20 @@ def _run_agent_loop(
                     G.console.print("[yellow]400 from vLLM — restarting with correct flags...[/]")
                     _restart_vllm_on_gpu(cfg.gpu)
                     client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
-                    resp = client.chat.completions.create(
-                        model=profile.served_model_name,
-                        messages=messages,
-                        tools=all_tools,
-                        tool_choice="auto",
-                        stream=False,
-                        timeout=float(profile.request_timeout_s),
-                    )
+                    try:
+                        resp = client.chat.completions.create(
+                            model=profile.served_model_name,
+                            messages=messages,
+                            tools=all_tools,
+                            tool_choice="auto",
+                            stream=False,
+                            timeout=float(profile.request_timeout_s),
+                        )
+                    except httpx.HTTPStatusError as retry_exc:
+                        raise G.MichaelError(
+                            f"vLLM still returning {retry_exc.response.status_code} after restart — "
+                            f"run `michael gpu down && michael gpu up` to force a clean restart."
+                        ) from retry_exc
                 else:
                     raise
             choice = resp.choices[0]
