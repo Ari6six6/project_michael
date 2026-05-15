@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 from typing import TYPE_CHECKING, Any
 
 import michael.globals as G
@@ -232,6 +233,46 @@ def load_scripture(scripture_dir: str) -> str:
     return "\n\n".join(parts)
 
 
+_TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
+
+
+def _toolbox_listing(project_path: str) -> str:
+    """Summarise available dynamic tools across all three toolbox directories."""
+    def _scan(d: pathlib.Path) -> list[str]:
+        if not d.is_dir():
+            return []
+        names: list[str] = []
+        for f in sorted(d.glob("*.py")):
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            if "TOOL_SCHEMA" not in text:
+                continue
+            m = _TOOL_NAME_RE.search(text)
+            names.append(m.group(1) if m else f.stem)
+        return names
+
+    bundled = pathlib.Path(__file__).parent.parent / "toolbox"
+    global_box = G.GLOBAL_TOOLS_DIR
+    project_box = pathlib.Path(project_path) / "tools"
+
+    lines = ["Toolbox (dynamic tools available to you):"]
+    for label, path in [
+        ("bundled toolbox/", bundled),
+        ("global ~/.michael/toolbox/", global_box),
+        ("project tools/", project_box),
+    ]:
+        names = _scan(path)
+        entry = ", ".join(names) if names else "(empty)"
+        lines.append(f"  {label}: {entry}")
+    lines.append(
+        "  Write a .py file to project tools/ or ~/.michael/toolbox/ "
+        "exporting TOOL_SCHEMA + a callable to add a new tool."
+    )
+    return "\n".join(lines)
+
+
 def build_header(
     project: "Project",
     system_prompt: str,
@@ -242,12 +283,16 @@ def build_header(
     actions = _action_log_lines(project)
     snap = filesystem_snapshot(pathlib.Path(project.path))
     protocol = build_protocol()
+    toolbox = _toolbox_listing(project.path)
 
     parts = [
         system_prompt,
         "",
         "=== H4: Protocol ===",
         protocol,
+        "",
+        "=== Toolbox ===",
+        toolbox,
         "",
     ]
     if scripture:
