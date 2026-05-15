@@ -183,6 +183,8 @@ def _run_agent_loop(
                     targs = json.loads(tc.arguments or "{}")
                 except json.JSONDecodeError:
                     targs = {}
+                if tc.name in ("write_file", "apply_patch") and "path" in targs:
+                    G.console.print(f"[dim]  → {targs['path']}[/]")
                 result = dispatch_tool_call(
                     tc.name, targs, project, cfg, backend, pending
                 )
