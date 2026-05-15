@@ -414,7 +414,7 @@ def cmd_gpu_up() -> None:
             )
 
     # ── Install vLLM if missing ──
-    cp = _gpu_ssh_run(gpu, "python3 -c 'import vllm' 2>/dev/null && echo installed || echo missing")
+    cp = _gpu_ssh_run(gpu, "python3 -c 'import vllm' 2>/dev/null && echo installed || echo missing", timeout=60)
     if "missing" in cp.stdout:
         G.console.print("[cyan]Installing vLLM (grab a coffee, this takes a few minutes)…[/]")
         rc = _gpu_ssh_stream(gpu, "pip install vllm --quiet --upgrade", timeout=900)
