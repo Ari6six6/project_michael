@@ -80,14 +80,52 @@ app.add_typer(tools_app, name="tools")
 # ---------------------------------------------------------------------------
 
 
+_SHELL_MARKER = "# michael shell integration"
+_SHELL_LINES = (
+    "\n{marker}\n"
+    "export PATH=\"{bin}:$PATH\"\n"
+    "mcd() {{ cd \"$(michael path)\"; }}\n"
+)
+
+
+def _shell_profile() -> Optional[pathlib.Path]:
+    shell = os.environ.get("SHELL", "")
+    home = pathlib.Path.home()
+    if "zsh" in shell:
+        return home / ".zshrc"
+    if "bash" in shell:
+        for name in (".bashrc", ".bash_profile"):
+            p = home / name
+            if p.is_file():
+                return p
+        return home / ".bashrc"
+    return None
+
+
+def _inject_shell_integration() -> str:
+    profile = _shell_profile()
+    if profile is None:
+        return "[yellow]unknown shell — add manually:[/]\n  export PATH=\"{bin}:$PATH\"\n  mcd() {{ cd \"$(michael path)\"; }}".format(bin=G.MICHAEL_BIN_DIR)
+    text = profile.read_text() if profile.is_file() else ""
+    if _SHELL_MARKER in text:
+        return f"[dim]shell integration already in {profile}[/]"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    with profile.open("a") as f:
+        f.write(_SHELL_LINES.format(marker=_SHELL_MARKER, bin=G.MICHAEL_BIN_DIR))
+    return f"[green]wrote shell integration → {profile}[/]\n[dim]run: source {profile}[/]"
+
+
 def cmd_init() -> None:
     G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
     if not G.GLOBAL_CONFIG_PATH.is_file():
         make_stub_config().save()
         G.console.print(f"[green]wrote stub[/] {G.GLOBAL_CONFIG_PATH}")
     else:
         G.console.print(f"[dim]config exists[/] {G.GLOBAL_CONFIG_PATH}")
     append_event("config.loaded", {"path": str(G.GLOBAL_CONFIG_PATH)})
+    shell_msg = _inject_shell_integration()
+    G.console.print(shell_msg)
     G.console.print(
         Panel(
             "Edit ~/.michael/config.json — fill in:\n\n"
@@ -105,6 +143,25 @@ def cmd_init() -> None:
             border_style="green",
         )
     )
+
+
+def cmd_upgrade() -> None:
+    repo_dir = pathlib.Path(__file__).parent.parent
+    if not (repo_dir / ".git").is_dir():
+        raise G.MichaelError(f"not a git repo: {repo_dir}")
+    G.console.print(f"[dim]pulling {repo_dir}…[/]")
+    cp = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        raise G.MichaelError(f"git pull failed:\n{cp.stderr.strip()}")
+    G.console.print(f"[green]{cp.stdout.strip() or 'already up to date'}[/]")
+    shell_msg = _inject_shell_integration()
+    G.console.print(shell_msg)
 
 
 def cmd_show() -> None:
@@ -892,8 +949,14 @@ def cmd_tools_show(name: str) -> None:
 
 @app.command(name="init")
 def init_cmd() -> None:
-    """Write a stub config file if missing. Idempotent."""
+    """Write stub config, create workbench dirs, inject shell integration. Idempotent."""
     cmd_init()
+
+
+@app.command(name="upgrade")
+def upgrade_cmd() -> None:
+    """git pull the michael repo and re-run shell integration."""
+    cmd_upgrade()
 
 
 @app.command(name="show")
@@ -1186,13 +1249,16 @@ def dispatch_repl(line: str) -> None:
             "  path                              print active project workspace path\n"
             "  deliver                           detect + install active project's deliverable\n"
             "  config                            edit config\n"
-            "  init                              initialize config\n"
+            "  init                              initialize config + shell integration\n"
+            "  upgrade                           git pull + re-apply shell integration\n"
             "  exit / quit                       exit michael"
         )
         return
 
     if cmd == "init":
         cmd_init()
+    elif cmd == "upgrade":
+        cmd_upgrade()
     elif cmd == "config":
         cmd_config()
     elif cmd == "project":
