@@ -1,6 +1,28 @@
 # Recon Protocol: Target Modeling
 
-## The Core Distinction
+## Init Commands
+
+These are recognized prompt triggers that launch prefab recon workflows.
+Parse the domain from the prompt, then follow the steps exactly.
+
+**`init_recon_passive @ <domain>`**
+1. `read_file("targets/<domain>.md")` if it exists
+2. Call `recon_passive(domain="<domain>")`
+3. Merge findings into the canonical template → `write_file("targets/<domain>.md", ...)`
+4. `commit_changes(summary="passive recon: <domain>")`
+
+**`init_recon_full @ <domain>`**
+1. `read_file("targets/<domain>.md")` if it exists
+2. Extract authorization from the user's prompt context ("it's my system", "I own this", etc.)
+3. Call `recon_full(domain="<domain>", authorized_by="<extracted auth>")`
+4. Merge findings into the canonical template → `write_file("targets/<domain>.md", ...)`
+5. Call `source_map` for any detected software versions
+6. `commit_changes(summary="full recon: <domain>")`
+
+No `michael new` needed for recon — use an existing recon project or create one once.
+The target model in `targets/<domain>.md` IS the persistent artifact. H2 picks it up every run.
+
+---
 
 H3 (the causal chain) tells you what tools ran and what they returned. It is a log — immutable, append-only, and truncated to brief excerpts after the first view. It is not a model.
 
