@@ -433,10 +433,10 @@ def cmd_gpu_up() -> None:
     if already_ready:
         flag_check = _gpu_ssh_run(
             gpu,
-            f"ps aux | grep 'vllm serve' | grep -v grep | grep 'enable-auto-tool-choice' | grep -c 'max-model-len {gpu.vllm_max_model_len}' 2>/dev/null || echo 0",
+            f"ps aux | grep 'vllm serve' | grep -v grep | grep 'enable-auto-tool-choice' | grep -q 'max-model-len {gpu.vllm_max_model_len}'",
             timeout=10,
         )
-        if flag_check.stdout.strip() == "0":
+        if flag_check.returncode != 0:
             G.console.print("[yellow]vLLM running with wrong flags — restarting...[/]")
             needs_restart = True
 
