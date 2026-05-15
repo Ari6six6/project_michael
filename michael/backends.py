@@ -388,7 +388,7 @@ class _Completions:
         stream_options: Optional[dict] = None,
         **_kw: Any,
     ) -> Any:
-        body: dict[str, Any] = {"model": model, "messages": messages, "stream": stream, "chat_template_kwargs": {"enable_thinking": True}}
+        body: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
         if tools:
             body["tools"] = tools
         if tool_choice is not None:
