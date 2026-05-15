@@ -159,8 +159,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "run_in_sandbox",
             "description": (
-                "Run Python code in an isolated podman sandbox: no network, "
-                "read-only mount, dropped caps. Requires user confirmation."
+                "Run Python code in an isolated podman sandbox: NO network access, "
+                "read-only mount, dropped caps. Requires user confirmation. "
+                "Do NOT use this for anything that needs internet (HTTP requests, "
+                "APIs, web scraping) — use run_shell instead for those."
             ),
             "parameters": {
                 "type": "object",
@@ -175,6 +177,8 @@ TOOLS: list[dict[str, Any]] = [
             "name": "run_shell",
             "description": (
                 "Run a shell command in the project workspace (NOT sandboxed). "
+                "Has full network access — use this for curl, wget, API calls, "
+                "web requests, or any command needing the internet. "
                 "Requires user confirmation."
             ),
             "parameters": {
@@ -190,19 +194,42 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "commit_changes",
+            "description": (
+                "Commit all staged file changes to the project workspace. "
+                "Call this when your work is complete and you are satisfied with the result. "
+                "This is the ONLY way to apply staged write_file / apply_patch calls — "
+                "nothing is written to disk until you call commit_changes. "
+                "Do not call it unless the goal is fully met."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief description of what was done and why.",
+                    }
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_tools",
             "description": (
-                "Search the personal tool body — all tools ever built by Michael in prior projects. "
-                "Returns matching tool slugs, run commands, and install paths. "
-                "Call this before building anything to check if a similar tool already exists. "
-                "Auto-executes."
+                "Search the tool catalog for previously built and delivered tools by keyword. "
+                "Returns matching tool names, descriptions, and run commands. "
+                "Auto-executes — use this before building a new tool to check if one already "
+                "exists that meets your needs."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keyword(s) to search for in tool slugs and names.",
+                        "description": "Keyword(s) to search for in tool names, descriptions, and tags.",
                     }
                 },
                 "required": ["query"],
@@ -214,54 +241,70 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "forge_tool",
             "description": (
-                "Create a new dynamic tool as a Python file in this project's tools/ directory. "
-                "The tool is available to every room in the NEXT cycle. "
-                "Use in Room 3 (Teleology) to define helpers needed in Room 2 of the next cycle. "
-                "The name must be a valid Python identifier (snake_case). "
-                "The parameters field must be a JSON Schema object with a 'properties' key. "
-                "The code field is the Python function body — receives **kwargs, must return str."
+                "Create a new dynamic tool mid-run by writing a .py file to the project's "
+                "tools/ directory. The tool is immediately available for use in subsequent turns "
+                "without restarting. The file must export TOOL_SCHEMA (an OpenAI function schema "
+                "dict) and a callable with the same name as the tool. Auto-executes."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Snake_case tool name. Used as the function and file name.",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "What the tool does (written into its schema).",
-                    },
-                    "parameters": {
-                        "type": "object",
-                        "description": "JSON Schema 'object' with 'properties' describing arguments.",
+                        "description": "Tool name in snake_case, must match the callable name.",
                     },
                     "code": {
                         "type": "string",
-                        "description": (
-                            "Python function body. Receives **kwargs matching parameters. "
-                            "Must return a string. Do not include the def line."
-                        ),
+                        "description": "Full Python source. Must define TOOL_SCHEMA and a callable.",
                     },
                 },
-                "required": ["name", "description", "parameters", "code"],
+                "required": ["name", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch the content of a URL and return the response body as text. "
+                "Useful for reading documentation, APIs, raw files, or any web resource. "
+                "Responses larger than 100 KB are truncated. Auto-executes — no confirmation needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch.",
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "HEAD"],
+                        "description": "HTTP method (default: GET).",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers as key-value pairs.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional request body (for POST).",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Request timeout in seconds (default: 15).",
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
 ]
 
-# ---------------------------------------------------------------------------
-# Room-scoped tool subsets
-# ---------------------------------------------------------------------------
-
-_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory", "search_tools"}
-_PLANNING_TOOL_NAMES  = {
-    "read_file", "list_dir", "search_memory", "search_tools",
-    "write_file", "apply_patch", "forge_tool",
-}
-
-TOOLS_READ_ONLY = [t for t in TOOLS if t["function"]["name"] in _READ_ONLY_TOOL_NAMES]
-TOOLS_PLANNING  = [t for t in TOOLS if t["function"]["name"] in _PLANNING_TOOL_NAMES]
+# Sentinel returned by dispatch_tool_call when commit_changes fires, so the
+# agent loop knows to exit immediately.
+COMMIT_SENTINEL = "__COMMITTED__"
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +343,9 @@ def _summary_for(name: str, args: dict[str, Any]) -> str:
 def _format_proc_result(cp: subprocess.CompletedProcess) -> str:
     out = [f"rc={cp.returncode}"]
     if cp.stdout:
-        out.append(f"stdout (truncated):\n{cp.stdout[-2000:]}")
+        out.append(f"stdout (first 2000 chars):\n{cp.stdout[:2000]}")
     if cp.stderr:
-        out.append(f"stderr (truncated):\n{cp.stderr[-1000:]}")
+        out.append(f"stderr (first 500 chars):\n{cp.stderr[:500]}")
     return "\n".join(out)
 
 
@@ -324,7 +367,7 @@ def _stage_project(project: Project) -> pathlib.Path:
     src = pathlib.Path(project.path).resolve()
     if not src.is_dir():
         raise G.MichaelError(f"project root does not exist: {src}")
-    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-", dir="/tmp"))
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-"))
     dst = parent / src.name
     shutil.copytree(src, dst, ignore=_stage_ignore, symlinks=False)
     return dst
@@ -661,80 +704,6 @@ def _search_memory(project: Project, query: str, cfg: Config) -> str:
     )
 
 
-def _search_tools(query: str) -> str:
-    from michael.project import load_catalog
-    catalog = load_catalog()
-    if not catalog:
-        return "search_tools: tool body is empty — no tools built yet"
-    q = query.lower().strip()
-    matches = []
-    for slug, entry in sorted(catalog.items()):
-        haystack = f"{slug} {entry.get('name', '')} {entry.get('deliverable', '')}".lower()
-        if not q or q in haystack:
-            run_cmd = entry.get("run_cmd", "?")
-            installed = entry.get("installed_as", "")
-            note = f" [installed: {installed}]" if installed else ""
-            matches.append(f"  {slug}: {run_cmd}{note}")
-    if not matches:
-        return f"search_tools: no tools match {query!r}"
-    return f"search_tools: {len(matches)} match(es):\n" + "\n".join(matches)
-
-
-def _execute_forge_tool(args: dict[str, Any], project: Project) -> str:
-    tool_name = str(args.get("name", "")).strip()
-    description = str(args.get("description", "")).strip()
-    parameters = args.get("parameters", {})
-    code = str(args.get("code", "")).strip()
-
-    if not tool_name or not tool_name.isidentifier():
-        return f"forge_tool error: name must be a valid Python identifier, got {tool_name!r}"
-    if not description:
-        return "forge_tool error: description is required"
-    if not isinstance(parameters, dict):
-        return "forge_tool error: parameters must be a JSON Schema object dict"
-    if not code:
-        return "forge_tool error: code is required"
-
-    tools_dir = pathlib.Path(project.path) / "tools"
-    try:
-        tools_dir.mkdir(exist_ok=True)
-    except OSError as e:
-        return f"forge_tool error: cannot create tools/: {e}"
-
-    output_path = tools_dir / f"{tool_name}.py"
-    indented_code = "\n".join("    " + line for line in code.splitlines()) or "    pass"
-    schema_json = json.dumps(parameters, indent=4)
-    content = (
-        f'"""Dynamic tool: {tool_name} — created by forge_tool."""\n'
-        f"from __future__ import annotations\n"
-        f"from typing import Any\n\n"
-        f"TOOL_SCHEMA = {{\n"
-        f'    "type": "function",\n'
-        f'    "function": {{\n'
-        f'        "name": "{tool_name}",\n'
-        f'        "description": {json.dumps(description)},\n'
-        f'        "parameters": {schema_json},\n'
-        f"    }},\n"
-        f"}}\n\n\n"
-        f"def {tool_name}(**kwargs: Any) -> str:\n"
-        f"{indented_code}\n"
-    )
-    try:
-        output_path.write_text(content)
-    except OSError as e:
-        return f"forge_tool error: {e}"
-
-    append_event(
-        "tool.executed",
-        {"tool": "forge_tool", "summary": f"forged tool {tool_name!r} → {output_path}"},
-        project=project,
-    )
-    return (
-        f"forge_tool: wrote {output_path.relative_to(pathlib.Path(project.path))}. "
-        f"Tool '{tool_name}' will be available to all rooms in the next cycle."
-    )
-
-
 def execute_tool(
     name: str,
     args: dict[str, Any],
@@ -803,7 +772,91 @@ def execute_tool(
         return _search_memory(project, str(args.get("query", "")), cfg)
 
     if name == "search_tools":
-        return _search_tools(str(args.get("query", "")))
+        from michael.project import load_catalog
+        catalog = load_catalog()
+        if not catalog:
+            return "search_tools: catalog is empty — no tools have been delivered yet"
+        q = str(args.get("query", "")).lower().strip()
+        if not q:
+            return "search_tools: query must not be empty"
+        hits: list[str] = []
+        for slug, entry in sorted(catalog.items()):
+            desc = str(entry.get("description", "")).lower()
+            tags = " ".join(entry.get("tags", [])).lower()
+            if q in slug.lower() or q in desc or q in tags:
+                run_cmd = entry.get("run_cmd", "—")
+                installed = entry.get("installed_as")
+                display_cmd = installed if installed else run_cmd
+                hits.append(
+                    f"  {slug}: {entry.get('description', '(no description)')}\n"
+                    f"    run: {display_cmd}"
+                )
+        if not hits:
+            return f"search_tools: no matches for {q!r} in {len(catalog)} catalog entries"
+        return f"search_tools: {len(hits)} match(es) for {q!r}:\n" + "\n".join(hits)
+
+    if name == "forge_tool":
+        tool_name = str(args.get("name", "")).strip()
+        code = str(args.get("code", ""))
+        if not tool_name:
+            return "forge_tool: name is required"
+        if not code:
+            return "forge_tool: code is required"
+        tools_dir = pathlib.Path(project.path) / "tools"
+        tools_dir.mkdir(exist_ok=True)
+        target = tools_dir / f"{tool_name}.py"
+        try:
+            target.write_text(code)
+        except OSError as exc:
+            return f"forge_tool: failed to write {target}: {exc}"
+        import importlib.util as _ilu
+        try:
+            spec = _ilu.spec_from_file_location(tool_name, target)
+            mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            if not hasattr(mod, "TOOL_SCHEMA"):
+                return f"forge_tool: wrote {target} but TOOL_SCHEMA not found — tool will not auto-load"
+            if not callable(getattr(mod, tool_name, None)):
+                return f"forge_tool: wrote {target} but callable {tool_name!r} not found — dispatch will fail"
+        except Exception as exc:
+            return f"forge_tool: wrote {target} but validation failed: {exc}"
+        return f"forge_tool: {tool_name} created at {target} — available immediately in this run"
+
+    if name == "fetch_url":
+        import httpx
+
+        url = str(args.get("url", ""))
+        if not url:
+            return "error: url is required"
+        method = str(args.get("method", "GET")).upper()
+        headers = args.get("headers") or {}
+        body = args.get("body")
+        timeout_s = int(args.get("timeout_s", 15))
+        _MAX_RESPONSE_BYTES = 100_000
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout_s) as client:
+                resp = client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    content=body.encode() if isinstance(body, str) else None,
+                )
+        except httpx.TimeoutException:
+            return f"error: request timed out after {timeout_s}s"
+        except httpx.RequestError as exc:
+            return f"error: {exc}"
+        content_type = resp.headers.get("content-type", "")
+        try:
+            text = resp.text
+        except Exception:
+            text = resp.content.decode("utf-8", errors="replace")
+        truncated = len(text) > _MAX_RESPONSE_BYTES
+        body_out = text[:_MAX_RESPONSE_BYTES]
+        parts = [f"status: {resp.status_code}", f"content-type: {content_type}"]
+        if truncated:
+            parts.append(f"(truncated to {_MAX_RESPONSE_BYTES} bytes)")
+        parts.append(body_out)
+        return "\n".join(parts)
 
     return f"error: unknown tool {name}"
 
@@ -1029,6 +1082,7 @@ def execute_with_staging(
 
     mismatch = _check_expected(expected_list, delta)
     if mismatch:
+        _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
         append_event(
             "tool.delta_mismatch",
             {
@@ -1040,6 +1094,14 @@ def execute_with_staging(
             },
             project=project,
         )
+        return (
+            f"mismatch: prediction and reality diverge — {mismatch}.\n"
+            f"predicted: {sorted(expected_list)}\n"
+            f"actual:    added={delta['added']}  "
+            f"modified={delta['modified']}  removed={delta['removed']}\n"
+            "This call was rolled back. Correct expected_changes and re-propose."
+        )
+
     append_event(
         "tool.staged",
         {
@@ -1172,12 +1234,9 @@ def confirm_tool_call(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_dynamic_tool(name: str, args: dict[str, Any], project: Project) -> str:
-    """Load and call a tool script from <project>/tools/<name>.py."""
+def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: pathlib.Path) -> str:
+    """Load and call a tool script from the given py_file path."""
     import importlib.util as _ilu
-    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
-    if not py_file.exists():
-        return f"error: unknown tool {name!r} (not a built-in and not found in tools/)"
     try:
         spec = _ilu.spec_from_file_location(name, py_file)
         mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
@@ -1222,11 +1281,22 @@ def dispatch_tool_call(
         )
         return result
 
-    if name == "forge_tool":
-        return _execute_forge_tool(args, project)
-
     if name in ("write_file", "apply_patch"):
         return execute_with_staging(name, args, project, cfg, pending)
+
+    if name == "commit_changes":
+        summaries = commit_pending(project, pending)
+        if summaries:
+            for s in summaries:
+                G.console.print(f"[green]applied[/] {s['summary']}")
+        else:
+            G.console.print("[dim]no file changes staged[/]")
+        append_event(
+            "tool.executed",
+            {"tool": "commit_changes", "args": args, "summary": args.get("summary", "")},
+            project=project,
+        )
+        return COMMIT_SENTINEL
 
     # Dynamic tool invented by the agent (tools/<name>.py) — auto-executed, no confirmation.
     dynamic_result = _try_dynamic_dispatch(name, args, project)
@@ -1269,8 +1339,17 @@ def dispatch_tool_call(
 
 
 def _try_dynamic_dispatch(name: str, args: dict[str, Any], project: Project) -> Optional[str]:
-    """Return dynamic tool result if tools/<name>.py exists, else None."""
-    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
-    if not py_file.exists():
-        return None
-    return _dispatch_dynamic_tool(name, args, project)
+    """Return dynamic tool result if <name>.py exists in any dynamic tool dir, else None.
+
+    Search order (first found wins): project-local > user global > bundled.
+    """
+    search_dirs = [
+        pathlib.Path(project.path) / "tools",
+        pathlib.Path(G.GLOBAL_TOOLS_DIR),
+        pathlib.Path(__file__).parent.parent / "toolbox",
+    ]
+    for d in search_dirs:
+        py_file = d / f"{name}.py"
+        if py_file.exists():
+            return _dispatch_dynamic_tool_from_path(name, args, py_file)
+    return None

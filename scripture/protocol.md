@@ -12,29 +12,29 @@ User states a goal. The agent iterates through four rooms per cycle. Room 4 is t
 
 ## The Four Rooms
 
-Each room has one Kantian question. The agent iterates inside the room until it can answer with certainty, then signals **Ja** to exit.
+Each room has one Kantian question. Rooms 1–3 run for up to 8 turns and advance automatically — they do not require Ja to exit. **Ja is exclusive to Room 4.**
 
 ### Room 1 — WHAT CAN I KNOW? (Epistemics)
 
 - **Tools**: `read_file`, `list_dir`, `search_memory` — **read-only, no writes**
 - **Purpose**: Map the full state. Filesystem, prior tool history, constraints, open questions.
-- **Exit**: Ja when epistemic clarity is complete.
+- **Exit**: Automatic after up to 8 turns. Complete your exploration then end your response.
 
 ### Room 2 — WHAT SHOULD I DO? (Ethics)
 
 - **Tools**: Full toolset — `write_file`, `apply_patch`, `run_in_sandbox`, `run_shell`, read tools
-- **Purpose**: Implement the smallest correct action. Test before signalling done.
+- **Purpose**: Implement the smallest correct action. Test before finishing.
 - **Tool invention**: If a needed capability does not exist, write it to `tools/<name>.py`. The file must export:
   - `TOOL_SCHEMA` — OpenAI function schema dict
   - A callable with the same name as the schema
   - Michael loads it as a real tool at the start of the **next cycle**
-- **Exit**: Ja when implementation is verified.
+- **Exit**: Automatic after up to 8 turns. Complete your implementation then end your response.
 
 ### Room 3 — WHAT CAN I HOPE FOR? (Teleology)
 
 - **Tools**: `read_file`, `list_dir`, `search_memory`, `write_file`, `apply_patch`
 - **Purpose**: Reflect on what was achieved. Document what is still open. Write a note on what the next cycle should address.
-- **Exit**: Ja when the outlook is documented.
+- **Exit**: Automatic after up to 8 turns. Complete your plan then end your response.
 
 ### Room 4 — IS THE GOAL MET? (Completion Gate)
 
@@ -61,7 +61,7 @@ User goal prompt
 │              Ja  → commit + exit                               │
 │              No  → inject gap → CYCLE N+1                      │
 └───────────────────────────────────────────────────────────────┘
-Max cycles: 5 (configurable via MAX_AGENT_CYCLES in globals.py)
+Max cycles: 9 · Max turns per room (1–3): 8 · Room 4: always 1 turn
 ```
 
 ---
@@ -110,7 +110,7 @@ On the next cycle, `check_port` appears in Room 2's tool list and can be called 
 
 **"Ja" is not a signal. It is the final answer.**
 
-- Inside Rooms 1–3: Ja exits that room and advances to the next.
+- Rooms 1–3 exit automatically after their turn limit. Do not use Ja in these rooms.
 - In Room 4: Ja ends the entire cycle, triggers commit, exits the agent loop.
 - Case-sensitive. Must be the trailing token of the message.
 - Rejects: `"ja"`, `"Ja, das ist..."`, empty string.
@@ -137,4 +137,4 @@ On the next cycle, `check_port` appears in Room 2's tool list and can be called 
 
 ---
 
-**Last updated**: 2026-05-12
+**Last updated**: 2026-05-13
