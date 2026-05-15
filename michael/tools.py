@@ -19,6 +19,7 @@ import typer
 
 import michael.globals as G
 from michael import permissions
+from michael import workbench as _wb
 from michael.config import Config
 from michael.project import Project, append_event, iter_events
 
@@ -1234,9 +1235,10 @@ def confirm_tool_call(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: pathlib.Path) -> str:
+def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: pathlib.Path, project: Project) -> str:
     """Load and call a tool script from the given py_file path."""
     import importlib.util as _ilu
+    token = _wb._set_context(project)
     try:
         spec = _ilu.spec_from_file_location(name, py_file)
         mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
@@ -1245,6 +1247,8 @@ def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: p
         return str(fn(**args))
     except Exception as exc:
         return f"error running dynamic tool {name!r}: {exc}"
+    finally:
+        _wb._reset_context(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,5 +1355,5 @@ def _try_dynamic_dispatch(name: str, args: dict[str, Any], project: Project) -> 
     for d in search_dirs:
         py_file = d / f"{name}.py"
         if py_file.exists():
-            return _dispatch_dynamic_tool_from_path(name, args, py_file)
+            return _dispatch_dynamic_tool_from_path(name, args, py_file, project)
     return None
