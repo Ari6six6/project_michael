@@ -56,6 +56,7 @@ class GpuConfig:
     model_repo: str = "Qwen/Qwen2.5-72B-Instruct-AWQ"
     vllm_port: int = 8000
     vllm_api_key: str = ""
+    vllm_max_model_len: int = 32768
 
 
 @dataclass

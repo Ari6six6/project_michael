@@ -150,6 +150,12 @@ def _run_agent_loop(
                 )
             except httpx.HTTPStatusError as _exc:
                 if _exc.response.status_code == 400 and cfg.gpu.ssh_host:
+                    body = _exc.response.text
+                    if "context length" in body or "context window" in body:
+                        raise G.MichaelError(
+                            "Prompt exceeds vLLM context window — run `michael gpu up` to "
+                            "restart vLLM with a larger max-model-len, or reduce prompt size."
+                        )
                     G.console.print("[yellow]400 from vLLM — restarting with correct flags...[/]")
                     _restart_vllm_on_gpu(cfg.gpu)
                     client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
