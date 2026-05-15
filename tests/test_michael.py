@@ -49,9 +49,11 @@ def test_slugify_strips_specials():
     assert m.slugify("foo!@# bar/baz") == "foo-bar-baz"
 
 
-def test_slugify_empty_falls_back():
-    assert m.slugify("") == "project"
-    assert m.slugify("///") == "project"
+def test_slugify_empty_raises():
+    with pytest.raises(michael_globals.MichaelError):
+        m.slugify("")
+    with pytest.raises(michael_globals.MichaelError):
+        m.slugify("///")
 
 
 def test_slugify_truncates_to_64():

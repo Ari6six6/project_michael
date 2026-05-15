@@ -41,10 +41,13 @@ from michael.project import (
     Project,
     append_event,
     create_project,
+    detect_deliverable,
     get_active_project,
     get_active_slug,
     iter_events,
     list_projects,
+    load_catalog,
+    register_deliverable,
     replay_global,
     require_active_project,
     set_active_slug,
@@ -133,7 +136,7 @@ def cmd_new(name: Optional[str]) -> None:
     except G.MichaelError as e:
         G.err.print(str(e))
         return
-    default_path = pathlib.Path.home() / "projects" / slug_preview
+    default_path = G.WORKBENCH_DIR / "codebases" / slug_preview
     path_str = typer.prompt("path", default=str(default_path))
     path = pathlib.Path(path_str).expanduser().resolve()
     proj = create_project(name, path)
@@ -671,6 +674,88 @@ def cmd_ssh_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Catalog / install / deliver commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_catalog() -> None:
+    catalog = load_catalog()
+    if not catalog:
+        G.console.print("[dim]catalog is empty — deliver a tool first[/]")
+        return
+    table = Table(title=f"tool catalog ({len(catalog)} tools)", border_style="cyan")
+    table.add_column("slug", style="bold")
+    table.add_column("description")
+    table.add_column("installed", style="green")
+    table.add_column("built_at", style="dim")
+    for slug, entry in sorted(catalog.items()):
+        table.add_row(
+            slug,
+            str(entry.get("description", "—"))[:60],
+            str(entry.get("installed_as") or "—"),
+            str(entry.get("built_at", "—"))[:19],
+        )
+    G.console.print(table)
+
+
+def cmd_install(slug: Optional[str]) -> None:
+    catalog = load_catalog()
+    if not catalog:
+        raise G.MichaelError("catalog is empty — no tools to install")
+    if slug is None:
+        proj = get_active_project()
+        if not proj:
+            raise G.MichaelError("no active project and no slug given")
+        slug = proj.slug
+    entry = catalog.get(slug)
+    if not entry:
+        raise G.MichaelError(f"tool {slug!r} not found in catalog")
+    deliverable = entry.get("deliverable", "")
+    if not deliverable:
+        raise G.MichaelError(f"no deliverable path recorded for {slug!r}")
+    src = pathlib.Path(deliverable).expanduser()
+    if not src.is_file():
+        raise G.MichaelError(f"deliverable not found: {src}")
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    link = G.MICHAEL_BIN_DIR / slug
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(src)
+    if not src.stat().st_mode & 0o111:
+        src.chmod(src.stat().st_mode | 0o755)
+    run_cmd = str(link)
+    from michael.project import save_catalog
+    catalog[slug]["installed_as"] = str(link)
+    catalog[slug]["run_cmd"] = run_cmd
+    save_catalog(catalog)
+    G.console.print(
+        Panel(
+            f"[bold green]installed[/] {slug}\n"
+            f"  symlink: {link} → {src}\n\n"
+            f"Add to PATH:\n  export PATH=\"{G.MICHAEL_BIN_DIR}:$PATH\"",
+            title="michael install",
+            border_style="green",
+        )
+    )
+
+
+def cmd_deliver() -> None:
+    project = require_active_project()
+    det = detect_deliverable(project)
+    if not det:
+        raise G.MichaelError("no deliverable detected in this project (look for main.py, app.py, *.sh, etc.)")
+    deliverable, run_cmd = det
+    register_deliverable(project, deliverable, run_cmd)
+    G.console.print(
+        Panel(
+            f"[bold green]delivered[/] {deliverable}\nrun: [cyan]{run_cmd}[/]",
+            title="michael deliver",
+            border_style="green",
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tools workspace commands
 # ---------------------------------------------------------------------------
 
@@ -926,6 +1011,26 @@ def ssh_test_cmd() -> None:
     cmd_ssh_test()
 
 
+@app.command(name="catalog")
+def catalog_cmd() -> None:
+    """List all delivered tools in the global catalog."""
+    cmd_catalog()
+
+
+@app.command(name="install")
+def install_cmd(
+    slug: Optional[str] = typer.Argument(None, help="Tool slug to install (default: active project)."),
+) -> None:
+    """Symlink a delivered tool into ~/workbench/bin/ for PATH access."""
+    cmd_install(slug)
+
+
+@app.command(name="deliver")
+def deliver_cmd() -> None:
+    """Detect and register the active project's deliverable in the catalog."""
+    cmd_deliver()
+
+
 @tools_app.command(name="list")
 def tools_list_cmd() -> None:
     """List all dynamic tools across bundled, global, and project toolboxes."""
@@ -1062,6 +1167,9 @@ def dispatch_repl(line: str) -> None:
             "  tools list                        list all dynamic tools\n"
             "  tools run <name> [key=value ...]  run a dynamic tool directly\n"
             "  tools show <name>                 print tool source\n"
+            "  catalog                           list all delivered tools\n"
+            "  install [slug]                    symlink tool into ~/workbench/bin/\n"
+            "  deliver                           register active project's deliverable\n"
             "  config                            edit config\n"
             "  init                              initialize config\n"
             "  exit / quit                       exit michael"
@@ -1113,6 +1221,12 @@ def dispatch_repl(line: str) -> None:
                 cmd_tools_show(rest[1])
         else:
             G.err.print("usage: tools list | tools run <name> [key=value ...] | tools show <name>")
+    elif cmd == "catalog":
+        cmd_catalog()
+    elif cmd == "install":
+        cmd_install(rest[0] if rest else None)
+    elif cmd == "deliver":
+        cmd_deliver()
     else:
         G.err.print(f"unknown command: {cmd!r}. try 'help'.")
 

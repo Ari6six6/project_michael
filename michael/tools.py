@@ -217,6 +217,54 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search_tools",
+            "description": (
+                "Search the tool catalog for previously built and delivered tools by keyword. "
+                "Returns matching tool names, descriptions, and run commands. "
+                "Auto-executes — use this before building a new tool to check if one already "
+                "exists that meets your needs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword(s) to search for in tool names, descriptions, and tags.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forge_tool",
+            "description": (
+                "Create a new dynamic tool mid-run by writing a .py file to the project's "
+                "tools/ directory. The tool is immediately available for use in subsequent turns "
+                "without restarting. The file must export TOOL_SCHEMA (an OpenAI function schema "
+                "dict) and a callable with the same name as the tool. Auto-executes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tool name in snake_case, must match the callable name.",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Full Python source. Must define TOOL_SCHEMA and a callable.",
+                    },
+                },
+                "required": ["name", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
             "description": (
                 "Fetch the content of a URL and return the response body as text. "
@@ -722,6 +770,57 @@ def execute_tool(
 
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
+
+    if name == "search_tools":
+        from michael.project import load_catalog
+        catalog = load_catalog()
+        if not catalog:
+            return "search_tools: catalog is empty — no tools have been delivered yet"
+        q = str(args.get("query", "")).lower().strip()
+        if not q:
+            return "search_tools: query must not be empty"
+        hits: list[str] = []
+        for slug, entry in sorted(catalog.items()):
+            desc = str(entry.get("description", "")).lower()
+            tags = " ".join(entry.get("tags", [])).lower()
+            if q in slug.lower() or q in desc or q in tags:
+                run_cmd = entry.get("run_cmd", "—")
+                installed = entry.get("installed_as")
+                display_cmd = installed if installed else run_cmd
+                hits.append(
+                    f"  {slug}: {entry.get('description', '(no description)')}\n"
+                    f"    run: {display_cmd}"
+                )
+        if not hits:
+            return f"search_tools: no matches for {q!r} in {len(catalog)} catalog entries"
+        return f"search_tools: {len(hits)} match(es) for {q!r}:\n" + "\n".join(hits)
+
+    if name == "forge_tool":
+        tool_name = str(args.get("name", "")).strip()
+        code = str(args.get("code", ""))
+        if not tool_name:
+            return "forge_tool: name is required"
+        if not code:
+            return "forge_tool: code is required"
+        tools_dir = pathlib.Path(project.path) / "tools"
+        tools_dir.mkdir(exist_ok=True)
+        target = tools_dir / f"{tool_name}.py"
+        try:
+            target.write_text(code)
+        except OSError as exc:
+            return f"forge_tool: failed to write {target}: {exc}"
+        import importlib.util as _ilu
+        try:
+            spec = _ilu.spec_from_file_location(tool_name, target)
+            mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            if not hasattr(mod, "TOOL_SCHEMA"):
+                return f"forge_tool: wrote {target} but TOOL_SCHEMA not found — tool will not auto-load"
+            if not callable(getattr(mod, tool_name, None)):
+                return f"forge_tool: wrote {target} but callable {tool_name!r} not found — dispatch will fail"
+        except Exception as exc:
+            return f"forge_tool: wrote {target} but validation failed: {exc}"
+        return f"forge_tool: {tool_name} created at {target} — available immediately in this run"
 
     if name == "fetch_url":
         import httpx

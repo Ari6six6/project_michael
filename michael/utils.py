@@ -241,11 +241,33 @@ def build_protocol() -> str:
         "  read_file(path)                                    auto-executes",
         "  list_dir(path='.')                                 auto-executes",
         "  search_memory(query)                               auto-executes",
+        "  search_tools(query)                                auto-executes; searches delivered tool catalog",
+        "  forge_tool(name, code)                             auto-executes; creates a tool in tools/ immediately",
+        "  fetch_url(url, method, headers, body)              auto-executes; HTTP fetch",
         "  run_in_sandbox(python_code)                        isolated podman, requires confirmation",
         "  run_shell(cmd, timeout_s=60)                       project workspace, requires confirmation",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
+
+
+def _tool_body_section() -> str:
+    """Summarize the global tool catalog for injection into the context header."""
+    from michael.project import load_catalog
+    catalog = load_catalog()
+    if not catalog:
+        return "Tool Body: (empty — no tools delivered yet)\nUse search_tools(query) to search when entries exist."
+    lines = ["Tool Body (tools you have built and delivered — consult before rebuilding):"]
+    for slug, entry in sorted(catalog.items()):
+        desc = entry.get("description", "(no description)")
+        installed = entry.get("installed_as")
+        run_cmd = entry.get("run_cmd", "—")
+        display_cmd = installed if installed else run_cmd
+        lines.append(f"  {slug}: {desc}")
+        lines.append(f"    run: {display_cmd}")
+    lines.append("")
+    lines.append("Use search_tools(query) to find a specific tool by keyword.")
+    return "\n".join(lines)
 
 
 def load_scripture(scripture_dir: str) -> str:
@@ -315,6 +337,8 @@ def build_header(
     protocol = build_protocol()
     toolbox = _toolbox_listing(project.path)
 
+    tool_body = _tool_body_section()
+
     parts = [
         system_prompt,
         "",
@@ -323,6 +347,9 @@ def build_header(
         "",
         "=== Toolbox ===",
         toolbox,
+        "",
+        "=== Tool Body ===",
+        tool_body,
         "",
     ]
     if scripture:

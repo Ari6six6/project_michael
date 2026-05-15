@@ -20,6 +20,8 @@ from michael.backends import (
 )
 from michael.config import Config, ModelProfile
 from michael.project import Project, append_event
+import subprocess
+
 from michael.tools import (
     PendingChanges,
     TOOLS,
@@ -56,6 +58,23 @@ def _load_dynamic_tools(project_path: str) -> list[dict[str, Any]]:
             except Exception as exc:
                 G.err.print(f"[dim]dynamic tool load failed ({py_file.name}): {exc}[/]")
     return list(seen.values())
+
+
+def _probe_deliverable(project: Project, run_cmd: str) -> tuple[bool, str]:
+    """Run the deliverable with --help; return (success, output)."""
+    try:
+        cp = subprocess.run(
+            ["bash", "-c", f"{run_cmd} --help"],
+            cwd=project.path,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        out = (cp.stdout or "")[:500] + (cp.stderr or "")[:200]
+        return cp.returncode == 0, out
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _run_agent_loop(
@@ -198,7 +217,34 @@ def _run_agent_loop(
 
             if committed:
                 from rich.panel import Panel
-                G.console.print(Panel("Done.", title="⚡ Committed", border_style="green"))
+                from michael.project import detect_deliverable, register_deliverable
+
+                det = detect_deliverable(project)
+                if det:
+                    deliverable, run_cmd = det
+                    ok, probe_out = _probe_deliverable(project, run_cmd)
+                    if ok:
+                        register_deliverable(project, deliverable, run_cmd)
+                        G.console.print(Panel(
+                            f"[bold]{deliverable}[/]\nrun: [cyan]{run_cmd}[/]\n\n[dim]{probe_out[:300]}[/]",
+                            title="⚡ Committed + Delivered",
+                            border_style="green",
+                        ))
+                        append_event(
+                            "tool.executed",
+                            {"tool": "deliver", "summary": f"delivered {deliverable}", "run_cmd": run_cmd},
+                            project=project,
+                        )
+                    else:
+                        G.console.print(Panel(
+                            f"[yellow]{deliverable}[/] — probe failed\n\n[dim]{probe_out[:400]}[/]\n\n"
+                            "Run [bold]michael run '<fix the issue>'[/] to repair and re-deliver.",
+                            title="⚡ Committed (verify failed)",
+                            border_style="yellow",
+                        ))
+                else:
+                    G.console.print(Panel("Done.", title="⚡ Committed", border_style="green"))
+
                 append_event(
                     "agent.ended", {"model": name, "committed": True, "turns": turn},
                     project=project,
