@@ -187,14 +187,78 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_tools",
+            "description": (
+                "Search the personal tool body — all tools ever built by Michael in prior projects. "
+                "Returns matching tool slugs, run commands, and install paths. "
+                "Call this before building anything to check if a similar tool already exists. "
+                "Auto-executes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword(s) to search for in tool slugs and names.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forge_tool",
+            "description": (
+                "Create a new dynamic tool as a Python file in this project's tools/ directory. "
+                "The tool is available to every room in the NEXT cycle. "
+                "Use in Room 3 (Teleology) to define helpers needed in Room 2 of the next cycle. "
+                "The name must be a valid Python identifier (snake_case). "
+                "The parameters field must be a JSON Schema object with a 'properties' key. "
+                "The code field is the Python function body — receives **kwargs, must return str."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Snake_case tool name. Used as the function and file name.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What the tool does (written into its schema).",
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "JSON Schema 'object' with 'properties' describing arguments.",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Python function body. Receives **kwargs matching parameters. "
+                            "Must return a string. Do not include the def line."
+                        ),
+                    },
+                },
+                "required": ["name", "description", "parameters", "code"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
 # Room-scoped tool subsets
 # ---------------------------------------------------------------------------
 
-_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory"}
-_PLANNING_TOOL_NAMES  = {"read_file", "list_dir", "search_memory", "write_file", "apply_patch"}
+_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory", "search_tools"}
+_PLANNING_TOOL_NAMES  = {
+    "read_file", "list_dir", "search_memory", "search_tools",
+    "write_file", "apply_patch", "forge_tool",
+}
 
 TOOLS_READ_ONLY = [t for t in TOOLS if t["function"]["name"] in _READ_ONLY_TOOL_NAMES]
 TOOLS_PLANNING  = [t for t in TOOLS if t["function"]["name"] in _PLANNING_TOOL_NAMES]
@@ -597,6 +661,80 @@ def _search_memory(project: Project, query: str, cfg: Config) -> str:
     )
 
 
+def _search_tools(query: str) -> str:
+    from michael.project import load_catalog
+    catalog = load_catalog()
+    if not catalog:
+        return "search_tools: tool body is empty — no tools built yet"
+    q = query.lower().strip()
+    matches = []
+    for slug, entry in sorted(catalog.items()):
+        haystack = f"{slug} {entry.get('name', '')} {entry.get('deliverable', '')}".lower()
+        if not q or q in haystack:
+            run_cmd = entry.get("run_cmd", "?")
+            installed = entry.get("installed_as", "")
+            note = f" [installed: {installed}]" if installed else ""
+            matches.append(f"  {slug}: {run_cmd}{note}")
+    if not matches:
+        return f"search_tools: no tools match {query!r}"
+    return f"search_tools: {len(matches)} match(es):\n" + "\n".join(matches)
+
+
+def _execute_forge_tool(args: dict[str, Any], project: Project) -> str:
+    tool_name = str(args.get("name", "")).strip()
+    description = str(args.get("description", "")).strip()
+    parameters = args.get("parameters", {})
+    code = str(args.get("code", "")).strip()
+
+    if not tool_name or not tool_name.isidentifier():
+        return f"forge_tool error: name must be a valid Python identifier, got {tool_name!r}"
+    if not description:
+        return "forge_tool error: description is required"
+    if not isinstance(parameters, dict):
+        return "forge_tool error: parameters must be a JSON Schema object dict"
+    if not code:
+        return "forge_tool error: code is required"
+
+    tools_dir = pathlib.Path(project.path) / "tools"
+    try:
+        tools_dir.mkdir(exist_ok=True)
+    except OSError as e:
+        return f"forge_tool error: cannot create tools/: {e}"
+
+    output_path = tools_dir / f"{tool_name}.py"
+    indented_code = "\n".join("    " + line for line in code.splitlines()) or "    pass"
+    schema_json = json.dumps(parameters, indent=4)
+    content = (
+        f'"""Dynamic tool: {tool_name} — created by forge_tool."""\n'
+        f"from __future__ import annotations\n"
+        f"from typing import Any\n\n"
+        f"TOOL_SCHEMA = {{\n"
+        f'    "type": "function",\n'
+        f'    "function": {{\n'
+        f'        "name": "{tool_name}",\n'
+        f'        "description": {json.dumps(description)},\n'
+        f'        "parameters": {schema_json},\n'
+        f"    }},\n"
+        f"}}\n\n\n"
+        f"def {tool_name}(**kwargs: Any) -> str:\n"
+        f"{indented_code}\n"
+    )
+    try:
+        output_path.write_text(content)
+    except OSError as e:
+        return f"forge_tool error: {e}"
+
+    append_event(
+        "tool.executed",
+        {"tool": "forge_tool", "summary": f"forged tool {tool_name!r} → {output_path}"},
+        project=project,
+    )
+    return (
+        f"forge_tool: wrote {output_path.relative_to(pathlib.Path(project.path))}. "
+        f"Tool '{tool_name}' will be available to all rooms in the next cycle."
+    )
+
+
 def execute_tool(
     name: str,
     args: dict[str, Any],
@@ -663,6 +801,9 @@ def execute_tool(
 
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
+
+    if name == "search_tools":
+        return _search_tools(str(args.get("query", "")))
 
     return f"error: unknown tool {name}"
 
@@ -1080,6 +1221,9 @@ def dispatch_tool_call(
             project=project,
         )
         return result
+
+    if name == "forge_tool":
+        return _execute_forge_tool(args, project)
 
     if name in ("write_file", "apply_patch"):
         return execute_with_staging(name, args, project, cfg, pending)

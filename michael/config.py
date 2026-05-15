@@ -70,6 +70,7 @@ class Config:
     log_responses: bool = True
     boot_poll_s: int = 10
     scripture_dir: str = "scripture"
+    workbench_root: str = "~/workbench"
 
     @classmethod
     def load(cls) -> "Config":

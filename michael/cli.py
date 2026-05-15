@@ -40,12 +40,16 @@ from michael.project import (
     Project,
     append_event,
     create_project,
+    detect_deliverable,
     get_active_project,
     get_active_slug,
     iter_events,
     list_projects,
+    load_catalog,
+    register_deliverable,
     replay_global,
     require_active_project,
+    save_catalog,
     set_active_slug,
     slugify,
 )
@@ -118,7 +122,9 @@ def cmd_new(name: Optional[str]) -> None:
     if not name:
         G.err.print("name is required")
         return
-    default_path = pathlib.Path.cwd() / slugify(name)
+    cfg = Config.load()
+    wb_root = pathlib.Path(cfg.workbench_root).expanduser()
+    default_path = wb_root / "codebases" / slugify(name)
     path_str = typer.prompt("path", default=str(default_path))
     path = pathlib.Path(path_str).expanduser().resolve()
     proj = create_project(name, path)
@@ -480,11 +486,33 @@ def cmd_ask(prompt: str) -> None:
     append_event("assistant.message", payload, project=project)
 
 
-def cmd_run(prompt: str) -> None:
+def cmd_run(prompt: str, no_verify: bool = False) -> None:
     project = require_active_project()
     cfg = Config.load()
     name, profile = cfg.get_model()
-    _run_agent_loop(project, cfg, name, profile, prompt, verb_label="run")
+
+    current_prompt = prompt
+    for attempt in range(G.MAX_VERIFY_RETRIES + 1):
+        result = _run_agent_loop(
+            project, cfg, name, profile, current_prompt, verb_label="run"
+        )
+        if no_verify or result is None:
+            break
+        verify_passed, error_output = result
+        if verify_passed:
+            break
+        remaining = G.MAX_VERIFY_RETRIES - attempt
+        if remaining <= 0:
+            G.err.print("[red]auto-verify: retry limit reached[/]")
+            break
+        G.console.print(
+            f"[yellow]auto-verify failed — retrying ({remaining} attempt(s) left)[/]"
+        )
+        current_prompt = (
+            f"AUTO-VERIFY FAILED. The deliverable did not run correctly.\n\n"
+            f"Error output:\n{error_output[:800]}\n\n"
+            "Fix the issue so the tool runs without errors, then signal Ja."
+        )
 
 
 def cmd_log(tail: int) -> None:
@@ -587,6 +615,79 @@ def cmd_sandbox(file: pathlib.Path, net: bool = False, timeout: int = 30) -> Non
     )
     if stderr_tail:
         G.console.print(Panel(stderr_tail, title="stderr", border_style="red"))
+
+
+def cmd_tools() -> None:
+    catalog = load_catalog()
+    if not catalog:
+        G.console.print("[dim](tool body is empty — build some tools first)[/]")
+        return
+    table = Table(title=f"tool body ({len(catalog)} tools)", border_style="cyan")
+    table.add_column("slug", style="bold")
+    table.add_column("deliverable")
+    table.add_column("run command")
+    table.add_column("installed at")
+    table.add_column("built")
+    for slug, entry in sorted(catalog.items()):
+        table.add_row(
+            slug,
+            entry.get("deliverable", "?"),
+            entry.get("run_cmd", "?"),
+            entry.get("installed_as") or "—",
+            (entry.get("built_at") or "?")[:19],
+        )
+    G.console.print(table)
+
+
+def cmd_install(slug: str) -> None:
+    catalog = load_catalog()
+    if slug not in catalog:
+        raise G.MichaelError(f"unknown tool: {slug!r} — run `michael tools` to list")
+    entry = catalog[slug]
+    run_cmd = entry.get("run_cmd", "")
+    deliverable = entry.get("deliverable", "")
+    if not deliverable:
+        raise G.MichaelError(f"no deliverable recorded for {slug!r}")
+
+    # Locate the actual file from the run_cmd
+    parts = run_cmd.split()
+    target_file = pathlib.Path(parts[-1]).expanduser().resolve() if parts else None
+    if not target_file or not target_file.is_file():
+        raise G.MichaelError(
+            f"deliverable file not found: {target_file}. "
+            "The project workspace may have moved."
+        )
+
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    link = G.MICHAEL_BIN_DIR / slug
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(target_file)
+    os.chmod(target_file, target_file.stat().st_mode | 0o111)
+
+    catalog[slug]["installed_as"] = str(link)
+    save_catalog(catalog)
+
+    G.console.print(f"[green]installed[/] {slug} → {link}")
+    path_str = str(G.MICHAEL_BIN_DIR)
+    G.console.print(
+        Panel(
+            f"[dim]Add to PATH if not already present:[/]\n"
+            f"  export PATH=\"{path_str}:$PATH\"",
+            border_style="dim",
+        )
+    )
+
+
+def cmd_deliver() -> None:
+    project = require_active_project()
+    found = detect_deliverable(project)
+    if not found:
+        G.console.print("[dim]no deliverable detected in project root[/]")
+        return
+    rel_path, run_cmd = found
+    register_deliverable(project, rel_path, run_cmd)
+    G.console.print(f"[green]registered[/] {project.slug}: {run_cmd}")
 
 
 def cmd_ssh_test() -> None:
@@ -696,6 +797,7 @@ def ask_cmd(
 @app.command(name="run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run_cmd(
     prompt: list[str] = typer.Argument(None, help="Prompt — every word after 'run' is the prompt."),
+    no_verify: bool = typer.Option(False, "--no-verify", help="Skip auto-verify after Ja."),
 ) -> None:
     """Run the agent on a prompt. Everything after 'run' is the prompt.
 
@@ -705,7 +807,27 @@ def run_cmd(
     if not text:
         G.err.print("michael run requires a prompt. Example: michael run fix the login bug")
         raise typer.Exit(1)
-    cmd_run(text)
+    cmd_run(text, no_verify=no_verify)
+
+
+@app.command(name="tools")
+def tools_cmd() -> None:
+    """List all tools in your personal tool body."""
+    cmd_tools()
+
+
+@app.command(name="install")
+def install_cmd(
+    slug: str = typer.Argument(..., help="Project slug of the tool to install."),
+) -> None:
+    """Install a built tool into ~/workbench/bin/ and symlink it."""
+    cmd_install(slug)
+
+
+@app.command(name="deliver")
+def deliver_cmd() -> None:
+    """Detect and register the deliverable in the active project without rebuilding."""
+    cmd_deliver()
 
 
 @app.command(name="log")
@@ -747,6 +869,7 @@ def ssh_test_cmd() -> None:
 
 REPL_COMMANDS = {
     "project", "new", "run", "up", "down", "config", "init",
+    "tools", "install", "deliver",
     "quit", "exit", "help",
 }
 
@@ -845,7 +968,10 @@ def dispatch_repl(line: str) -> None:
             "commands:\n"
             "  run <prompt>          run the agent on a prompt\n"
             "  project [slug]        select/list projects\n"
-            "  new [name]            create new project\n"
+            "  new [name]            create new project (defaults to ~/workbench/codebases/)\n"
+            "  tools                 list your tool body (all tools ever built)\n"
+            "  install <slug>        install a built tool into ~/workbench/bin/\n"
+            "  deliver               register deliverable in active project\n"
             "  up / down             start/stop GPU (legacy — needs config.json)\n"
             "  gpu up / gpu down     install vLLM, start model, print port-forward\n"
             "  config                edit config\n"
@@ -870,7 +996,18 @@ def dispatch_repl(line: str) -> None:
         if not rest:
             G.err.print("run requires a prompt. Example: run fix the auth bug")
             return
-        cmd_run(" ".join(rest))
+        no_verify = "--no-verify" in rest
+        words = [w for w in rest if w != "--no-verify"]
+        cmd_run(" ".join(words), no_verify=no_verify)
+    elif cmd == "tools":
+        cmd_tools()
+    elif cmd == "install":
+        if not rest:
+            G.err.print("install requires a slug. Example: install csv-splitter")
+            return
+        cmd_install(rest[0])
+    elif cmd == "deliver":
+        cmd_deliver()
     elif cmd == "up":
         cmd_up()
     elif cmd == "down":

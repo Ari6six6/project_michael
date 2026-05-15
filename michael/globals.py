@@ -20,6 +20,11 @@ STATE_FILE_PATH = STATE_DIR / "state.json"
 PROJECTS_DIR = STATE_DIR / "projects"
 REPL_HISTORY_PATH = STATE_DIR / "repl_history"
 GLOBAL_TOOLS_DIR = STATE_DIR / "toolbox"
+TOOLS_CATALOG_PATH = STATE_DIR / "tools_catalog.json"
+
+# Workbench — standard topology for built tools
+WORKBENCH_DIR = pathlib.Path.home() / "workbench"
+MICHAEL_BIN_DIR = WORKBENCH_DIR / "bin"
 
 # ---------------------------------------------------------------------------
 # Shared Rich consoles
@@ -45,7 +50,7 @@ SKIP_DIRS = {
 # Tool routing
 # ---------------------------------------------------------------------------
 
-AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory"}
+AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory", "search_tools"}
 
 # ---------------------------------------------------------------------------
 # Domain error
@@ -78,6 +83,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 MAX_AGENT_CYCLES = 9
+MAX_VERIFY_RETRIES = 3
 
 ROOMS: list[dict] = [
     {

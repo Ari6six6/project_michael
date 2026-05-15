@@ -249,6 +249,70 @@ def iter_events(path: pathlib.Path) -> list[dict[str, Any]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Tool catalog — global registry of delivered tools
+# ---------------------------------------------------------------------------
+
+
+def load_catalog() -> dict[str, Any]:
+    """Load the global tools catalog from disk."""
+    if not G.TOOLS_CATALOG_PATH.is_file():
+        return {}
+    try:
+        return json.loads(G.TOOLS_CATALOG_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_catalog(catalog: dict[str, Any]) -> None:
+    G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    G.TOOLS_CATALOG_PATH.write_text(json.dumps(catalog, indent=2, sort_keys=True))
+
+
+def detect_deliverable(project: "Project") -> Optional[tuple[str, str]]:
+    """Return (rel_path, run_cmd) for the best deliverable in the project, or None."""
+    root = pathlib.Path(project.path)
+    if not root.is_dir():
+        return None
+
+    for name in ("main.py", "app.py", "cli.py", "tool.py", "__main__.py"):
+        f = root / name
+        if f.is_file():
+            return name, f"python {f}"
+
+    for f in sorted(root.glob("*.py")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        if any(tok in text for tok in ("typer", "click", "argparse", "__main__")):
+            return f.name, f"python {f}"
+
+    for f in sorted(root.glob("*.sh")):
+        return f.name, f"bash {f}"
+
+    for f in sorted(root.iterdir()):
+        if f.is_file() and os.access(f, os.X_OK) and not f.name.startswith("."):
+            return f.name, str(f)
+
+    return None
+
+
+def register_deliverable(project: "Project", deliverable: str, run_cmd: str) -> None:
+    """Register the project's deliverable in the global catalog."""
+    catalog = load_catalog()
+    existing = catalog.get(project.slug, {})
+    catalog[project.slug] = {
+        "slug": project.slug,
+        "name": project.name,
+        "deliverable": deliverable,
+        "run_cmd": run_cmd,
+        "installed_as": existing.get("installed_as"),
+        "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    save_catalog(catalog)
+
+
 def replay_global() -> dict[str, Any]:
     """Pure fold over the global event log → per-profile state."""
     state: dict[str, Any] = {

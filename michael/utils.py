@@ -288,11 +288,30 @@ def build_protocol() -> str:
         "  read_file(path)                                    auto-executes",
         "  list_dir(path='.')                                 auto-executes",
         "  search_memory(query)                               auto-executes, searches past reasoning and tool results",
+        "  search_tools(query)                                auto-executes, searches all tools you have ever built",
+        "  forge_tool(name, description, parameters, code)   creates a new tool in tools/, available next cycle",
         "  run_in_sandbox(python_code)                        isolated podman, no network",
         "  run_shell(cmd, timeout_s=60)                       runs in the project workspace",
         "",
         "All paths are relative to the project root. Do not escape with '..'.",
     ])
+
+
+def _tool_body_section() -> str:
+    """Format the global tool catalog as a context section for the LLM."""
+    from michael.project import load_catalog
+    catalog = load_catalog()
+    if not catalog:
+        return ""
+    lines = [f"## Tool Body — {len(catalog)} tool(s) built in prior projects"]
+    for slug, entry in sorted(catalog.items()):
+        run_cmd = entry.get("run_cmd", "?")
+        installed = entry.get("installed_as", "")
+        note = f" [installed: {installed}]" if installed else ""
+        lines.append(f"  {slug}: {run_cmd}{note}")
+    lines.append("")
+    lines.append("Use search_tools(query) to find by keyword. Reuse before rebuilding.")
+    return "\n".join(lines)
 
 
 def load_scripture(scripture_dir: str) -> str:
@@ -332,6 +351,13 @@ def build_header(
         parts += [
             "=== Scripture ===",
             scripture,
+            "",
+        ]
+    tool_body = _tool_body_section()
+    if tool_body:
+        parts += [
+            "=== Tool Body (tools built in prior projects) ===",
+            tool_body,
             "",
         ]
     parts += [

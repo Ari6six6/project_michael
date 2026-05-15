@@ -4,7 +4,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
-from typing import Any
+import subprocess
+from typing import Any, Optional
 
 import michael.globals as G
 from michael.backends import (
@@ -15,7 +16,9 @@ from michael.backends import (
     make_backend,
 )
 from michael.config import Config, ModelProfile
-from michael.project import Project, append_event
+from michael.project import (
+    Project, append_event, detect_deliverable, register_deliverable,
+)
 from michael.tools import (
     PendingChanges,
     TOOLS,
@@ -29,6 +32,20 @@ from michael.utils import build_header, load_scripture
 
 # Kept for backwards-compatibility with imports in main.py
 _NUDGE_NO_JA = "Keep going. Signal Ja only when the job is done."
+
+
+def _probe_deliverable(run_cmd: str, project_path: str) -> tuple[bool, str]:
+    """Probe the deliverable with --help. Returns (passed, output)."""
+    probe = f"cd {pathlib.Path(project_path)} && {run_cmd} --help 2>&1"
+    try:
+        cp = subprocess.run(
+            ["bash", "-c", probe],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "probe timed out after 15s"
+    output = (cp.stdout + cp.stderr).strip()
+    return cp.returncode == 0, output
 
 
 def _load_dynamic_tools(project_path: str) -> list[dict[str, Any]]:
@@ -142,9 +159,12 @@ def _run_agent_loop(
     prompt: str,
     *,
     verb_label: str = "run",
-) -> None:
-    """Run one prompt through the four-room Kantian cycle. Iterates until Room 4
-    confirms the goal is met, then auto-commits all staged changes and returns."""
+) -> Optional[tuple[bool, str]]:
+    """Run one prompt through the four-room Kantian cycle.
+
+    Returns (verify_passed, error_output) when Ja fires, or None if aborted/failed.
+    verify_passed=True means no deliverable was found or the probe succeeded.
+    """
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
 
@@ -234,7 +254,7 @@ def _run_agent_loop(
                 "agent.aborted", {"cycle": cycle_num}, project=project
             )
             append_event("agent.ended", {"model": name, "aborted": True}, project=project)
-            return
+            return None
         except Exception as exc:
             G.err.print(f"LLM error: {exc}")
             append_event(
@@ -244,7 +264,7 @@ def _run_agent_loop(
             )
             pending.discard()
             append_event("agent.ended", {"model": name, "ja": False}, project=project)
-            return
+            return None
 
         if G._message_ends_with_ja(gate_content):
             from rich.panel import Panel
@@ -255,12 +275,55 @@ def _run_agent_loop(
                     G.console.print(f"[green]applied[/] {s['summary']}")
             else:
                 G.console.print("[dim]no file changes staged[/]")
-            append_event(
-                "agent.ended",
-                {"model": name, "ja": True, "cycles": cycle_num},
-                project=project,
-            )
-            return
+
+            # Detect deliverable, register in catalog, probe it
+            found = detect_deliverable(project)
+            if found:
+                rel_path, run_cmd = found
+                register_deliverable(project, rel_path, run_cmd)
+                G.console.print(
+                    Panel(
+                        f"[bold]{rel_path}[/]\n[dim]run:[/] [cyan]{run_cmd}[/]",
+                        title="📦 Delivered",
+                        border_style="blue",
+                    )
+                )
+                probe_passed, probe_output = _probe_deliverable(run_cmd, project.path)
+                if probe_passed:
+                    G.console.print(
+                        Panel(
+                            probe_output[:600] or "(no output)",
+                            title="✓ Auto-verify passed",
+                            border_style="green",
+                        )
+                    )
+                    append_event(
+                        "agent.ended",
+                        {"model": name, "ja": True, "cycles": cycle_num, "verify": "passed"},
+                        project=project,
+                    )
+                    return True, ""
+                else:
+                    G.console.print(
+                        Panel(
+                            probe_output[:600] or "(no output)",
+                            title="✗ Auto-verify failed",
+                            border_style="yellow",
+                        )
+                    )
+                    append_event(
+                        "agent.ended",
+                        {"model": name, "ja": True, "cycles": cycle_num, "verify": "failed"},
+                        project=project,
+                    )
+                    return False, probe_output
+            else:
+                append_event(
+                    "agent.ended",
+                    {"model": name, "ja": True, "cycles": cycle_num},
+                    project=project,
+                )
+                return True, ""
 
         G.console.print(
             f"[yellow]· cycle {cycle_num}: goal not yet met — "
@@ -293,3 +356,4 @@ def _run_agent_loop(
         {"model": name, "ja": False, "cycles": G.MAX_AGENT_CYCLES, "blocked_on": gate_content},
         project=project,
     )
+    return None
