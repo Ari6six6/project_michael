@@ -50,7 +50,8 @@ from michael.project import (
     set_active_slug,
     slugify,
 )
-from michael.tools import TOOLS, _list_trash, _undo_one
+from michael.agent import _load_dynamic_tools
+from michael.tools import TOOLS, _list_trash, _undo_one, _dispatch_dynamic_tool_from_path
 from michael.utils import (
     build_header,
     load_scripture,
@@ -66,6 +67,9 @@ app = typer.Typer(
 
 gpu_app = typer.Typer(help="GPU instance management (A100 / vLLM).")
 app.add_typer(gpu_app, name="gpu")
+
+tools_app = typer.Typer(help="Inspect and run dynamic tools.")
+app.add_typer(tools_app, name="tools")
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +671,127 @@ def cmd_ssh_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tools workspace commands
+# ---------------------------------------------------------------------------
+
+_TOOL_DIR_LABELS = [
+    ("bundled", pathlib.Path(__file__).parent.parent / "toolbox"),
+    ("global",  pathlib.Path(G.GLOBAL_TOOLS_DIR)),
+]
+
+
+def _tool_search_dirs(project_path: str | None) -> list[tuple[str, pathlib.Path]]:
+    dirs = list(_TOOL_DIR_LABELS)
+    if project_path:
+        dirs.append(("project", pathlib.Path(project_path) / "tools"))
+    return dirs
+
+
+def _parse_kv_args(tokens: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for token in tokens:
+        if "=" not in token:
+            raise typer.BadParameter(f"expected key=value, got {token!r}")
+        k, _, v = token.partition("=")
+        try:
+            out[k] = json.loads(v)
+        except json.JSONDecodeError:
+            out[k] = v
+    return out
+
+
+def _find_tool_file(name: str, project_path: str | None) -> pathlib.Path | None:
+    # Project-local takes priority, then global, then bundled.
+    search = list(reversed(_tool_search_dirs(project_path)))
+    for _label, d in search:
+        candidate = d / f"{name}.py"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def cmd_tools_list() -> None:
+    project_path: str | None = None
+    try:
+        project_path = require_active_project().path
+    except G.MichaelError:
+        pass
+
+    import importlib.util as _ilu
+
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    # Reverse priority so highest-priority entry wins display
+    for label, d in reversed(_tool_search_dirs(project_path)):
+        if not d.is_dir():
+            continue
+        for py_file in sorted(d.glob("*.py")):
+            try:
+                spec = _ilu.spec_from_file_location(py_file.stem, py_file)
+                mod = _ilu.module_from_spec(spec)       # type: ignore[arg-type]
+                spec.loader.exec_module(mod)             # type: ignore[union-attr]
+                if not hasattr(mod, "TOOL_SCHEMA"):
+                    continue
+                fn_name = mod.TOOL_SCHEMA.get("function", {}).get("name", py_file.stem)
+                if fn_name in seen:
+                    continue
+                seen.add(fn_name)
+                desc = mod.TOOL_SCHEMA.get("function", {}).get("description", "")
+                desc = desc.strip().splitlines()[0][:72] if desc else ""
+                rows.append((fn_name, desc, label))
+            except Exception as exc:
+                G.err.print(f"[dim]skipped {py_file.name}: {exc}[/]")
+
+    if not rows:
+        G.console.print("[dim]no dynamic tools found[/]")
+        return
+
+    t = Table(show_header=True, header_style="bold", box=None, pad_edge=False, min_width=60)
+    t.add_column("Name", style="cyan", no_wrap=True)
+    t.add_column("Description", no_wrap=False)
+    t.add_column("Source", style="dim", no_wrap=True)
+    for name, desc, label in sorted(rows, key=lambda r: r[0]):
+        t.add_row(name, desc, label)
+    G.console.print(t)
+
+
+def cmd_tools_run(name: str, kv_tokens: list[str]) -> None:
+    project_path: str | None = None
+    try:
+        project_path = require_active_project().path
+    except G.MichaelError:
+        pass
+
+    py_file = _find_tool_file(name, project_path)
+    if py_file is None:
+        raise G.MichaelError(f"tool {name!r} not found in any toolbox directory")
+
+    try:
+        args = _parse_kv_args(kv_tokens)
+    except typer.BadParameter as e:
+        raise G.MichaelError(str(e)) from e
+
+    result = _dispatch_dynamic_tool_from_path(name, args, py_file)
+    G.console.print(result)
+
+
+def cmd_tools_show(name: str) -> None:
+    project_path: str | None = None
+    try:
+        project_path = require_active_project().path
+    except G.MichaelError:
+        pass
+
+    py_file = _find_tool_file(name, project_path)
+    if py_file is None:
+        raise G.MichaelError(f"tool {name!r} not found in any toolbox directory")
+
+    from rich.syntax import Syntax
+    G.console.print(f"[dim]{py_file}[/]")
+    G.console.print(Syntax(py_file.read_text(), "python", line_numbers=True))
+
+
+# ---------------------------------------------------------------------------
 # Typer command bindings
 # ---------------------------------------------------------------------------
 
@@ -801,13 +926,39 @@ def ssh_test_cmd() -> None:
     cmd_ssh_test()
 
 
+@tools_app.command(name="list")
+def tools_list_cmd() -> None:
+    """List all dynamic tools across bundled, global, and project toolboxes."""
+    cmd_tools_list()
+
+
+@tools_app.command(
+    name="run",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def tools_run_cmd(
+    name: str = typer.Argument(..., help="Tool name to invoke."),
+    ctx: typer.Context = typer.Option(None, hidden=True),
+) -> None:
+    """Run a dynamic tool by name. Pass arguments as key=value pairs."""
+    cmd_tools_run(name, ctx.args if ctx else [])
+
+
+@tools_app.command(name="show")
+def tools_show_cmd(
+    name: str = typer.Argument(..., help="Tool name to inspect."),
+) -> None:
+    """Print the source code of a dynamic tool."""
+    cmd_tools_show(name)
+
+
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 
 REPL_COMMANDS = {
     "project", "new", "run", "up", "down", "gpu", "config", "init",
-    "quit", "exit", "help",
+    "tools", "quit", "exit", "help",
 }
 
 
@@ -903,14 +1054,17 @@ def dispatch_repl(line: str) -> None:
     if cmd == "help":
         G.console.print(
             "commands:\n"
-            "  run <prompt>          run the agent on a prompt\n"
-            "  project [slug]        select/list projects\n"
-            "  new [name]            create new project\n"
-            "  up / down             start/stop GPU (legacy — needs config.json)\n"
-            "  gpu up / gpu down     start instance, install vLLM, serve model\n"
-            "  config                edit config\n"
-            "  init                  initialize config\n"
-            "  exit / quit           exit michael"
+            "  run <prompt>                      run the agent on a prompt\n"
+            "  project [slug]                    select/list projects\n"
+            "  new [name]                        create new project\n"
+            "  up / down                         start/stop GPU (legacy — needs config.json)\n"
+            "  gpu up / gpu down                 start instance, install vLLM, serve model\n"
+            "  tools list                        list all dynamic tools\n"
+            "  tools run <name> [key=value ...]  run a dynamic tool directly\n"
+            "  tools show <name>                 print tool source\n"
+            "  config                            edit config\n"
+            "  init                              initialize config\n"
+            "  exit / quit                       exit michael"
         )
         return
 
@@ -943,6 +1097,22 @@ def dispatch_repl(line: str) -> None:
             cmd_gpu_down()
         else:
             G.err.print("usage: gpu up | gpu down")
+    elif cmd == "tools":
+        sub = rest[0] if rest else "list"
+        if sub == "list":
+            cmd_tools_list()
+        elif sub == "run":
+            if len(rest) < 2:
+                G.err.print("usage: tools run <name> [key=value ...]")
+            else:
+                cmd_tools_run(rest[1], rest[2:])
+        elif sub == "show":
+            if len(rest) < 2:
+                G.err.print("usage: tools show <name>")
+            else:
+                cmd_tools_show(rest[1])
+        else:
+            G.err.print("usage: tools list | tools run <name> [key=value ...] | tools show <name>")
     else:
         G.err.print(f"unknown command: {cmd!r}. try 'help'.")
 
