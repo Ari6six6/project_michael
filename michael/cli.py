@@ -379,14 +379,9 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
         f"[bold]Using GPU:[/] {gname}  [dim](instance {gpu.vast_instance_id})[/]"
     )
 
-    # Build the vLLM startup command to send as an onstart script.
-    # Vast.ai runs this automatically when the instance boots.
-    onstart = _build_vllm_cmd(gpu)
-    G.console.print(f"[dim]onstart: {onstart[:80]}…[/]")
-
     vast = VastClient(cfg.vast_api_key)
     try:
-        vast.start(gpu.vast_instance_id, onstart=onstart)
+        vast.start(gpu.vast_instance_id)
     except G.MichaelError as e:
         if "404" in str(e):
             raise G.MichaelError(
@@ -397,9 +392,16 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
     finally:
         vast.close()
 
-    G.console.print("[dim]start requested — polling for vLLM endpoint…[/]")
+    vllm_cmd = _build_vllm_cmd(gpu)
+    G.console.print(
+        "[dim]start requested — polling for vLLM endpoint…[/]\n"
+        "[dim]Make sure port[/] [bold]8000[/] [dim]is open on the instance and your onstart script runs:[/]\n"
+        f"[dim]  {vllm_cmd[:100]}[/]"
+    )
 
-    # ── Poll Vast API until we have a public IP, then poll vLLM over HTTP ──
+    # ── Poll Vast API for the mapped external port, then ping vLLM over HTTP ──
+    # endpoint_for() resolves the external port from Vast's port-mapping table,
+    # so this works even if Vast NATs 8000 → some other external port.
     _max_wait_s = 5400  # 90 min (model download on first boot)
     _poll_s = 15
     _elapsed = 0
@@ -413,34 +415,30 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
 
         try:
             _vc = VastClient(cfg.vast_api_key)
-            inst = _vc.get(gpu.vast_instance_id)
+            ep = _vc.endpoint_for(gpu.vast_instance_id, gpu.vllm_port)
             _vc.close()
         except G.MichaelError:
             G.console.print(f"[dim]· {_elapsed}s — API unreachable, retrying…[/]")
             _poll_s = min(_poll_s * 2, 60)
             continue
 
-        public_ip = inst.get("public_ipaddr") or inst.get("ssh_host") or ""
-        actual_status = inst.get("actual_status") or inst.get("status") or "unknown"
-
-        if not public_ip:
-            G.console.print(f"[dim]· {_elapsed}s — waiting for IP (status: {actual_status})…[/]")
+        if not ep:
+            G.console.print(f"[dim]· {_elapsed}s — port {gpu.vllm_port} not mapped yet…[/]")
             continue
 
-        candidate = f"http://{public_ip}:{gpu.vllm_port}/v1"
-        if _ping_vllm(candidate, gpu.vllm_api_key, timeout_s=8.0):
-            endpoint = candidate
+        if _ping_vllm(ep, gpu.vllm_api_key, timeout_s=8.0):
+            endpoint = ep
             break
 
-        G.console.print(f"[dim]· {_elapsed}s — {public_ip}:{gpu.vllm_port} not ready yet (status: {actual_status})…[/]")
-        append_event("gpu.poll", {"elapsed_s": _elapsed, "attempt": _attempt, "ip": public_ip})
+        G.console.print(f"[dim]· {_elapsed}s — {ep} not ready yet…[/]")
+        append_event("gpu.poll", {"elapsed_s": _elapsed, "attempt": _attempt, "ep": ep})
         _poll_s = min(_poll_s * 2, 60)
 
     if not endpoint:
         raise G.MichaelError(
             f"vLLM did not become ready within {_max_wait_s}s.\n"
-            "Check the instance in Vast.ai console — look at the logs tab for errors.\n"
-            "Common causes: CUDA OOM, model download failed, or wrong model name."
+            "Check the Vast.ai console — confirm port 8000 is open and the onstart script is set.\n"
+            "Common causes: port not exposed, CUDA OOM, model download failed."
         )
 
     # ── Save endpoint ──
