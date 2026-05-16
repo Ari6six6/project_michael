@@ -81,6 +81,7 @@ def _run_room(
             tool_choice="auto",
             stream=False,
             timeout=float(profile.request_timeout_s),
+            enable_thinking=profile.enable_thinking,
         )
         msg = resp.choices[0].message
         content = msg.content or ""

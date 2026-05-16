@@ -386,9 +386,12 @@ class _Completions:
         stream: bool = False,
         timeout: float = 60.0,
         stream_options: Optional[dict] = None,
+        enable_thinking: bool = False,
         **_kw: Any,
     ) -> Any:
-        body: dict[str, Any] = {"model": model, "messages": messages, "stream": stream, "chat_template_kwargs": {"enable_thinking": True}}
+        body: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
+        if enable_thinking:
+            body["chat_template_kwargs"] = {"enable_thinking": True}
         if tools:
             body["tools"] = tools
         if tool_choice is not None:
