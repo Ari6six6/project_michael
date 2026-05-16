@@ -19,11 +19,31 @@ import typer
 
 import michael.globals as G
 from michael import permissions
+from michael import workbench as _wb
 from michael.config import Config
 from michael.project import Project, append_event, iter_events
 
 if TYPE_CHECKING:
     from michael.backends import SandboxBackend
+
+
+# ---------------------------------------------------------------------------
+# Tiny I/O helpers — silence expected OSError noise
+# ---------------------------------------------------------------------------
+
+
+def _safe_read(p: pathlib.Path) -> Optional[bytes]:
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+def _safe_unlink(p: pathlib.Path) -> None:
+    try:
+        p.unlink()
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -36,20 +56,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Overwrite (or create) a file anywhere on the Work FS. "
-                "Path may be absolute or relative to the project root; "
-                "parent dirs are created automatically. "
-                "Writing to ~/.michael/ (the Central FS) is blocked. "
-                "The change is applied to a staging copy first. "
-                "You MUST predict the resulting filesystem delta in "
-                "`expected_changes` (every path that will be added, modified, "
-                "or removed — use absolute paths for files outside the project "
-                "root). If reality diverges from your prediction, Michael "
-                "returns a mismatch error and the user is NOT prompted — "
-                "re-propose. If `verify` is provided, it runs in the staging "
-                "copy after the write; verify failures roll back this call. "
-                "If prediction matches and verify passes (or is omitted), the "
-                "user is shown the diff and asked to confirm."
+                "Write or overwrite a file on the Work FS (Central FS is blocked). "
+                "Requires expected_changes — your prediction of which paths change. "
+                "Mismatch with reality is returned as an error; re-propose. "
+                "Optional verify runs in staging; failure rolls back the call."
             ),
             "parameters": {
                 "type": "object",
@@ -106,10 +116,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "search_memory",
             "description": (
-                "Search past LLM responses stored in this project's event log for a "
-                "query string (case-insensitive substring match). Returns up to 5 "
-                "matching excerpts with timestamps. Auto-executes — no confirmation "
-                "needed. Only works when log_responses=true in config."
+                "Case-insensitive search of past LLM responses in this project's event log. "
+                "Returns up to 5 excerpts with timestamps. Auto-executes. Requires log_responses=true."
             ),
             "parameters": {
                 "type": "object",
@@ -128,11 +136,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "apply_patch",
             "description": (
-                "Apply a unified diff to a file. Goes through the same "
-                "staging + predicted-delta + verify + user-confirm flow as "
-                "write_file: `expected_changes` is required, mismatches are "
-                "returned to you, and the user is only prompted on a clean "
-                "match."
+                "Apply a unified diff to a file. Same staging + expected_changes + verify "
+                "flow as write_file."
             ),
             "parameters": {
                 "type": "object",
@@ -159,8 +164,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "run_in_sandbox",
             "description": (
-                "Run Python code in an isolated podman sandbox: no network, "
-                "read-only mount, dropped caps. Requires user confirmation."
+                "Run Python code in an isolated podman sandbox: NO network access, "
+                "read-only mount, dropped caps. Requires user confirmation. "
+                "Do NOT use this for anything that needs internet (HTTP requests, "
+                "APIs, web scraping) — use run_shell instead for those."
             ),
             "parameters": {
                 "type": "object",
@@ -175,6 +182,8 @@ TOOLS: list[dict[str, Any]] = [
             "name": "run_shell",
             "description": (
                 "Run a shell command in the project workspace (NOT sandboxed). "
+                "Has full network access — use this for curl, wget, API calls, "
+                "web requests, or any command needing the internet. "
                 "Requires user confirmation."
             ),
             "parameters": {
@@ -187,17 +196,148 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "commit_changes",
+            "description": (
+                "Commit all staged file changes to the project workspace. "
+                "Call this when your work is complete and you are satisfied with the result. "
+                "This is the ONLY way to apply staged write_file / apply_patch calls — "
+                "nothing is written to disk until you call commit_changes. "
+                "Do not call it unless the goal is fully met."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief description of what was done and why.",
+                    }
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_tools",
+            "description": (
+                "Search the tool catalog for previously built and delivered tools by keyword. "
+                "Returns matching tool names, descriptions, and run commands. "
+                "Auto-executes — use this before building a new tool to check if one already "
+                "exists that meets your needs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword(s) to search for in tool names, descriptions, and tags.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forge_tool",
+            "description": (
+                "Create a new dynamic tool mid-run by writing a .py file to the project's "
+                "tools/ directory. The tool is immediately available for use in subsequent turns "
+                "without restarting. The file must export TOOL_SCHEMA (an OpenAI function schema "
+                "dict) and a callable with the same name as the tool. Auto-executes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tool name in snake_case, must match the callable name.",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Full Python source. Must define TOOL_SCHEMA and a callable.",
+                    },
+                },
+                "required": ["name", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch the content of a URL and return the response body as text. "
+                "Useful for reading documentation, APIs, raw files, or any web resource. "
+                "Responses larger than 100 KB are truncated. Auto-executes — no confirmation needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch.",
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "HEAD"],
+                        "description": "HTTP method (default: GET).",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers as key-value pairs.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional request body (for POST).",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Request timeout in seconds (default: 15).",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_model",
+            "description": (
+                "Load a structured AppModel for a known target. Returns JSON with "
+                "base_url, auth pattern, endpoint signatures, stack, and notes "
+                "synthesized from recon. Auto-executes — no confirmation needed. "
+                "Call this as soon as you identify the target system, before writing "
+                "any HTTP calls or target-specific tools. If no model exists, the "
+                "response tells you what models are available and how to build one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "App or API name, e.g. 'cloudflare-api' or 'wordpress'.",
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "Version string, e.g. 'v4' or '6.4.2'.",
+                    },
+                },
+                "required": ["name", "version"],
+            },
+        },
+    },
 ]
 
-# ---------------------------------------------------------------------------
-# Room-scoped tool subsets
-# ---------------------------------------------------------------------------
-
-_READ_ONLY_TOOL_NAMES = {"read_file", "list_dir", "search_memory"}
-_PLANNING_TOOL_NAMES  = {"read_file", "list_dir", "search_memory", "write_file", "apply_patch"}
-
-TOOLS_READ_ONLY = [t for t in TOOLS if t["function"]["name"] in _READ_ONLY_TOOL_NAMES]
-TOOLS_PLANNING  = [t for t in TOOLS if t["function"]["name"] in _PLANNING_TOOL_NAMES]
+# Sentinel returned by dispatch_tool_call when commit_changes fires, so the
+# agent loop knows to exit immediately.
+COMMIT_SENTINEL = "__COMMITTED__"
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +376,9 @@ def _summary_for(name: str, args: dict[str, Any]) -> str:
 def _format_proc_result(cp: subprocess.CompletedProcess) -> str:
     out = [f"rc={cp.returncode}"]
     if cp.stdout:
-        out.append(f"stdout (truncated):\n{cp.stdout[-2000:]}")
+        out.append(f"stdout (first 2000 chars):\n{cp.stdout[:2000]}")
     if cp.stderr:
-        out.append(f"stderr (truncated):\n{cp.stderr[-1000:]}")
+        out.append(f"stderr (first 500 chars):\n{cp.stderr[:500]}")
     return "\n".join(out)
 
 
@@ -260,7 +400,7 @@ def _stage_project(project: Project) -> pathlib.Path:
     src = pathlib.Path(project.path).resolve()
     if not src.is_dir():
         raise G.MichaelError(f"project root does not exist: {src}")
-    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-", dir="/tmp"))
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="michael-stage-"))
     dst = parent / src.name
     shutil.copytree(src, dst, ignore=_stage_ignore, symlinks=False)
     return dst
@@ -276,9 +416,8 @@ def _file_hashes(root: pathlib.Path) -> dict[str, str]:
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in G.SKIP_DIRS]
         for fn in files:
             fp = dp_path / fn
-            try:
-                data = fp.read_bytes()
-            except OSError:
+            data = _safe_read(fp)
+            if data is None:
                 continue
             rel = str(fp.relative_to(root))
             out[rel] = hashlib.sha256(data).hexdigest()
@@ -299,9 +438,8 @@ def _combined_hashes(
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in G.SKIP_DIRS]
             for fn in files:
                 fp = pathlib.Path(dp) / fn
-                try:
-                    data = fp.read_bytes()
-                except OSError:
+                data = _safe_read(fp)
+                if data is None:
                     continue
                 rel_in_ext = fp.relative_to(ext_root)
                 abs_key = "/" + str(rel_in_ext)
@@ -486,10 +624,7 @@ def _sync_to_real(
     for rel in delta["removed"]:
         dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
-            try:
-                dst.unlink()
-            except OSError:
-                pass
+            _safe_unlink(dst)
 
 
 def _list_trash(project: Project) -> list[dict[str, Any]]:
@@ -540,10 +675,7 @@ def _undo_one(project: Project, trash_id: Optional[str] = None) -> dict[str, Any
     for rel in delta.get("added", []):
         dst = pathlib.Path(rel) if rel.startswith("/") else real_root / rel
         if dst.is_file():
-            try:
-                dst.unlink()
-            except OSError:
-                pass
+            _safe_unlink(dst)
     shutil.rmtree(target, ignore_errors=True)
     return metadata
 
@@ -664,6 +796,112 @@ def execute_tool(
     if name == "search_memory":
         return _search_memory(project, str(args.get("query", "")), cfg)
 
+    if name == "search_tools":
+        from michael.project import load_catalog
+        catalog = load_catalog()
+        if not catalog:
+            return "search_tools: catalog is empty — no tools have been delivered yet"
+        q = str(args.get("query", "")).lower().strip()
+        if not q:
+            return "search_tools: query must not be empty"
+        hits: list[str] = []
+        for slug, entry in sorted(catalog.items()):
+            desc = str(entry.get("description", "")).lower()
+            tags = " ".join(entry.get("tags", [])).lower()
+            if q in slug.lower() or q in desc or q in tags:
+                run_cmd = entry.get("run_cmd", "—")
+                installed = entry.get("installed_as")
+                display_cmd = installed if installed else run_cmd
+                hits.append(
+                    f"  {slug}: {entry.get('description', '(no description)')}\n"
+                    f"    run: {display_cmd}"
+                )
+        if not hits:
+            return f"search_tools: no matches for {q!r} in {len(catalog)} catalog entries"
+        return f"search_tools: {len(hits)} match(es) for {q!r}:\n" + "\n".join(hits)
+
+    if name == "forge_tool":
+        tool_name = str(args.get("name", "")).strip()
+        code = str(args.get("code", ""))
+        if not tool_name:
+            return "forge_tool: name is required"
+        if not code:
+            return "forge_tool: code is required"
+        tools_dir = pathlib.Path(project.path) / "tools"
+        tools_dir.mkdir(exist_ok=True)
+        target = tools_dir / f"{tool_name}.py"
+        try:
+            target.write_text(code)
+        except OSError as exc:
+            return f"forge_tool: failed to write {target}: {exc}"
+        import importlib.util as _ilu
+        try:
+            spec = _ilu.spec_from_file_location(tool_name, target)
+            mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            if not hasattr(mod, "TOOL_SCHEMA"):
+                return f"forge_tool: wrote {target} but TOOL_SCHEMA not found — tool will not auto-load"
+            if not callable(getattr(mod, tool_name, None)):
+                return f"forge_tool: wrote {target} but callable {tool_name!r} not found — dispatch will fail"
+        except Exception as exc:
+            return f"forge_tool: wrote {target} but validation failed: {exc}"
+        return f"forge_tool: {tool_name} created at {target} — available immediately in this run"
+
+    if name == "fetch_url":
+        import httpx
+
+        url = str(args.get("url", ""))
+        if not url:
+            return "error: url is required"
+        method = str(args.get("method", "GET")).upper()
+        headers = args.get("headers") or {}
+        body = args.get("body")
+        timeout_s = int(args.get("timeout_s", 15))
+        _MAX_RESPONSE_BYTES = 100_000
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout_s) as client:
+                resp = client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    content=body.encode() if isinstance(body, str) else None,
+                )
+        except httpx.TimeoutException:
+            return f"error: request timed out after {timeout_s}s"
+        except httpx.RequestError as exc:
+            return f"error: {exc}"
+        content_type = resp.headers.get("content-type", "")
+        try:
+            text = resp.text
+        except Exception:
+            text = resp.content.decode("utf-8", errors="replace")
+        truncated = len(text) > _MAX_RESPONSE_BYTES
+        body_out = text[:_MAX_RESPONSE_BYTES]
+        parts = [f"status: {resp.status_code}", f"content-type: {content_type}"]
+        if truncated:
+            parts.append(f"(truncated to {_MAX_RESPONSE_BYTES} bytes)")
+        parts.append(body_out)
+        return "\n".join(parts)
+
+    if name == "load_model":
+        from dataclasses import asdict as _asdict
+        from michael.appmodel import load_model as _load_model, list_models as _list_models
+        model_name_arg = str(args.get("name", ""))
+        model_ver_arg = str(args.get("version", ""))
+        if not model_name_arg or not model_ver_arg:
+            return "load_model: both 'name' and 'version' are required"
+        try:
+            model = _load_model(project, model_name_arg, model_ver_arg)
+            return json.dumps(_asdict(model), indent=2)
+        except G.MichaelError:
+            available = [f"{mo.name} {mo.version}" for mo in _list_models(project)]
+            hint = (
+                f"Available models: {available}" if available
+                else "No models built yet — run recon (recon_passive/explore_service), "
+                     "then write models/<name>-<version>.json with base_url, auth, endpoints, stack, notes."
+            )
+            return f"No model for {model_name_arg!r} {model_ver_arg!r}. {hint}"
+
     return f"error: unknown tool {name}"
 
 
@@ -782,15 +1020,9 @@ def _snapshot_file(
         # External file not yet staged — try the real filesystem.
         abs_path = permissions.resolve_any(path_str, real_project_root)
         if not permissions.is_project_path(abs_path, real_project_root) and abs_path.is_file():
-            try:
-                return True, abs_path.read_bytes()
-            except OSError:
-                return True, None
+            return True, _safe_read(abs_path)
         return False, None
-    try:
-        return True, target.read_bytes()
-    except OSError:
-        return True, None
+    return True, _safe_read(target)
 
 
 def _restore_file(
@@ -807,10 +1039,7 @@ def _restore_file(
         return
     if not existed:
         if target.is_file():
-            try:
-                target.unlink()
-            except OSError:
-                pass
+            _safe_unlink(target)
         return
     if blob is None:
         return
@@ -888,6 +1117,7 @@ def execute_with_staging(
 
     mismatch = _check_expected(expected_list, delta)
     if mismatch:
+        _restore_file(stage_root, ext_root, path_str, real_project_root, existed, blob)
         append_event(
             "tool.delta_mismatch",
             {
@@ -899,6 +1129,14 @@ def execute_with_staging(
             },
             project=project,
         )
+        return (
+            f"mismatch: prediction and reality diverge — {mismatch}.\n"
+            f"predicted: {sorted(expected_list)}\n"
+            f"actual:    added={delta['added']}  "
+            f"modified={delta['modified']}  removed={delta['removed']}\n"
+            "This call was rolled back. Correct expected_changes and re-propose."
+        )
+
     append_event(
         "tool.staged",
         {
@@ -1031,12 +1269,10 @@ def confirm_tool_call(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_dynamic_tool(name: str, args: dict[str, Any], project: Project) -> str:
-    """Load and call a tool script from <project>/tools/<name>.py."""
+def _dispatch_dynamic_tool_from_path(name: str, args: dict[str, Any], py_file: pathlib.Path, project: Project) -> str:
+    """Load and call a tool script from the given py_file path."""
     import importlib.util as _ilu
-    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
-    if not py_file.exists():
-        return f"error: unknown tool {name!r} (not a built-in and not found in tools/)"
+    token = _wb._set_context(project)
     try:
         spec = _ilu.spec_from_file_location(name, py_file)
         mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
@@ -1045,11 +1281,32 @@ def _dispatch_dynamic_tool(name: str, args: dict[str, Any], project: Project) ->
         return str(fn(**args))
     except Exception as exc:
         return f"error running dynamic tool {name!r}: {exc}"
+    finally:
+        _wb._reset_context(token)
 
 
 # ---------------------------------------------------------------------------
 # Master dispatch
 # ---------------------------------------------------------------------------
+
+
+def _log_and_return(
+    name: str, args: dict[str, Any], result: str, project: Project,
+    *, dynamic: bool = False,
+) -> str:
+    first = (result.splitlines()[0] if result else "ok")[:120]
+    payload: dict[str, Any] = {
+        "tool": name,
+        "args": args,
+        "summary": f"{_summary_for(name, args)} → {first}",
+        "result_chars": len(result),
+    }
+    if dynamic:
+        payload["dynamic"] = True
+    if name in ("run_in_sandbox", "run_shell"):
+        payload["brief_result"] = result[:600]
+    append_event("tool.executed", payload, project=project)
+    return result
 
 
 def dispatch_tool_call(
@@ -1061,40 +1318,33 @@ def dispatch_tool_call(
     pending: PendingChanges,
 ) -> str:
     """Route one LLM tool call to the right handler."""
-    summary = _summary_for(name, args)
-
     if name in G.AUTO_EXEC_TOOLS:
         try:
             result = execute_tool(name, args, project, cfg, backend)
         except G.MichaelError as e:
             result = f"error: {e}"
-        first = (result.splitlines()[0] if result else "ok")[:120]
-        append_event(
-            "tool.executed",
-            {
-                "tool": name,
-                "args": args,
-                "summary": f"{summary} → {first}",
-                "result_chars": len(result),
-            },
-            project=project,
-        )
-        return result
+        return _log_and_return(name, args, result, project)
 
     if name in ("write_file", "apply_patch"):
         return execute_with_staging(name, args, project, cfg, pending)
 
-    # Dynamic tool invented by the agent (tools/<name>.py) — auto-executed, no confirmation.
-    dynamic_result = _try_dynamic_dispatch(name, args, project)
-    if dynamic_result is not None:
-        first = (dynamic_result.splitlines()[0] if dynamic_result else "ok")[:120]
+    if name == "commit_changes":
+        summaries = commit_pending(project, pending)
+        if summaries:
+            for s in summaries:
+                G.console.print(f"[green]applied[/] {s['summary']}")
+        else:
+            G.console.print("[dim]no file changes staged[/]")
         append_event(
             "tool.executed",
-            {"tool": name, "args": args, "summary": f"{summary} → {first}",
-             "result_chars": len(dynamic_result), "dynamic": True},
+            {"tool": "commit_changes", "args": args, "summary": args.get("summary", "")},
             project=project,
         )
-        return dynamic_result
+        return COMMIT_SENTINEL
+
+    dynamic_result = _try_dynamic_dispatch(name, args, project)
+    if dynamic_result is not None:
+        return _log_and_return(name, args, dynamic_result, project, dynamic=True)
 
     try:
         decision, final_args = confirm_tool_call(name, args, project)
@@ -1103,7 +1353,7 @@ def dispatch_tool_call(
     if decision == "no":
         append_event(
             "tool.rejected",
-            {"tool": name, "args": args, "summary": summary},
+            {"tool": name, "args": args, "summary": _summary_for(name, args)},
             project=project,
         )
         return "[user rejected this tool call]"
@@ -1111,22 +1361,21 @@ def dispatch_tool_call(
         result = execute_tool(name, final_args, project, cfg, backend)
     except G.MichaelError as e:
         result = f"error: {e}"
-    first = (result.splitlines()[0] if result else "ok")[:120]
-    payload: dict[str, Any] = {
-        "tool": name,
-        "args": final_args,
-        "summary": f"{_summary_for(name, final_args)} → {first}",
-        "result_chars": len(result),
-    }
-    if name in ("run_in_sandbox", "run_shell"):
-        payload["brief_result"] = result[:600]
-    append_event("tool.executed", payload, project=project)
-    return result
+    return _log_and_return(name, final_args, result, project)
 
 
 def _try_dynamic_dispatch(name: str, args: dict[str, Any], project: Project) -> Optional[str]:
-    """Return dynamic tool result if tools/<name>.py exists, else None."""
-    py_file = pathlib.Path(project.path) / "tools" / f"{name}.py"
-    if not py_file.exists():
-        return None
-    return _dispatch_dynamic_tool(name, args, project)
+    """Return dynamic tool result if <name>.py exists in any dynamic tool dir, else None.
+
+    Search order (first found wins): project-local > user global > bundled.
+    """
+    search_dirs = [
+        pathlib.Path(project.path) / "tools",
+        pathlib.Path(G.GLOBAL_TOOLS_DIR),
+        pathlib.Path(__file__).parent.parent / "toolbox",
+    ]
+    for d in search_dirs:
+        py_file = d / f"{name}.py"
+        if py_file.exists():
+            return _dispatch_dynamic_tool_from_path(name, args, py_file, project)
+    return None

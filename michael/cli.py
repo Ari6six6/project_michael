@@ -23,6 +23,7 @@ import michael.globals as G
 from michael.agent import _run_agent_loop
 from michael.backends import (
     VastClient,
+    _build_vllm_cmd,
     _gpu_ssh_run,
     _gpu_ssh_stream,
     _ping_vllm,
@@ -40,17 +41,26 @@ from michael.project import (
     Project,
     append_event,
     create_project,
+    detect_deliverable,
     get_active_project,
     get_active_slug,
     iter_events,
     list_projects,
+    load_catalog,
+    register_deliverable,
     replay_global,
     require_active_project,
     set_active_slug,
     slugify,
 )
-from michael.tools import TOOLS, _list_trash, _undo_one
-from michael.utils import build_header
+from michael.agent import _load_dynamic_tools
+from michael.tools import TOOLS, _list_trash, _undo_one, _dispatch_dynamic_tool_from_path
+from michael.utils import (
+    build_header,
+    load_scripture,
+    _prompt_history_lines,
+    _action_log_lines,
+)
 
 app = typer.Typer(
     no_args_is_help=False,
@@ -61,20 +71,61 @@ app = typer.Typer(
 gpu_app = typer.Typer(help="GPU instance management (A100 / vLLM).")
 app.add_typer(gpu_app, name="gpu")
 
+tools_app = typer.Typer(help="Inspect and run dynamic tools.")
+app.add_typer(tools_app, name="tools")
+
 
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
 
+_SHELL_MARKER = "# michael shell integration"
+_SHELL_LINES = (
+    "\n{marker}\n"
+    "export PATH=\"{bin}:$PATH\"\n"
+    "mcd() {{ cd \"$(michael path)\"; }}\n"
+)
+
+
+def _shell_profile() -> Optional[pathlib.Path]:
+    shell = os.environ.get("SHELL", "")
+    home = pathlib.Path.home()
+    if "zsh" in shell:
+        return home / ".zshrc"
+    if "bash" in shell:
+        for name in (".bashrc", ".bash_profile"):
+            p = home / name
+            if p.is_file():
+                return p
+        return home / ".bashrc"
+    return None
+
+
+def _inject_shell_integration() -> str:
+    profile = _shell_profile()
+    if profile is None:
+        return "[yellow]unknown shell — add manually:[/]\n  export PATH=\"{bin}:$PATH\"\n  mcd() {{ cd \"$(michael path)\"; }}".format(bin=G.MICHAEL_BIN_DIR)
+    text = profile.read_text() if profile.is_file() else ""
+    if _SHELL_MARKER in text:
+        return f"[dim]shell integration already in {profile}[/]"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    with profile.open("a") as f:
+        f.write(_SHELL_LINES.format(marker=_SHELL_MARKER, bin=G.MICHAEL_BIN_DIR))
+    return f"[green]wrote shell integration → {profile}[/]\n[dim]run: source {profile}[/]"
+
+
 def cmd_init() -> None:
     G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
     if not G.GLOBAL_CONFIG_PATH.is_file():
         make_stub_config().save()
         G.console.print(f"[green]wrote stub[/] {G.GLOBAL_CONFIG_PATH}")
     else:
         G.console.print(f"[dim]config exists[/] {G.GLOBAL_CONFIG_PATH}")
     append_event("config.loaded", {"path": str(G.GLOBAL_CONFIG_PATH)})
+    shell_msg = _inject_shell_integration()
+    G.console.print(shell_msg)
     G.console.print(
         Panel(
             "Edit ~/.michael/config.json — fill in:\n\n"
@@ -92,6 +143,25 @@ def cmd_init() -> None:
             border_style="green",
         )
     )
+
+
+def cmd_upgrade() -> None:
+    repo_dir = pathlib.Path(__file__).parent.parent
+    if not (repo_dir / ".git").is_dir():
+        raise G.MichaelError(f"not a git repo: {repo_dir}")
+    G.console.print(f"[dim]pulling {repo_dir}…[/]")
+    cp = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        raise G.MichaelError(f"git pull failed:\n{cp.stderr.strip()}")
+    G.console.print(f"[green]{cp.stdout.strip() or 'already up to date'}[/]")
+    shell_msg = _inject_shell_integration()
+    G.console.print(shell_msg)
 
 
 def cmd_show() -> None:
@@ -118,13 +188,19 @@ def cmd_new(name: Optional[str]) -> None:
     if not name:
         G.err.print("name is required")
         return
-    default_path = pathlib.Path.cwd() / slugify(name)
+    try:
+        slug_preview = slugify(name)
+    except G.MichaelError as e:
+        G.err.print(str(e))
+        return
+    default_path = G.WORKBENCH_DIR / "codebases" / slug_preview
     path_str = typer.prompt("path", default=str(default_path))
     path = pathlib.Path(path_str).expanduser().resolve()
     proj = create_project(name, path)
     set_active_slug(proj.slug)
     append_event("project.activated", {"slug": proj.slug})
     G.console.print(f"[green]created[/] {proj.slug} at {proj.path}")
+    G.console.print(f"[dim]workspace is empty — add your code there, then run: michael run <prompt>[/]")
 
 
 def cmd_use(slug: str) -> None:
@@ -359,17 +435,64 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
         cfg.save()
         G.console.print(f"[green]GPU config saved[/] ({gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port})")
 
-    # ── Verify connectivity ──
-    G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-    cp = _gpu_ssh_run(gpu, "echo ok", timeout=20)
-    if cp.returncode != 0:
-        raise G.MichaelError(
-            f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
-            "Check ssh_key_path in config or try ssh manually."
-        )
+    # ── Power on via Vast.ai API if we have the instance ID ──
+    if gpu.vast_instance_id and cfg.vast_api_key:
+        G.console.print(f"[dim]starting instance {gpu.vast_instance_id} via Vast.ai API…[/]")
+        try:
+            vast = VastClient(cfg.vast_api_key)
+            vast.start(gpu.vast_instance_id)
+            vast.close()
+            G.console.print("[dim]start requested — waiting for SSH to come up…[/]")
+            _poll_s = 10
+            _max_boot = 300
+            _elapsed = 0
+            booted = False
+            while _elapsed < _max_boot:
+                time.sleep(_poll_s)
+                _elapsed += _poll_s
+                cp = _gpu_ssh_run(gpu, "echo ok", timeout=10)
+                if cp.returncode == 0:
+                    booted = True
+                    break
+                G.console.print(f"[dim]· {_elapsed}s — waiting for SSH…[/]")
+            if not booted:
+                api_status = "unknown"
+                try:
+                    _vc = VastClient(cfg.vast_api_key)
+                    inst = _vc.get(gpu.vast_instance_id)
+                    _vc.close()
+                    api_status = inst.get("actual_status") or inst.get("status", "unknown")
+                except G.MichaelError:
+                    pass
+                raise G.MichaelError(
+                    f"instance did not respond to SSH within {_max_boot}s "
+                    f"(Vast.ai reports instance as: {api_status})\n"
+                    "If the instance is running, SSH may still be initialising — "
+                    "try again: michael gpu up"
+                )
+        except G.MichaelError as e:
+            if "404" in str(e) or "no_such_instance" in str(e):
+                G.console.print("[yellow]Instance not found — it was probably destroyed. Clearing stale config…[/]")
+                gpu.vast_instance_id = ""
+                gpu.ssh_host = ""
+                cfg.gpu = gpu
+                cfg.save()
+                raise G.MichaelError(
+                    "Stale GPU config cleared. Run `michael gpu up` again and paste the new SSH string."
+                ) from e
+            raise G.MichaelError(f"failed to start instance: {e}") from e
+    else:
+        # ── Verify connectivity (no API, assume already running) ──
+        G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
+        cp = _gpu_ssh_run(gpu, "echo ok", timeout=20)
+        if cp.returncode != 0:
+            raise G.MichaelError(
+                f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
+                "Check ssh_key_path in config or try ssh manually."
+            )
 
     # ── Install vLLM if missing ──
-    cp = _gpu_ssh_run(gpu, "python3 -c 'import vllm' 2>/dev/null && echo installed || echo missing")
+    cp = _gpu_ssh_run(gpu, "pip show vllm > /dev/null 2>&1 && echo installed || echo missing", timeout=15)
     if "missing" in cp.stdout:
         G.console.print("[cyan]Installing vLLM (grab a coffee, this takes a few minutes)…[/]")
         rc = _gpu_ssh_stream(gpu, "pip install vllm --quiet --upgrade", timeout=900)
@@ -383,27 +506,27 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
         f"curl -sf http://localhost:{gpu.vllm_port}/v1/models > /dev/null 2>&1 && echo ready || echo down",
     )
     already_ready = "ready" in cp.stdout
+    needs_restart = not already_ready
 
-    if not already_ready:
-        # Kill any stale process first
+    if already_ready:
+        flag_check = _gpu_ssh_run(
+            gpu,
+            f"ps aux | grep 'vllm serve' | grep -v grep | grep 'enable-auto-tool-choice' | grep -q 'max-model-len {gpu.vllm_max_model_len}'",
+            timeout=10,
+        )
+        if flag_check.returncode != 0:
+            G.console.print("[yellow]vLLM running with wrong flags — restarting...[/]")
+            needs_restart = True
+
+    if needs_restart:
         _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=10)
         time.sleep(2)
-
-        api_key_flag = f"--api-key {gpu.vllm_api_key} " if gpu.vllm_api_key else ""
-        vllm_cmd = (
-            f"nohup vllm serve {gpu.model_repo} "
-            f"--host 0.0.0.0 --port {gpu.vllm_port} "
-            f"--dtype auto --gpu-memory-utilization 0.95 "
-            f"--max-model-len 8192 "
-            f"{api_key_flag}"
-            f"> /tmp/vllm.log 2>&1 & echo $!"
-        )
-        cp = _gpu_ssh_run(gpu, vllm_cmd, timeout=30)
+        cp = _gpu_ssh_run(gpu, _build_vllm_cmd(gpu), timeout=30)
         pid = cp.stdout.strip()
         G.console.print(f"[cyan]vLLM starting[/] (PID {pid}) — model download may take 20–40 min on first boot")
         G.console.print("[dim]tailing /tmp/vllm.log for progress…[/]")
     else:
-        G.console.print("[dim]vLLM already serving, skipping start[/]")
+        G.console.print("[dim]vLLM already serving with correct flags, skipping start[/]")
 
     # ── Poll until /v1/models responds ──
     _max_wait_s = 5400  # 90 min
@@ -423,7 +546,20 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
         if "ready" in cp.stdout:
             endpoint_ready = True
             break
-        # Show last 2 lines of vllm.log for progress
+        # Fail fast if vLLM process has died (CUDA OOM, crash, etc.)
+        alive_cp = _gpu_ssh_run(
+            gpu,
+            "pgrep -f 'vllm serve' > /dev/null 2>&1 && echo alive || echo dead",
+            timeout=10,
+        )
+        if "dead" in alive_cp.stdout:
+            log_tail_cp = _gpu_ssh_run(gpu, "tail -20 /tmp/vllm.log 2>/dev/null || true", timeout=10)
+            raise G.MichaelError(
+                f"vLLM process died after {_elapsed}s.\n"
+                f"Last log output:\n{log_tail_cp.stdout.strip()}\n\n"
+                "Common causes: CUDA OOM (try lowering --gpu-memory-utilization), "
+                "incompatible vLLM version, or missing model files."
+            )
         log_cp = _gpu_ssh_run(gpu, "tail -2 /tmp/vllm.log 2>/dev/null || true", timeout=10)
         tail = log_cp.stdout.strip().replace("\n", " | ")
         G.console.print(f"[dim]· {_elapsed}s — {tail or 'loading…'}[/]")
@@ -471,9 +607,12 @@ def cmd_gpu_down(name: Optional[str] = None) -> None:
     if not gpu.ssh_host:
         raise G.MichaelError(f"GPU {gname!r} has no SSH host — was it ever started?")
 
-    G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-    _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=15)
-    G.console.print("[yellow]vLLM stopped[/]")
+    # Kill vLLM via SSH (best-effort — instance may already be off)
+    cp = _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=15)
+    if cp.returncode == 0:
+        G.console.print("[yellow]vLLM stopped[/]")
+    else:
+        G.console.print("[dim]SSH unreachable — skipping vLLM kill (instance likely already off)[/]")
 
     if gpu.vast_instance_id and cfg.vast_api_key:
         vast = VastClient(cfg.vast_api_key)
@@ -526,7 +665,7 @@ def cmd_ask(prompt: str) -> None:
     cfg = Config.load()
     name, profile = cfg.get_model()
     endpoint = _require_endpoint(profile, name)
-    client = llm_client(endpoint, profile.vllm_api_key)
+    client = llm_client(endpoint, profile.vllm_api_key, profile.enable_thinking)
     project = get_active_project()
     if project is not None:
         append_event(
@@ -601,6 +740,21 @@ def cmd_log(tail: int) -> None:
             payload,
         )
     G.console.print(table)
+
+
+def cmd_inspect() -> None:
+    project = require_active_project()
+    cfg = Config.load()
+    scripture = load_scripture(cfg.scripture_dir)
+    header = build_header(project, cfg.resolved_system_prompt(), scripture)
+    prompts = _prompt_history_lines(project)
+    actions = _action_log_lines(project)
+    G.console.print(f"\n[bold cyan]Project:[/] {project.name}  [dim]({project.slug})[/]")
+    G.console.print(
+        f"[dim]H1 prompts: {len(prompts)} · H3 tool calls: {len(actions)} · "
+        f"context size: {len(header):,} chars[/]\n"
+    )
+    G.console.print(header)
 
 
 def cmd_undo(list_only: bool = False, trash_id: Optional[str] = None) -> None:
@@ -696,14 +850,232 @@ def cmd_ssh_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Catalog / install / deliver commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_catalog() -> None:
+    catalog = load_catalog()
+    if not catalog:
+        G.console.print("[dim]catalog is empty — deliver a tool first[/]")
+        return
+    table = Table(title=f"tool catalog ({len(catalog)} tools)", border_style="cyan")
+    table.add_column("slug", style="bold")
+    table.add_column("description")
+    table.add_column("installed", style="green")
+    table.add_column("built_at", style="dim")
+    for slug, entry in sorted(catalog.items()):
+        table.add_row(
+            slug,
+            str(entry.get("description", "—"))[:60],
+            str(entry.get("installed_as") or "—"),
+            str(entry.get("built_at", "—"))[:19],
+        )
+    G.console.print(table)
+
+
+def cmd_install(slug: Optional[str]) -> None:
+    catalog = load_catalog()
+    if not catalog:
+        raise G.MichaelError("catalog is empty — no tools to install")
+    if slug is None:
+        proj = get_active_project()
+        if not proj:
+            raise G.MichaelError("no active project and no slug given")
+        slug = proj.slug
+    entry = catalog.get(slug)
+    if not entry:
+        raise G.MichaelError(f"tool {slug!r} not found in catalog")
+    deliverable = entry.get("deliverable", "")
+    if not deliverable:
+        raise G.MichaelError(f"no deliverable path recorded for {slug!r}")
+    src = pathlib.Path(deliverable).expanduser()
+    if not src.is_file():
+        raise G.MichaelError(f"deliverable not found: {src}")
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    link = G.MICHAEL_BIN_DIR / slug
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(src)
+    if not src.stat().st_mode & 0o111:
+        src.chmod(src.stat().st_mode | 0o755)
+    run_cmd = str(link)
+    from michael.project import save_catalog
+    catalog[slug]["installed_as"] = str(link)
+    catalog[slug]["run_cmd"] = run_cmd
+    save_catalog(catalog)
+    G.console.print(
+        Panel(
+            f"[bold green]installed[/] {slug}\n"
+            f"  symlink: {link} → {src}\n\n"
+            f"Add to PATH:\n  export PATH=\"{G.MICHAEL_BIN_DIR}:$PATH\"",
+            title="michael install",
+            border_style="green",
+        )
+    )
+
+
+def cmd_path() -> None:
+    p = get_active_project()
+    if not p:
+        raise G.MichaelError("no active project")
+    G.console.print(p.path)
+
+
+def cmd_deliver() -> None:
+    project = require_active_project()
+    det = detect_deliverable(project)
+    if not det:
+        raise G.MichaelError("no deliverable detected in this project (look for main.py, app.py, *.sh, etc.)")
+    deliverable, run_cmd = det
+    register_deliverable(project, deliverable, run_cmd)
+    G.console.print(
+        Panel(
+            f"[bold green]delivered[/] {deliverable}\n"
+            f"installed: [cyan]{G.MICHAEL_BIN_DIR / project.slug}[/]\n\n"
+            f"[dim]Add to PATH: export PATH=\"{G.MICHAEL_BIN_DIR}:$PATH\"[/]",
+            title="michael deliver",
+            border_style="green",
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tools workspace commands
+# ---------------------------------------------------------------------------
+
+_TOOL_DIR_LABELS = [
+    ("bundled", pathlib.Path(__file__).parent.parent / "toolbox"),
+    ("global",  pathlib.Path(G.GLOBAL_TOOLS_DIR)),
+]
+
+
+def _tool_search_dirs(project_path: str | None) -> list[tuple[str, pathlib.Path]]:
+    dirs = list(_TOOL_DIR_LABELS)
+    if project_path:
+        dirs.append(("project", pathlib.Path(project_path) / "tools"))
+    return dirs
+
+
+def _parse_kv_args(tokens: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for token in tokens:
+        if "=" not in token:
+            raise typer.BadParameter(f"expected key=value, got {token!r}")
+        k, _, v = token.partition("=")
+        try:
+            out[k] = json.loads(v)
+        except json.JSONDecodeError:
+            out[k] = v
+    return out
+
+
+def _find_tool_file(name: str, project_path: str | None) -> pathlib.Path | None:
+    # Project-local takes priority, then global, then bundled.
+    search = list(reversed(_tool_search_dirs(project_path)))
+    for _label, d in search:
+        candidate = d / f"{name}.py"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def cmd_tools_list() -> None:
+    project_path: str | None = None
+    try:
+        project_path = require_active_project().path
+    except G.MichaelError:
+        pass
+
+    import importlib.util as _ilu
+
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    # Reverse priority so highest-priority entry wins display
+    for label, d in reversed(_tool_search_dirs(project_path)):
+        if not d.is_dir():
+            continue
+        for py_file in sorted(d.glob("*.py")):
+            try:
+                spec = _ilu.spec_from_file_location(py_file.stem, py_file)
+                mod = _ilu.module_from_spec(spec)       # type: ignore[arg-type]
+                spec.loader.exec_module(mod)             # type: ignore[union-attr]
+                if not hasattr(mod, "TOOL_SCHEMA"):
+                    continue
+                fn_name = mod.TOOL_SCHEMA.get("function", {}).get("name", py_file.stem)
+                if fn_name in seen:
+                    continue
+                seen.add(fn_name)
+                desc = mod.TOOL_SCHEMA.get("function", {}).get("description", "")
+                desc = desc.strip().splitlines()[0][:72] if desc else ""
+                rows.append((fn_name, desc, label))
+            except Exception as exc:
+                G.err.print(f"[dim]skipped {py_file.name}: {exc}[/]")
+
+    if not rows:
+        G.console.print("[dim]no dynamic tools found[/]")
+        return
+
+    t = Table(show_header=True, header_style="bold", box=None, pad_edge=False, min_width=60)
+    t.add_column("Name", style="cyan", no_wrap=True)
+    t.add_column("Description", no_wrap=False)
+    t.add_column("Source", style="dim", no_wrap=True)
+    for name, desc, label in sorted(rows, key=lambda r: r[0]):
+        t.add_row(name, desc, label)
+    G.console.print(t)
+
+
+def cmd_tools_run(name: str, kv_tokens: list[str]) -> None:
+    project: Optional[Any] = None
+    try:
+        project = require_active_project()
+    except G.MichaelError:
+        pass
+
+    py_file = _find_tool_file(name, project.path if project else None)
+    if py_file is None:
+        raise G.MichaelError(f"tool {name!r} not found in any toolbox directory")
+
+    try:
+        args = _parse_kv_args(kv_tokens)
+    except typer.BadParameter as e:
+        raise G.MichaelError(str(e)) from e
+
+    result = _dispatch_dynamic_tool_from_path(name, args, py_file, project)
+    G.console.print(result)
+
+
+def cmd_tools_show(name: str) -> None:
+    project_path: str | None = None
+    try:
+        project_path = require_active_project().path
+    except G.MichaelError:
+        pass
+
+    py_file = _find_tool_file(name, project_path)
+    if py_file is None:
+        raise G.MichaelError(f"tool {name!r} not found in any toolbox directory")
+
+    from rich.syntax import Syntax
+    G.console.print(f"[dim]{py_file}[/]")
+    G.console.print(Syntax(py_file.read_text(), "python", line_numbers=True))
+
+
+# ---------------------------------------------------------------------------
 # Typer command bindings
 # ---------------------------------------------------------------------------
 
 
 @app.command(name="init")
 def init_cmd() -> None:
-    """Write a stub config file if missing. Idempotent."""
+    """Write stub config, create workbench dirs, inject shell integration. Idempotent."""
     cmd_init()
+
+
+@app.command(name="upgrade")
+def upgrade_cmd() -> None:
+    """git pull the michael repo and re-run shell integration."""
+    cmd_upgrade()
 
 
 @app.command(name="show")
@@ -812,6 +1184,12 @@ def log_cmd(
     cmd_log(tail)
 
 
+@app.command(name="inspect")
+def inspect_cmd() -> None:
+    """Print the full H1–H4 context package the model will receive on the next run."""
+    cmd_inspect()
+
+
 @app.command(name="sandbox")
 def sandbox_cmd(
     file: pathlib.Path = typer.Argument(..., exists=True, readable=True),
@@ -837,13 +1215,65 @@ def ssh_test_cmd() -> None:
     cmd_ssh_test()
 
 
+@app.command(name="catalog")
+def catalog_cmd() -> None:
+    """List all delivered tools in the global catalog."""
+    cmd_catalog()
+
+
+@app.command(name="path")
+def path_cmd() -> None:
+    """Print the active project's workspace path (useful for cd $(michael path))."""
+    cmd_path()
+
+
+@app.command(name="deliver")
+def deliver_cmd() -> None:
+    """Detect, register, and install the active project's deliverable."""
+    cmd_deliver()
+
+
+@app.command(name="install", hidden=True)
+def install_cmd(
+    slug: Optional[str] = typer.Argument(None, help="Tool slug to reinstall."),
+) -> None:
+    """Reinstall a delivered tool's wrapper script (repair command)."""
+    cmd_install(slug)
+
+
+@tools_app.command(name="list")
+def tools_list_cmd() -> None:
+    """List all dynamic tools across bundled, global, and project toolboxes."""
+    cmd_tools_list()
+
+
+@tools_app.command(
+    name="run",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def tools_run_cmd(
+    name: str = typer.Argument(..., help="Tool name to invoke."),
+    ctx: typer.Context = typer.Option(None, hidden=True),
+) -> None:
+    """Run a dynamic tool by name. Pass arguments as key=value pairs."""
+    cmd_tools_run(name, ctx.args if ctx else [])
+
+
+@tools_app.command(name="show")
+def tools_show_cmd(
+    name: str = typer.Argument(..., help="Tool name to inspect."),
+) -> None:
+    """Print the source code of a dynamic tool."""
+    cmd_tools_show(name)
+
+
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 
 REPL_COMMANDS = {
-    "project", "new", "run", "up", "down", "config", "init",
-    "quit", "exit", "help",
+    "project", "new", "run", "up", "down", "gpu", "config", "init",
+    "tools", "quit", "exit", "help",
 }
 
 
@@ -939,19 +1369,28 @@ def dispatch_repl(line: str) -> None:
     if cmd == "help":
         G.console.print(
             "commands:\n"
-            "  run <prompt>          run the agent on a prompt\n"
-            "  project [slug]        select/list projects\n"
-            "  new [name]            create new project\n"
-            "  up / down             start/stop GPU (legacy — needs config.json)\n"
-            "  gpu up / gpu down     install vLLM, start model, print port-forward\n"
-            "  config                edit config\n"
-            "  init                  initialize config\n"
-            "  exit / quit           exit michael"
+            "  run <prompt>                      run the agent on a prompt\n"
+            "  project [slug]                    select/list projects\n"
+            "  new [name]                        create new project\n"
+            "  up / down                         start/stop GPU (legacy — needs config.json)\n"
+            "  gpu up / gpu down                 start instance, install vLLM, serve model\n"
+            "  tools list                        list all dynamic tools\n"
+            "  tools run <name> [key=value ...]  run a dynamic tool directly\n"
+            "  tools show <name>                 print tool source\n"
+            "  catalog                           list all delivered tools\n"
+            "  path                              print active project workspace path\n"
+            "  deliver                           detect + install active project's deliverable\n"
+            "  config                            edit config\n"
+            "  init                              initialize config + shell integration\n"
+            "  upgrade                           git pull + re-apply shell integration\n"
+            "  exit / quit                       exit michael"
         )
         return
 
     if cmd == "init":
         cmd_init()
+    elif cmd == "upgrade":
+        cmd_upgrade()
     elif cmd == "config":
         cmd_config()
     elif cmd == "project":
@@ -979,6 +1418,28 @@ def dispatch_repl(line: str) -> None:
             cmd_gpu_down()
         else:
             G.err.print("usage: gpu up | gpu down")
+    elif cmd == "tools":
+        sub = rest[0] if rest else "list"
+        if sub == "list":
+            cmd_tools_list()
+        elif sub == "run":
+            if len(rest) < 2:
+                G.err.print("usage: tools run <name> [key=value ...]")
+            else:
+                cmd_tools_run(rest[1], rest[2:])
+        elif sub == "show":
+            if len(rest) < 2:
+                G.err.print("usage: tools show <name>")
+            else:
+                cmd_tools_show(rest[1])
+        else:
+            G.err.print("usage: tools list | tools run <name> [key=value ...] | tools show <name>")
+    elif cmd == "catalog":
+        cmd_catalog()
+    elif cmd == "path":
+        cmd_path()
+    elif cmd == "deliver":
+        cmd_deliver()
     else:
         G.err.print(f"unknown command: {cmd!r}. try 'help'.")
 

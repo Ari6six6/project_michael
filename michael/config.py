@@ -20,6 +20,7 @@ class ModelProfile:
     vllm_api_key: str = ""
     request_timeout_s: int = 120
     endpoint: Optional[str] = None
+    enable_thinking: bool = False
 
 
 @dataclass
@@ -52,9 +53,10 @@ class GpuConfig:
     ssh_user: str = "root"
     ssh_key_path: str = "~/.ssh/id_ed25519"
     vast_instance_id: str = ""
-    model_repo: str = "Qwen/Qwen3-72B-AWQ"
+    model_repo: str = "Qwen/Qwen2.5-72B-Instruct-AWQ"
     vllm_port: int = 8000
     vllm_api_key: str = ""
+    vllm_max_model_len: int = 12288
 
 
 @dataclass
@@ -71,6 +73,7 @@ class Config:
     log_responses: bool = True
     boot_poll_s: int = 10
     scripture_dir: str = "scripture"
+    workbench_root: str = "~/workbench"
 
     @classmethod
     def load(cls) -> "Config":

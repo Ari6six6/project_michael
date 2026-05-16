@@ -22,10 +22,8 @@ from michael.globals import (  # noqa: F401
     SKIP_DIRS,
     AUTO_EXEC_TOOLS,
     MichaelError,
-    JA_PASSPHRASE,
     _GOD_MODE_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
-    _message_ends_with_ja,
 )
 
 from michael.config import (  # noqa: F401
@@ -55,20 +53,19 @@ from michael.project import (  # noqa: F401
 
 from michael.backends import (  # noqa: F401
     _ssh_argv,
-    _ssh_run,
-    _ssh_close_master,
     _ssh_preflight,
     VastClient,
     llm_client,
-    _usage_dict,
     chat_stream,
     _ping_vllm,
     _require_endpoint,
-    _safe_tail,
+    _build_vllm_cmd,
+    _restart_vllm_on_gpu,
+    _ensure_tunnel,
+    _close_tunnel,
     SandboxBackend,
-    DisabledSandboxBackend,
     LocalPodmanBackend,
-    RemoteSshPodmanBackend,
+    RemotePodmanBackend,
     make_backend,
 )
 
@@ -77,7 +74,6 @@ from michael.utils import (  # noqa: F401
     filesystem_snapshot,
     _prompt_history_lines,
     _action_log_lines,
-    _MODE_ADDENDUM,
     build_protocol,
     build_header,
 )
@@ -114,7 +110,6 @@ from michael.tools import (  # noqa: F401
 )
 
 from michael.agent import (  # noqa: F401
-    _NUDGE_NO_JA,
     _run_agent_loop,
 )
 

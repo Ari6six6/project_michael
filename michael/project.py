@@ -88,7 +88,9 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def slugify(name: str) -> str:
     s = _SLUG_RE.sub("-", name.strip().lower()).strip("-")
-    return s[:64] or "project"
+    if not s:
+        raise G.MichaelError("project name must contain at least one letter or digit")
+    return s[:64]
 
 
 def list_projects() -> list[Project]:
@@ -247,6 +249,74 @@ def iter_events(path: pathlib.Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tool catalog — global registry of delivered tools
+# ---------------------------------------------------------------------------
+
+
+def load_catalog() -> dict[str, Any]:
+    """Load the global tools catalog from disk."""
+    if not G.TOOLS_CATALOG_PATH.is_file():
+        return {}
+    try:
+        return json.loads(G.TOOLS_CATALOG_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_catalog(catalog: dict[str, Any]) -> None:
+    G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    G.TOOLS_CATALOG_PATH.write_text(json.dumps(catalog, indent=2, sort_keys=True))
+
+
+def detect_deliverable(project: "Project") -> Optional[tuple[str, str]]:
+    """Return (rel_path, run_cmd) for the best deliverable in the project, or None."""
+    root = pathlib.Path(project.path)
+    if not root.is_dir():
+        return None
+
+    for name in ("main.py", "app.py", "cli.py", "tool.py", "__main__.py"):
+        f = root / name
+        if f.is_file():
+            return name, f"python {f}"
+
+    for f in sorted(root.glob("*.py")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        if any(tok in text for tok in ("typer", "click", "argparse", "__main__")):
+            return f.name, f"python {f}"
+
+    for f in sorted(root.glob("*.sh")):
+        return f.name, f"bash {f}"
+
+    for f in sorted(root.iterdir()):
+        if f.is_file() and os.access(f, os.X_OK) and not f.name.startswith("."):
+            return f.name, str(f)
+
+    return None
+
+
+def register_deliverable(project: "Project", deliverable: str, run_cmd: str) -> None:
+    """Register the deliverable in the catalog and auto-install a wrapper into workbench/bin."""
+    G.MICHAEL_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    wrapper = G.MICHAEL_BIN_DIR / project.slug
+    wrapper.write_text(f"#!/bin/bash\nexec {run_cmd} \"$@\"\n")
+    wrapper.chmod(0o755)
+
+    catalog = load_catalog()
+    catalog[project.slug] = {
+        "slug": project.slug,
+        "name": project.name,
+        "deliverable": deliverable,
+        "run_cmd": run_cmd,
+        "installed_as": str(wrapper),
+        "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    save_catalog(catalog)
 
 
 def replay_global() -> dict[str, Any]:

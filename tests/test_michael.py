@@ -49,9 +49,11 @@ def test_slugify_strips_specials():
     assert m.slugify("foo!@# bar/baz") == "foo-bar-baz"
 
 
-def test_slugify_empty_falls_back():
-    assert m.slugify("") == "project"
-    assert m.slugify("///") == "project"
+def test_slugify_empty_raises():
+    with pytest.raises(michael_globals.MichaelError):
+        m.slugify("")
+    with pytest.raises(michael_globals.MichaelError):
+        m.slugify("///")
 
 
 def test_slugify_truncates_to_64():
@@ -370,7 +372,7 @@ def test_execute_with_staging_missing_expected_returns_error_to_llm(home, worksp
     assert "tool.delta_missing" in types
 
 
-def test_execute_with_staging_mismatch_is_review_data_not_rejection(home, workspace):
+def test_execute_with_staging_mismatch_rolls_back_and_errors(home, workspace):
     p = m.create_project("x", workspace)
     cfg = m.Config()
     pending = m.PendingChanges()
@@ -384,18 +386,17 @@ def test_execute_with_staging_mismatch_is_review_data_not_rejection(home, worksp
         },
         p, cfg, pending,
     )
-    # Mismatch is information, not auto-rejection — no error: prefix.
-    assert not result.startswith("error:")
+    # Mismatch is an error: rolled back, LLM told to re-propose.
+    assert result.startswith("mismatch:")
     assert "predicted:" in result and "actual:" in result
-    assert "src/bar.py" in result
-    # Real workspace untouched; staging holds the change for the LLM to review.
+    # Change was rolled back — not in change_log.
+    assert len(pending.change_log) == 0
+    # Real workspace untouched.
     assert not (workspace / "src" / "bar.py").exists()
-    assert pending.stage_root is not None
-    assert len(pending.change_log) == 1
     events = m.iter_events(p.events_path)
     types = [e.get("type") for e in events]
     assert "tool.delta_mismatch" in types
-    assert "tool.staged" in types
+    assert "tool.staged" not in types
 
 
 def test_execute_with_staging_review_returns_diff_without_prompt(home, workspace, monkeypatch):
@@ -477,28 +478,6 @@ def test_commit_pending_syncs_all_entries_then_discards(home, workspace):
     assert types.count("tool.executed") == 2
 
 
-# ---- Ja passcode and detector -------------------------------------------
-
-def test_ja_passphrase_constant():
-    assert m.JA_PASSPHRASE == "Ja"
-
-
-def test_ja_detector_recognises_end_of_message():
-    assert m._message_ends_with_ja("thoughts.\nJa")
-    assert m._message_ends_with_ja("thoughts.\nJa\n")
-    assert m._message_ends_with_ja("done with the work. Ja")
-    assert m._message_ends_with_ja("done. Ja.")
-    assert m._message_ends_with_ja("Ja")
-
-
-def test_ja_detector_rejects_mid_sentence_and_other_languages():
-    assert not m._message_ends_with_ja("")
-    assert not m._message_ends_with_ja("Yes")
-    assert not m._message_ends_with_ja("Ja, das ist gut")
-    assert not m._message_ends_with_ja("Ja im Anfang")
-    assert not m._message_ends_with_ja("ja")  # case-sensitive
-
-
 # ---- Header 4 / build_protocol ------------------------------------------
 
 def test_build_protocol_lists_four_headers():
@@ -507,24 +486,11 @@ def test_build_protocol_lists_four_headers():
         assert h in text
 
 
-def test_build_protocol_mentions_ja_passcode_and_no_hands():
-    text = m.build_protocol()
-    assert "Ja" in text
-    assert "passcode" in text.lower()
-    assert "no hands" in text.lower() or "NO HANDS" in text
-
-
-def test_build_protocol_has_full_authority_addendum():
-    text = m.build_protocol()
-    assert "FULL AUTHORITY" in text
-
 
 def test_build_header_includes_protocol(home, workspace):
     p = m.create_project("x", workspace)
     pkg = m.build_header(p, "system stub")
     assert "H4: Protocol" in pkg
-    assert "Ja" in pkg
-    # H1/H2/H3 markers are present too.
     assert "H1:" in pkg and "H2:" in pkg and "H3:" in pkg
 
 
@@ -535,3 +501,88 @@ def test_repl_commands_include_core_commands():
     assert "new" in m.REPL_COMMANDS
     assert "up" in m.REPL_COMMANDS
     assert "down" in m.REPL_COMMANDS
+
+
+# ---- workbench -----------------------------------------------------------
+
+import michael.workbench as wb
+
+
+def test_workbench_project_root_outside_context_raises():
+    with pytest.raises(RuntimeError, match="no active project"):
+        wb.project_root()
+
+
+def test_workbench_project_root_inside_context(home, workspace):
+    p = m.create_project("wb-test", workspace)
+    token = wb._set_context(p)
+    try:
+        assert wb.project_root() == pathlib.Path(p.path)
+        assert wb.project_slug() == p.slug
+    finally:
+        wb._reset_context(token)
+
+
+def test_workbench_context_cleared_after_reset(home, workspace):
+    p = m.create_project("wb-reset", workspace)
+    token = wb._set_context(p)
+    wb._reset_context(token)
+    with pytest.raises(RuntimeError, match="no active project"):
+        wb.project_root()
+
+
+def test_workbench_read_file_blocks_central_fs(home, workspace):
+    p = m.create_project("wb-perm", workspace)
+    token = wb._set_context(p)
+    try:
+        central_path = str(michael_globals.STATE_DIR / "secret.txt")
+        with pytest.raises(m.MichaelError, match="Central FS violation"):
+            wb.read_file(central_path)
+    finally:
+        wb._reset_context(token)
+
+
+def test_workbench_run_shell_blocks_central_fs_reference(home, workspace):
+    p = m.create_project("wb-shell", workspace)
+    token = wb._set_context(p)
+    try:
+        with pytest.raises(m.MichaelError):
+            wb.run_shell("cat ~/.michael/config.json")
+    finally:
+        wb._reset_context(token)
+
+
+# ---- appmodel ------------------------------------------------------------
+
+import michael.appmodel as am
+
+
+def test_appmodel_save_and_load(home, workspace):
+    p = m.create_project("am-test", workspace)
+    model = am.make_model(
+        "testapp", "v1",
+        base_url="https://api.example.com",
+        auth={"type": "bearer"},
+        notes="test model",
+    )
+    am.save_model(p, model)
+    loaded = am.load_model(p, "testapp", "v1")
+    assert loaded.name == "testapp"
+    assert loaded.version == "v1"
+    assert loaded.base_url == "https://api.example.com"
+    assert loaded.auth == {"type": "bearer"}
+    assert loaded.notes == "test model"
+
+
+def test_appmodel_list_returns_all(home, workspace):
+    p = m.create_project("am-list", workspace)
+    am.save_model(p, am.make_model("app-a", "1.0"))
+    am.save_model(p, am.make_model("app-b", "2.0"))
+    models = am.list_models(p)
+    assert {mo.name for mo in models} == {"app-a", "app-b"}
+
+
+def test_appmodel_missing_raises(home, workspace):
+    p = m.create_project("am-miss", workspace)
+    with pytest.raises(m.MichaelError, match="no model"):
+        am.load_model(p, "ghost", "v0")

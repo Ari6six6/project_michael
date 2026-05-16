@@ -20,6 +20,13 @@ STATE_FILE_PATH = STATE_DIR / "state.json"
 PROJECTS_DIR = STATE_DIR / "projects"
 REPL_HISTORY_PATH = STATE_DIR / "repl_history"
 GLOBAL_TOOLS_DIR = STATE_DIR / "toolbox"
+TOOLS_CATALOG_PATH = STATE_DIR / "tools_catalog.json"
+
+MODELS_SUBDIR = "models"   # relative to project.path
+
+# Workbench — standard topology for built tools
+WORKBENCH_DIR = pathlib.Path.home() / "workbench"
+MICHAEL_BIN_DIR = WORKBENCH_DIR / "bin"
 
 # ---------------------------------------------------------------------------
 # Shared Rich consoles
@@ -45,7 +52,7 @@ SKIP_DIRS = {
 # Tool routing
 # ---------------------------------------------------------------------------
 
-AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory"}
+AUTO_EXEC_TOOLS = {"read_file", "list_dir", "search_memory", "fetch_url", "search_tools", "forge_tool", "load_model"}
 
 # ---------------------------------------------------------------------------
 # Domain error
@@ -60,8 +67,6 @@ class MichaelError(RuntimeError):
 # Agent protocol constants
 # ---------------------------------------------------------------------------
 
-JA_PASSPHRASE = "Ja"
-
 _GOD_MODE_PROMPT = (
     "Assess the full state of this project. "
     "Burn what is not working. "
@@ -70,91 +75,22 @@ _GOD_MODE_PROMPT = (
 )
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a careful coding assistant connected to the user's machine "
-    "through Project Michael. Keep changes small and reviewable. Prefer "
-    "editing existing files over creating new ones. Do not add unrequested "
-    "comments, error handling, or scaffolding."
+    "You are the intelligence of Project Michael — autonomous, mission-driven, "
+    "and accountable for outcomes. "
+    "Before acting, read all of H1–H3 deeply: the user's prompts carry implicit "
+    "intent beyond their literal words. A sparse prompt is not a minimal task; "
+    "derive the full mission from the project history and what H3 shows has failed. "
+    "Take initiative: find what is broken, incomplete, or misaligned and address it. "
+    "You own the outcome. Apply the Kantian cycle fully — know, decide, act, verify.\n\n"
+    "HARD RULES — follow these exactly, no exceptions:\n"
+    "1. run_in_sandbox = NO network. Never use it for HTTP, APIs, or web requests.\n"
+    "2. run_shell = HAS network. Always use it for curl, wget, and any web request.\n"
+    "3. WEATHER: always use exactly `curl -s 'https://wttr.in/CITY?format=3'`. "
+    "Never use weather.com, OpenWeatherMap, or any other weather service.\n"
+    "4. Prefer keyless public APIs. Never invent or placeholder API keys.\n"
+    "5. Keep code changes small. No unrequested comments or scaffolding."
 )
 
 
-MAX_AGENT_CYCLES = 9
-
-ROOMS: list[dict] = [
-    {
-        "name":      "room.epistemics",
-        "label":     "ROOM 1 — WHAT CAN I KNOW?",
-        "directive": (
-            "ROOM 1: EXPLORATION ONLY. Question: What can I know?\n"
-            "Available tools: read_file, list_dir, search_memory — no writes.\n"
-            "Map the full state: files, prior history, constraints, open questions.\n"
-            "Signal Ja when you have complete epistemic clarity."
-        ),
-        "nudge": "Room 1: keep exploring. No writes yet. Signal Ja when the full picture is clear.",
-    },
-    {
-        "name":      "room.ethics",
-        "label":     "ROOM 2 — WHAT SHOULD I DO?",
-        "directive": (
-            "ROOM 2: BUILDING. Question: What should I do?\n"
-            "Full tool access. Implement the smallest correct action. Test before signalling done.\n"
-            "You have two toolboxes — check them before building anything new:\n"
-            "  • tools/          — tools for this project only\n"
-            "  • ~/.michael/toolbox/ — global tools, available in every project\n"
-            "If a required capability is missing, write it as a Python file to one of those paths. "
-            "Export TOOL_SCHEMA (OpenAI function schema dict) and a callable with the same name. "
-            "It loads as a real tool available to every room in the next cycle.\n"
-            "Use the global toolbox for general-purpose tools (port scanners, parsers, etc.) "
-            "and the local tools/ for project-specific ones.\n"
-            "Signal Ja when the implementation is verified."
-        ),
-        "nudge": (
-            "Room 2: build, test, refine. Check tools/ and ~/.michael/toolbox/ before "
-            "writing new ones. Signal Ja when done."
-        ),
-    },
-    {
-        "name":      "room.teleology",
-        "label":     "ROOM 3 — WHAT CAN I HOPE FOR?",
-        "directive": (
-            "ROOM 3: PLOTTING. Question: What can I hope for?\n"
-            "Room 2 has built or extended the toolbox. Now plot the next cycle:\n"
-            "Which tools should Room 1 call to gather the remaining unknowns? "
-            "What targets, what parameters, what data is still missing before the object of "
-            "desire can be enclosed?\n"
-            "Be concrete: name the tools, name the targets, name the open questions. "
-            "This plot becomes the agenda for the next Room 1.\n"
-            "Signal Ja when the next cycle has a clear agenda."
-        ),
-        "nudge": (
-            "Room 3: make the next cycle's agenda concrete — tools, targets, unknowns. "
-            "Signal Ja when the plot is set."
-        ),
-    },
-    {
-        "name":      "room.completion",
-        "label":     "ROOM 4 — IS THE GOAL MET?",
-        "directive": (
-            "ROOM 4: COMPLETION GATE. Question: Have you enclosed the object of desire?\n"
-            "The object of desire is defined in the user's original prompt. "
-            "Ask yourself: can I answer that prompt with yes, right now, with certainty?\n"
-            "If YES: end your response with Ja.\n"
-            "If NO: state exactly what is still unknown or unbuilt. Do NOT say Ja."
-        ),
-        "nudge": "Room 4: have you enclosed the object of desire? Ja if yes. State what's missing if no.",
-    },
-]
-
-
-def _message_ends_with_ja(text: str) -> bool:
-    """True iff the message's trailing token is the bareword JA_PASSPHRASE.
-
-    Catches: 'thoughts.\\nJa', 'thoughts.\\nJa\\n', 'done. Ja.'
-    Rejects: '', 'Ja, das ist gut', 'Yes', 'ja' (case-sensitive).
-    """
-    if not text:
-        return False
-    stripped = text.rstrip().rstrip(".!?;:")
-    if not stripped:
-        return False
-    last_token = stripped.rsplit(None, 1)[-1]
-    return last_token == JA_PASSPHRASE
+MAX_AGENT_TURNS = 60
+MAX_VERIFY_RETRIES = 3
