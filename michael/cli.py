@@ -24,6 +24,7 @@ from michael.agent import _run_agent_loop
 from michael.backends import (
     VastClient,
     _build_vllm_cmd,
+    _gpu_ssh_argv,
     _gpu_ssh_run,
     _gpu_ssh_stream,
     _ping_vllm,
