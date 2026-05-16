@@ -368,211 +368,136 @@ def _pick_gpu(cfg: "Config", name: Optional[str]) -> tuple[str, GpuConfig]:
 
 def cmd_gpu_up(name: Optional[str] = None) -> None:
     cfg = Config.load()
+    if not cfg.vast_api_key:
+        raise G.MichaelError("vast_api_key is not set — run `michael config`")
     gname, gpu = _pick_gpu(cfg, name)
-    G.console.print(
-        f"[bold]Using GPU:[/] {gname}  [dim](instance {gpu.vast_instance_id or '—'})[/]"
-    )
-
-    # ── Auto-discover SSH details from Vast API when instance_id is known ──
-    if not gpu.ssh_host and gpu.vast_instance_id and cfg.vast_api_key:
-        G.console.print("[dim]discovering SSH details from Vast API…[/]")
-        vast = VastClient(cfg.vast_api_key)
-        try:
-            inst = vast.get(gpu.vast_instance_id)
-        finally:
-            vast.close()
-        ssh_host = inst.get("ssh_host") or inst.get("public_ipaddr") or ""
-        if not ssh_host:
-            raise G.MichaelError(
-                f"instance {gpu.vast_instance_id} has no ssh_host yet — is it running?"
-            )
-        ports = inst.get("ports") or {}
-        ssh_port = 22
-        if isinstance(ports, dict):
-            mapping = ports.get("22/tcp") or ports.get("22")
-            if isinstance(mapping, list) and mapping:
-                try:
-                    ssh_port = int(mapping[0].get("HostPort", 22))
-                except (TypeError, ValueError):
-                    pass
-        gpu.ssh_host = ssh_host
-        gpu.ssh_port = ssh_port
-        if gname in cfg.gpus:
-            cfg.gpus[gname] = gpu
-        cfg.save()
-        G.console.print(f"[green]SSH discovered:[/] {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}")
-
-    # ── First-time setup: read SSH string from Vast.ai console ──
-    if not gpu.ssh_host:
-        G.console.print(
-            "[bold cyan]Paste the SSH command from your Vast.ai console[/] "
-            "[dim](e.g. ssh root@1.2.3.4 -p 10022)[/]"
+    if not gpu.vast_instance_id:
+        raise G.MichaelError(
+            f"GPU {gname!r} has no instance ID — run: michael gpu new {gname} <instance_id>"
         )
-        ssh_str = typer.prompt("SSH command").strip()
-        user, host, port = parse_vast_ssh_cmd(ssh_str)
-        gpu.ssh_user = user
-        gpu.ssh_host = host
-        gpu.ssh_port = port
+    G.console.print(f"[bold]Using GPU:[/] {gname}  [dim](instance {gpu.vast_instance_id})[/]")
 
-        # Try to auto-discover the instance ID from the Vast.ai API
-        if cfg.vast_api_key:
-            try:
-                vast = VastClient(cfg.vast_api_key)
-                for inst in vast.list():
-                    if inst.get("ssh_host") == host or inst.get("public_ipaddr") == host:
-                        gpu.vast_instance_id = str(inst["id"])
-                        G.console.print(
-                            f"[dim]auto-detected instance id: {gpu.vast_instance_id}[/]"
-                        )
-                        break
-                vast.close()
-            except G.MichaelError:
-                pass
+    # ── Start instance ──
+    vast = VastClient(cfg.vast_api_key)
+    try:
+        vast.start(gpu.vast_instance_id)
+    except G.MichaelError as e:
+        if "404" in str(e):
+            raise G.MichaelError(
+                f"Instance {gpu.vast_instance_id} not found — it may have been destroyed.\n"
+                f"Register a new one: michael gpu new {gname} <new_instance_id>"
+            ) from e
+        raise
+    finally:
+        vast.close()
 
-        cfg.gpu = gpu
-        if gname in cfg.gpus:
-            cfg.gpus[gname] = gpu
-        cfg.save()
-        G.console.print(f"[green]GPU config saved[/] ({gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port})")
+    G.console.print("[dim]start requested — waiting for SSH…[/]")
 
-    # ── Power on via Vast.ai API if we have the instance ID ──
-    if gpu.vast_instance_id and cfg.vast_api_key:
-        G.console.print(f"[dim]starting instance {gpu.vast_instance_id} via Vast.ai API…[/]")
+    # ── Wait for SSH host/port to appear in Vast API ──
+    # inst["ssh_host"] and inst["ssh_port"] are assigned at boot time.
+    for _t in range(10, 181, 10):
+        time.sleep(10)
         try:
-            vast = VastClient(cfg.vast_api_key)
-            vast.start(gpu.vast_instance_id)
-            vast.close()
-            G.console.print("[dim]start requested — waiting for SSH to come up…[/]")
-            _poll_s = 10
-            _max_boot = 300
-            _elapsed = 0
-            booted = False
-            while _elapsed < _max_boot:
-                time.sleep(_poll_s)
-                _elapsed += _poll_s
-                cp = _gpu_ssh_run(gpu, "echo ok", timeout=10)
-                if cp.returncode == 0:
-                    booted = True
-                    break
-                G.console.print(f"[dim]· {_elapsed}s — waiting for SSH…[/]")
-            if not booted:
-                api_status = "unknown"
-                try:
-                    _vc = VastClient(cfg.vast_api_key)
-                    inst = _vc.get(gpu.vast_instance_id)
-                    _vc.close()
-                    api_status = inst.get("actual_status") or inst.get("status", "unknown")
-                except G.MichaelError:
-                    pass
-                raise G.MichaelError(
-                    f"instance did not respond to SSH within {_max_boot}s "
-                    f"(Vast.ai reports instance as: {api_status})\n"
-                    "If the instance is running, SSH may still be initialising — "
-                    "try again: michael gpu up"
-                )
-        except G.MichaelError as e:
-            if "404" in str(e) or "no_such_instance" in str(e):
-                G.console.print("[yellow]Instance not found — it was probably destroyed. Clearing stale config…[/]")
-                gpu.vast_instance_id = ""
-                gpu.ssh_host = ""
+            _vc = VastClient(cfg.vast_api_key)
+            inst = _vc.get(gpu.vast_instance_id)
+            _vc.close()
+        except G.MichaelError:
+            G.console.print(f"[dim]· {_t}s — waiting for instance metadata…[/]")
+            continue
+        fresh_host = inst.get("ssh_host") or inst.get("public_ipaddr") or ""
+        fresh_port = int(inst.get("ssh_port") or 0)
+        if fresh_host and fresh_port:
+            if fresh_host != gpu.ssh_host or fresh_port != gpu.ssh_port:
+                gpu.ssh_host = fresh_host
+                gpu.ssh_port = fresh_port
+                if gname in cfg.gpus:
+                    cfg.gpus[gname] = gpu
                 cfg.gpu = gpu
                 cfg.save()
-                raise G.MichaelError(
-                    "Stale GPU config cleared. Run `michael gpu up` again and paste the new SSH string."
-                ) from e
-            raise G.MichaelError(f"failed to start instance: {e}") from e
+                G.console.print(f"[green]SSH:[/] {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}")
+            break
+        G.console.print(f"[dim]· {_t}s — SSH details not assigned yet…[/]")
     else:
-        # ── Verify connectivity (no API, assume already running) ──
-        G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-        cp = _gpu_ssh_run(gpu, "echo ok", timeout=20)
-        if cp.returncode != 0:
-            raise G.MichaelError(
-                f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
-                "Check ssh_key_path in config or try ssh manually."
-            )
+        raise G.MichaelError(
+            "Instance did not expose SSH details within 180s — check Vast.ai console."
+        )
+
+    # ── Poll SSH until reachable ──
+    for _t in range(10, 301, 10):
+        time.sleep(10)
+        if _gpu_ssh_run(gpu, "echo ok", timeout=12).returncode == 0:
+            break
+        G.console.print(f"[dim]· {_t}s — SSH not accepting connections yet…[/]")
+    else:
+        raise G.MichaelError(
+            f"SSH did not become reachable within 300s at "
+            f"{gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}\n"
+            "Verify your SSH key is uploaded in Vast.ai account settings."
+        )
 
     # ── Install vLLM if missing ──
     cp = _gpu_ssh_run(gpu, "pip show vllm > /dev/null 2>&1 && echo installed || echo missing", timeout=15)
     if "missing" in cp.stdout:
-        G.console.print("[cyan]Installing vLLM (grab a coffee, this takes a few minutes)…[/]")
-        rc = _gpu_ssh_stream(gpu, "pip install vllm --quiet --upgrade", timeout=900)
-        if rc != 0:
-            raise G.MichaelError("vLLM installation failed — check GPU terminal for details")
+        G.console.print("[cyan]Installing vLLM (takes a few minutes)…[/]")
+        if _gpu_ssh_stream(gpu, "pip install vllm --quiet --upgrade", timeout=900) != 0:
+            raise G.MichaelError("vLLM installation failed — check the instance terminal")
         G.console.print("[green]vLLM installed[/]")
 
-    # ── Check if vLLM is already serving ──
-    cp = _gpu_ssh_run(
+    # ── Start vLLM ──
+    already = _gpu_ssh_run(
         gpu,
-        f"curl -sf http://localhost:{gpu.vllm_port}/v1/models > /dev/null 2>&1 && echo ready || echo down",
+        f"curl -sf http://localhost:{gpu.vllm_port}/v1/models > /dev/null 2>&1 && echo y || echo n",
     )
-    already_ready = "ready" in cp.stdout
-    needs_restart = not already_ready
-
-    if already_ready:
-        flag_check = _gpu_ssh_run(
-            gpu,
-            f"ps aux | grep 'vllm serve' | grep -v grep | grep 'enable-auto-tool-choice' | grep -q 'max-model-len {gpu.vllm_max_model_len}'",
-            timeout=10,
-        )
-        if flag_check.returncode != 0:
-            G.console.print("[yellow]vLLM running with wrong flags — restarting...[/]")
-            needs_restart = True
-
-    if needs_restart:
+    if "y" in already.stdout:
+        G.console.print("[dim]vLLM already serving[/]")
+    else:
         _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=10)
         time.sleep(2)
-        cp = _gpu_ssh_run(gpu, _build_vllm_cmd(gpu), timeout=30)
-        pid = cp.stdout.strip()
-        G.console.print(f"[cyan]vLLM starting[/] (PID {pid}) — model download may take 20–40 min on first boot")
-        G.console.print("[dim]tailing /tmp/vllm.log for progress…[/]")
-    else:
-        G.console.print("[dim]vLLM already serving with correct flags, skipping start[/]")
+        pid = _gpu_ssh_run(gpu, _build_vllm_cmd(gpu), timeout=30).stdout.strip()
+        G.console.print(f"[cyan]vLLM starting[/] (PID {pid}) — model load can take 20–40 min on first boot")
 
-    # ── Poll until /v1/models responds ──
-    _max_wait_s = 5400  # 90 min
+    # ── Poll until vLLM responds ──
+    _max_wait_s = 5400
     _poll_s = 30
     _elapsed = 0
-    _attempt = 0
-    endpoint_ready = already_ready
-    while not endpoint_ready and _elapsed < _max_wait_s:
+    endpoint: Optional[str] = None
+
+    while _elapsed < _max_wait_s:
         time.sleep(_poll_s)
         _elapsed += _poll_s
-        _attempt += 1
-        cp = _gpu_ssh_run(
+
+        # Check locally via SSH first (works even if external port not mapped)
+        local = _gpu_ssh_run(
             gpu,
-            f"curl -sf http://localhost:{gpu.vllm_port}/v1/models > /dev/null 2>&1 && echo ready || echo down",
+            f"curl -sf http://localhost:{gpu.vllm_port}/v1/models > /dev/null 2>&1 && echo y || echo n",
             timeout=15,
         )
-        if "ready" in cp.stdout:
-            endpoint_ready = True
-            break
-        # Fail fast if vLLM process has died (CUDA OOM, crash, etc.)
-        alive_cp = _gpu_ssh_run(
-            gpu,
-            "pgrep -f 'vllm serve' > /dev/null 2>&1 && echo alive || echo dead",
-            timeout=10,
-        )
-        if "dead" in alive_cp.stdout:
-            log_tail_cp = _gpu_ssh_run(gpu, "tail -20 /tmp/vllm.log 2>/dev/null || true", timeout=10)
-            raise G.MichaelError(
-                f"vLLM process died after {_elapsed}s.\n"
-                f"Last log output:\n{log_tail_cp.stdout.strip()}\n\n"
-                "Common causes: CUDA OOM (try lowering --gpu-memory-utilization), "
-                "incompatible vLLM version, or missing model files."
-            )
-        log_cp = _gpu_ssh_run(gpu, "tail -2 /tmp/vllm.log 2>/dev/null || true", timeout=10)
-        tail = log_cp.stdout.strip().replace("\n", " | ")
-        G.console.print(f"[dim]· {_elapsed}s — {tail or 'loading…'}[/]")
-        append_event("gpu.poll", {"elapsed_s": _elapsed, "attempt": _attempt})
+        if "y" not in local.stdout:
+            alive = _gpu_ssh_run(gpu, "pgrep -f 'vllm serve' > /dev/null 2>&1 && echo y || echo n", timeout=10)
+            if "n" in alive.stdout:
+                tail = _gpu_ssh_run(gpu, "tail -20 /tmp/vllm.log 2>/dev/null", timeout=10).stdout.strip()
+                raise G.MichaelError(f"vLLM process died.\n{tail}")
+            log = _gpu_ssh_run(gpu, "tail -2 /tmp/vllm.log 2>/dev/null", timeout=10).stdout.strip()
+            G.console.print(f"[dim]· {_elapsed}s — {log or 'loading…'}[/]")
+            append_event("gpu.poll", {"elapsed_s": _elapsed})
+            _poll_s = min(_poll_s * 2, 60)
+            continue
 
-    if not endpoint_ready:
-        raise G.MichaelError(
-            f"vLLM did not become ready within {_max_wait_s}s. "
-            "SSH in and check /tmp/vllm.log"
-        )
+        # vLLM is up — try to resolve the public endpoint via Vast port mapping
+        try:
+            _vc = VastClient(cfg.vast_api_key)
+            ep = _vc.endpoint_for(gpu.vast_instance_id, gpu.vllm_port)
+            _vc.close()
+        except G.MichaelError:
+            ep = None
 
-    # ── Save endpoint into models.god so `michael run` works via port forward ──
-    endpoint = f"http://localhost:{gpu.vllm_port}/v1"
+        endpoint = ep or f"http://localhost:{gpu.vllm_port}/v1"
+        break
+
+    if not endpoint:
+        raise G.MichaelError(f"vLLM did not become ready within {_max_wait_s}s")
+
+    # ── Save endpoint ──
     if "god" not in cfg.models:
         from michael.config import ModelProfile
         cfg.models["god"] = ModelProfile()
@@ -582,17 +507,20 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
     if gname in cfg.gpus:
         cfg.gpus[gname] = gpu
     cfg.save()
-    append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint})
+    append_event("gpu.ready", {"instance": gpu.vast_instance_id, "model": gpu.model_repo, "endpoint": endpoint})
 
-    pf_cmd = gpu_port_forward_cmd(gpu)
+    needs_pf = endpoint.startswith("http://localhost")
     G.console.print(
         Panel(
             f"[bold green]vLLM is ready[/] — {gpu.model_repo}\n\n"
-            f"[bold]Open a new terminal and run:[/]\n\n"
-            f"  {pf_cmd}\n\n"
-            f"[dim]Keep that terminal open. Then use:[/]\n"
-            f"  michael run <your prompt>",
-            title="port forward",
+            f"endpoint: [bold]{endpoint}[/]\n\n"
+            + (
+                f"[dim]Open a new terminal and keep this running:[/]\n"
+                f"  {gpu_port_forward_cmd(gpu)}\n\n"
+                if needs_pf else ""
+            )
+            + f"[dim]Then:[/]  michael run <your prompt>",
+            title="ready",
             border_style="green",
         )
     )
@@ -629,6 +557,81 @@ def cmd_gpu_down(name: Optional[str] = None) -> None:
     if "god" in cfg.models:
         cfg.models["god"].endpoint = None
     cfg.save()
+
+
+def cmd_gpu_debug(name: Optional[str] = None) -> None:
+    import subprocess as _sp
+
+    cfg = Config.load()
+    gname, gpu = _pick_gpu(cfg, name)
+
+    G.console.print(f"\n[bold cyan]═══ STEP 1: local config for {gname!r} ═══[/]")
+    G.console.print(f"  instance_id : {gpu.vast_instance_id or '(not set)'}")
+    G.console.print(f"  ssh_host    : {gpu.ssh_host or '(not set)'}")
+    G.console.print(f"  ssh_port    : {gpu.ssh_port}")
+    G.console.print(f"  ssh_user    : {gpu.ssh_user}")
+    G.console.print(f"  ssh_key     : {gpu.ssh_key_path}")
+    G.console.print(f"  model_repo  : {gpu.model_repo}")
+    G.console.print(f"  vllm_port   : {gpu.vllm_port}")
+
+    G.console.print(f"\n[bold cyan]═══ STEP 2: Vast.ai API response ═══[/]")
+    if not cfg.vast_api_key:
+        G.console.print("  [red]vast_api_key not set — skipping[/]")
+    elif not gpu.vast_instance_id:
+        G.console.print("  [red]vast_instance_id not set — skipping[/]")
+    else:
+        try:
+            vast = VastClient(cfg.vast_api_key)
+            inst = vast.get(gpu.vast_instance_id)
+            vast.close()
+            for key in ("actual_status", "ssh_host", "ssh_port", "public_ipaddr", "ports"):
+                G.console.print(f"  {key}: {inst.get(key)!r}")
+        except G.MichaelError as e:
+            G.console.print(f"  [red]API error: {e}[/]")
+
+    G.console.print(f"\n[bold cyan]═══ STEP 3: SSH command ═══[/]")
+    argv = _gpu_ssh_argv(gpu)
+    G.console.print("  " + " ".join(argv) + " echo ok")
+
+    G.console.print(f"\n[bold cyan]═══ STEP 4: SSH verbose connect ═══[/]")
+    key = os.path.expanduser(gpu.ssh_key_path)
+    ssh_cmd = [
+        "ssh", "-vvv",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+        "-i", key,
+        "-p", str(gpu.ssh_port),
+        f"{gpu.ssh_user}@{gpu.ssh_host}",
+        "echo __SSH_OK__",
+    ]
+    G.console.print(f"  running: {' '.join(ssh_cmd[:9])} …")
+    result = _sp.run(ssh_cmd, capture_output=True, text=True, timeout=25, check=False)
+    G.console.print(f"  exit code: {result.returncode}")
+    if result.stdout:
+        G.console.print("[bold]stdout:[/]\n" + result.stdout)
+    if result.stderr:
+        G.console.print("[bold]stderr (contains SSH debug):[/]\n" + result.stderr)
+
+    if "__SSH_OK__" not in result.stdout:
+        G.console.print("\n[red bold]SSH failed — share the stderr above to diagnose.[/]")
+        return
+
+    G.console.print(f"\n[bold cyan]═══ STEP 5: instance state ═══[/]")
+    checks = (
+        "uname -a",
+        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1 || echo 'no nvidia-smi'",
+        "pip show vllm 2>&1 | head -3 || echo 'vllm not installed'",
+        "pgrep -fa 'vllm serve' 2>/dev/null || echo 'vllm not running'",
+        "ss -tlnp 2>/dev/null | grep 8000 || echo 'nothing listening on 8000'",
+        "curl -sf http://localhost:8000/v1/models 2>&1 && echo '\\nvllm HTTP ok' || echo 'vllm HTTP not ready'",
+        "tail -30 /tmp/vllm.log 2>/dev/null || echo 'no /tmp/vllm.log'",
+    )
+    for cmd in checks:
+        G.console.print(f"\n[dim]$ {cmd}[/]")
+        cp = _gpu_ssh_run(gpu, cmd, timeout=20)
+        G.console.print(cp.stdout or cp.stderr or "(no output)")
 
 
 def cmd_status() -> None:
@@ -1145,6 +1148,14 @@ def gpu_down_cmd(
 ) -> None:
     """Kill vLLM on a named GPU instance and stop it via Vast.ai API."""
     cmd_gpu_down(name)
+
+
+@gpu_app.command("debug")
+def gpu_debug_cmd(
+    name: Optional[str] = typer.Argument(None, help="GPU name. Prompts if omitted."),
+) -> None:
+    """Run full SSH + vLLM diagnostics and print everything."""
+    cmd_gpu_debug(name)
 
 
 @app.command(name="status")
