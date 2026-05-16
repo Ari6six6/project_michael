@@ -300,12 +300,13 @@ class VastClient:
         )
         return data.get("instances", {}) or {}
 
-    def start(self, inst_id: str | int) -> dict[str, Any]:
+    def start(self, inst_id: str | int, onstart: str = "") -> dict[str, Any]:
+        payload: dict[str, Any] = {"state": "running"}
+        if onstart:
+            payload["onstart"] = onstart
         return self._wrap(
             "start",
-            lambda: self._client.put(
-                f"{self.base}/instances/{inst_id}/", json={"state": "running"}
-            ),
+            lambda: self._client.put(f"{self.base}/instances/{inst_id}/", json=payload),
         )
 
     def stop(self, inst_id: str | int) -> dict[str, Any]:
