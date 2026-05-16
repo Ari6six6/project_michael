@@ -175,6 +175,8 @@ def _run_agent_loop(
                         ) from retry_exc
                 else:
                     raise
+            if not resp.choices:
+                raise G.MichaelError("LLM returned empty choices — server may be overloaded or returned an error")
             choice = resp.choices[0]
             content = choice.content or ""
 

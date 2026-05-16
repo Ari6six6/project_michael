@@ -6,6 +6,7 @@ import dataclasses
 import json as _json
 import os
 import pathlib
+import re as _re
 import shlex
 import shutil
 import subprocess
@@ -165,9 +166,9 @@ def gpu_port_forward_cmd(gpu: GpuConfig) -> str:
 
 def _build_vllm_cmd(gpu: GpuConfig) -> str:
     """Build the nohup vllm serve command for the GPU. Single source of truth."""
-    api_key_flag = f"--api-key {gpu.vllm_api_key} " if gpu.vllm_api_key else ""
+    api_key_flag = f"--api-key {shlex.quote(gpu.vllm_api_key)} " if gpu.vllm_api_key else ""
     return (
-        f"nohup vllm serve {gpu.model_repo} "
+        f"nohup vllm serve {shlex.quote(gpu.model_repo)} "
         f"--host 0.0.0.0 --port {gpu.vllm_port} "
         f"--dtype auto --gpu-memory-utilization 0.90 "
         f"--max-model-len {gpu.vllm_max_model_len} "
@@ -366,6 +367,16 @@ def _parse_tool_calls(tcs: list) -> Optional[list]:
     return result or None
 
 
+_THINK_RE = _re.compile(r"<think>.*?</think>", _re.DOTALL)
+
+
+def _strip_thinking(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    stripped = _THINK_RE.sub("", text).lstrip()
+    return stripped or None
+
+
 class _Completions:
     def __init__(
         self, endpoint: str, http: httpx.Client, headers: dict, enable_thinking: bool = False
@@ -450,7 +461,7 @@ class _Completions:
             tool_calls = _parse_tool_calls(m.get("tool_calls") or [])
             choices.append(
                 _Choice(
-                    content=m.get("content"),
+                    content=_strip_thinking(m.get("content")),
                     tool_calls=tool_calls,
                     finish_reason=c.get("finish_reason"),
                 )
