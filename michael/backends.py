@@ -374,6 +374,7 @@ class _Completions:
         self._http = http
         self._headers = headers
         self._enable_thinking = enable_thinking
+        self._last_usage: Optional[dict] = None
 
     def create(
         self,
@@ -419,6 +420,7 @@ class _Completions:
             headers=self._headers,
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
+        self._last_usage = None
         try:
             with client.stream(
                 "POST", f"{self._endpoint}/chat/completions", json=body
@@ -429,8 +431,14 @@ class _Completions:
                         continue
                     if line.startswith("data: "):
                         try:
-                            yield self._parse_chunk(_json.loads(line[6:]))
-                        except (_json.JSONDecodeError, KeyError):
+                            data = _json.loads(line[6:])
+                        except _json.JSONDecodeError:
+                            continue
+                        if data.get("usage"):
+                            self._last_usage = data["usage"]
+                        try:
+                            yield self._parse_chunk(data)
+                        except KeyError:
                             continue
         finally:
             client.close()
@@ -509,8 +517,8 @@ def chat_stream(
     timeout_s: float = 120.0,
 ) -> tuple[str, Optional[dict]]:
     chunks: list[str] = []
-    usage: Optional[dict] = None
-    for chunk in client.chat.completions.create(
+    completions = client.chat.completions
+    for chunk in completions.create(
         model=model,
         messages=messages,
         stream=True,
@@ -520,7 +528,7 @@ def chat_stream(
         if chunk.content:
             chunks.append(chunk.content)
     text = "".join(chunks)
-    return text, usage
+    return text, completions._last_usage
 
 
 # ---------------------------------------------------------------------------

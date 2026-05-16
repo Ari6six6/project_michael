@@ -943,13 +943,13 @@ def cmd_tools_list() -> None:
 
 
 def cmd_tools_run(name: str, kv_tokens: list[str]) -> None:
-    project_path: str | None = None
+    project: Optional[Any] = None
     try:
-        project_path = require_active_project().path
+        project = require_active_project()
     except G.MichaelError:
         pass
 
-    py_file = _find_tool_file(name, project_path)
+    py_file = _find_tool_file(name, project.path if project else None)
     if py_file is None:
         raise G.MichaelError(f"tool {name!r} not found in any toolbox directory")
 
@@ -958,7 +958,7 @@ def cmd_tools_run(name: str, kv_tokens: list[str]) -> None:
     except typer.BadParameter as e:
         raise G.MichaelError(str(e)) from e
 
-    result = _dispatch_dynamic_tool_from_path(name, args, py_file)
+    result = _dispatch_dynamic_tool_from_path(name, args, py_file, project)
     G.console.print(result)
 
 
