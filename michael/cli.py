@@ -246,9 +246,85 @@ def cmd_down() -> None:
         vast.close()
 
 
-def cmd_gpu_up() -> None:
+def cmd_gpu_new(name: str, instance_id: str) -> None:
     cfg = Config.load()
-    gpu = cfg.gpu
+    cfg.gpus[name] = GpuConfig(vast_instance_id=instance_id)
+    cfg.save()
+    G.console.print(f"[green]registered GPU[/] [bold]{name}[/] (instance {instance_id})")
+    G.console.print(f"[dim]Run: michael gpu up {name}[/]")
+
+
+def _pick_gpu(cfg: "Config", name: Optional[str]) -> tuple[str, GpuConfig]:
+    """Return (name, GpuConfig) — prompts if multiple GPUs registered and name is None."""
+    if not cfg.gpus and not cfg.gpu.ssh_host and not cfg.gpu.vast_instance_id:
+        raise G.MichaelError("no GPUs registered — run: michael gpu new <name> <instance_id>")
+
+    pool: dict[str, GpuConfig] = dict(cfg.gpus)
+    if not pool and (cfg.gpu.ssh_host or cfg.gpu.vast_instance_id):
+        pool["(legacy)"] = cfg.gpu
+
+    if name:
+        if name not in pool:
+            raise G.MichaelError(
+                f"unknown GPU {name!r}. Available: {', '.join(pool)}"
+            )
+        return name, pool[name]
+
+    if len(pool) == 1:
+        n, g = next(iter(pool.items()))
+        G.console.print(f"[dim]Using GPU:[/] [bold]{n}[/]")
+        return n, g
+
+    names = list(pool)
+    G.console.print("[bold cyan]Available GPUs:[/]")
+    for i, n in enumerate(names, 1):
+        g = pool[n]
+        iid = g.vast_instance_id or "—"
+        G.console.print(f"  {i}. [bold]{n}[/]  [dim](instance {iid})[/]")
+    choice = typer.prompt("Which GPU?", default="1")
+    try:
+        idx = int(choice) - 1
+        chosen = names[idx]
+    except (ValueError, IndexError):
+        raise G.MichaelError(f"invalid choice: {choice!r}")
+    return chosen, pool[chosen]
+
+
+def cmd_gpu_up(name: Optional[str] = None) -> None:
+    cfg = Config.load()
+    gname, gpu = _pick_gpu(cfg, name)
+    G.console.print(
+        f"[bold]Using GPU:[/] {gname}  [dim](instance {gpu.vast_instance_id or '—'})[/]"
+    )
+
+    # ── Auto-discover SSH details from Vast API when instance_id is known ──
+    if not gpu.ssh_host and gpu.vast_instance_id and cfg.vast_api_key:
+        G.console.print("[dim]discovering SSH details from Vast API…[/]")
+        vast = VastClient(cfg.vast_api_key)
+        try:
+            inst = vast.get(gpu.vast_instance_id)
+        finally:
+            vast.close()
+        ssh_host = inst.get("ssh_host") or inst.get("public_ipaddr") or ""
+        if not ssh_host:
+            raise G.MichaelError(
+                f"instance {gpu.vast_instance_id} has no ssh_host yet — is it running?"
+            )
+        ports = inst.get("ports") or {}
+        ssh_port = 22
+        if isinstance(ports, dict):
+            mapping = ports.get("22/tcp") or ports.get("22")
+            if isinstance(mapping, list) and mapping:
+                try:
+                    ssh_port = int(mapping[0].get("HostPort", 22))
+                except (TypeError, ValueError):
+                    pass
+        gpu.ssh_host = ssh_host
+        gpu.ssh_port = ssh_port
+        if gname in cfg.gpus:
+            cfg.gpus[gname] = gpu
+        cfg.save()
+        G.console.print(f"[green]SSH discovered:[/] {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}")
 
     # ── First-time setup: read SSH string from Vast.ai console ──
     if not gpu.ssh_host:
@@ -278,6 +354,8 @@ def cmd_gpu_up() -> None:
                 pass
 
         cfg.gpu = gpu
+        if gname in cfg.gpus:
+            cfg.gpus[gname] = gpu
         cfg.save()
         G.console.print(f"[green]GPU config saved[/] ({gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port})")
 
@@ -365,6 +443,8 @@ def cmd_gpu_up() -> None:
         cfg.default_model = cfg.default_model or "god"
     cfg.models["god"].endpoint = endpoint
     cfg.models["god"].served_model_name = gpu.model_repo
+    if gname in cfg.gpus:
+        cfg.gpus[gname] = gpu
     cfg.save()
     append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint})
 
@@ -382,11 +462,14 @@ def cmd_gpu_up() -> None:
     )
 
 
-def cmd_gpu_down() -> None:
+def cmd_gpu_down(name: Optional[str] = None) -> None:
     cfg = Config.load()
-    gpu = cfg.gpu
+    gname, gpu = _pick_gpu(cfg, name)
+    G.console.print(
+        f"[bold]Stopping GPU:[/] {gname}  [dim](instance {gpu.vast_instance_id or '—'})[/]"
+    )
     if not gpu.ssh_host:
-        raise G.MichaelError("no GPU configured — run `michael gpu up` first")
+        raise G.MichaelError(f"GPU {gname!r} has no SSH host — was it ever started?")
 
     G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
     _gpu_ssh_run(gpu, "pkill -f 'vllm serve' 2>/dev/null || true", timeout=15)
@@ -667,16 +750,29 @@ def down_cmd() -> None:
     cmd_down()
 
 
+@gpu_app.command("new")
+def gpu_new_cmd(
+    name: str = typer.Argument(..., help="Short name for this GPU (e.g. 'rtx6000')."),
+    instance_id: str = typer.Argument(..., help="Vast.ai instance ID."),
+) -> None:
+    """Register a named GPU instance by Vast.ai instance ID."""
+    cmd_gpu_new(name, instance_id)
+
+
 @gpu_app.command("up")
-def gpu_up_cmd() -> None:
-    """Install vLLM on the GPU, start Qwen3-72B-AWQ, print the port-forward command."""
-    cmd_gpu_up()
+def gpu_up_cmd(
+    name: Optional[str] = typer.Argument(None, help="GPU name (from 'gpu new'). Prompts if omitted."),
+) -> None:
+    """Start vLLM on a named GPU instance."""
+    cmd_gpu_up(name)
 
 
 @gpu_app.command("down")
-def gpu_down_cmd() -> None:
-    """Kill vLLM on the GPU and stop the Vast.ai instance."""
-    cmd_gpu_down()
+def gpu_down_cmd(
+    name: Optional[str] = typer.Argument(None, help="GPU name (from 'gpu new'). Prompts if omitted."),
+) -> None:
+    """Kill vLLM on a named GPU instance and stop it via Vast.ai API."""
+    cmd_gpu_down(name)
 
 
 @app.command(name="status")

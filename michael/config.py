@@ -65,6 +65,7 @@ class Config:
     vps: VpsConfig = field(default_factory=VpsConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     gpu: GpuConfig = field(default_factory=GpuConfig)
+    gpus: dict[str, GpuConfig] = field(default_factory=dict)
     system_prompt: str = G.DEFAULT_SYSTEM_PROMPT
     system_prompt_file: str = ""
     log_responses: bool = True
@@ -104,9 +105,15 @@ class Config:
         valid_gpu = set(GpuConfig.__dataclass_fields__)
         gpu = GpuConfig(**{k: v for k, v in gpu_raw.items() if k in valid_gpu})
 
-        valid = set(cls.__dataclass_fields__) - {"models", "vps", "sandbox", "gpu"}
+        gpus_raw = data.pop("gpus", None) or {}
+        gpus: dict[str, GpuConfig] = {}
+        for gname, gdata in gpus_raw.items():
+            if isinstance(gdata, dict):
+                gpus[gname] = GpuConfig(**{k: v for k, v in gdata.items() if k in valid_gpu})
+
+        valid = set(cls.__dataclass_fields__) - {"models", "vps", "sandbox", "gpu", "gpus"}
         clean = {k: v for k, v in data.items() if k in valid}
-        return cls(models=models, vps=vps, sandbox=sandbox, gpu=gpu, **clean)
+        return cls(models=models, vps=vps, sandbox=sandbox, gpu=gpu, gpus=gpus, **clean)
 
     def save(self) -> None:
         G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)
