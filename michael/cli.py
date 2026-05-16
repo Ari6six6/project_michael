@@ -387,14 +387,17 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
                 f"instance {gpu.vast_instance_id} has no ssh_host yet — is it running?"
             )
         ports = inst.get("ports") or {}
-        ssh_port = 22
-        if isinstance(ports, dict):
-            mapping = ports.get("22/tcp") or ports.get("22")
-            if isinstance(mapping, list) and mapping:
-                try:
-                    ssh_port = int(mapping[0].get("HostPort", 22))
-                except (TypeError, ValueError):
-                    pass
+        ssh_port = int(inst.get("ssh_port") or 0)
+        if not ssh_port:
+            if isinstance(ports, dict):
+                mapping = ports.get("22/tcp") or ports.get("22")
+                if isinstance(mapping, list) and mapping:
+                    try:
+                        ssh_port = int(mapping[0].get("HostPort", 0))
+                    except (TypeError, ValueError):
+                        pass
+        if not ssh_port:
+            ssh_port = 22
         gpu.ssh_host = ssh_host
         gpu.ssh_port = ssh_port
         if gname in cfg.gpus:
@@ -458,15 +461,18 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
                     G.console.print(f"[dim]· {_ssh_wait}s — waiting for instance metadata…[/]")
                     continue
                 fresh_host = inst.get("ssh_host") or inst.get("public_ipaddr") or ""
-                fresh_port = 22
-                ports = inst.get("ports") or {}
-                if isinstance(ports, dict):
-                    mapping = ports.get("22/tcp") or ports.get("22")
-                    if isinstance(mapping, list) and mapping:
-                        try:
-                            fresh_port = int(mapping[0].get("HostPort", 22))
-                        except (TypeError, ValueError):
-                            pass
+                fresh_port = int(inst.get("ssh_port") or 0)
+                if not fresh_port:
+                    ports = inst.get("ports") or {}
+                    if isinstance(ports, dict):
+                        mapping = ports.get("22/tcp") or ports.get("22")
+                        if isinstance(mapping, list) and mapping:
+                            try:
+                                fresh_port = int(mapping[0].get("HostPort", 0))
+                            except (TypeError, ValueError):
+                                pass
+                if not fresh_port:
+                    fresh_port = 22
                 if fresh_host and fresh_port != 22 or (fresh_host and not gpu.ssh_host):
                     if fresh_host != gpu.ssh_host or fresh_port != gpu.ssh_port:
                         G.console.print(
