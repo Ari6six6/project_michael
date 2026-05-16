@@ -321,14 +321,34 @@ class VastClient:
         data = self._wrap("list", lambda: self._client.get(f"{self.base}/instances/"))
         return data.get("instances", []) or []
 
-    def endpoint_for(self, inst_id: str | int, port: int) -> Optional[str]:
+    def endpoint_for(self, inst_id: str | int, internal_port: int) -> Optional[str]:
+        """Return the public HTTP endpoint for an internal port, or None if not ready.
+
+        Vast.ai NATs ports: internal 8000 may be external 23456. Checks inst["ports"]
+        for the mapped external port; falls back to using internal_port directly if
+        no mapping exists (bare-metal instances that expose ports 1:1).
+        """
         info = self.get(inst_id)
         if not info:
             return None
         ip = info.get("public_ipaddr") or info.get("ssh_host")
         if not ip:
             return None
-        return f"http://{ip}:{port}/v1"
+        # Resolve external port from Vast.ai port-mapping table
+        external_port = internal_port
+        ports = info.get("ports") or {}
+        if isinstance(ports, dict):
+            key = f"{internal_port}/tcp"
+            mapping = ports.get(key) or ports.get(str(internal_port))
+            if isinstance(mapping, list) and mapping:
+                try:
+                    external_port = int(mapping[0].get("HostPort", internal_port))
+                except (TypeError, ValueError):
+                    pass
+        if external_port == internal_port and isinstance(ports, dict) and ports:
+            # Port table exists but our port isn't in it — not exposed yet
+            return None
+        return f"http://{ip}:{external_port}/v1"
 
 
 # ---------------------------------------------------------------------------
