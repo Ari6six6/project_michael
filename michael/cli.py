@@ -468,6 +468,20 @@ def cmd_gpu_up() -> None:
         if "ready" in cp.stdout:
             endpoint_ready = True
             break
+        # Fail fast if vLLM process has died (CUDA OOM, crash, etc.)
+        alive_cp = _gpu_ssh_run(
+            gpu,
+            "pgrep -f 'vllm serve' > /dev/null 2>&1 && echo alive || echo dead",
+            timeout=10,
+        )
+        if "dead" in alive_cp.stdout:
+            log_tail_cp = _gpu_ssh_run(gpu, "tail -20 /tmp/vllm.log 2>/dev/null || true", timeout=10)
+            raise G.MichaelError(
+                f"vLLM process died after {_elapsed}s.\n"
+                f"Last log output:\n{log_tail_cp.stdout.strip()}\n\n"
+                "Common causes: CUDA OOM (try lowering --gpu-memory-utilization), "
+                "incompatible vLLM version, or missing model files."
+            )
         log_cp = _gpu_ssh_run(gpu, "tail -2 /tmp/vllm.log 2>/dev/null || true", timeout=10)
         tail = log_cp.stdout.strip().replace("\n", " | ")
         G.console.print(f"[dim]· {_elapsed}s — {tail or 'loading…'}[/]")

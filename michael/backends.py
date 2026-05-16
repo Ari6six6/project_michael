@@ -169,7 +169,7 @@ def _build_vllm_cmd(gpu: GpuConfig) -> str:
     return (
         f"nohup vllm serve {gpu.model_repo} "
         f"--host 0.0.0.0 --port {gpu.vllm_port} "
-        f"--dtype auto --gpu-memory-utilization 0.95 "
+        f"--dtype auto --gpu-memory-utilization 0.90 "
         f"--max-model-len {gpu.vllm_max_model_len} "
         f"--enable-auto-tool-choice --tool-call-parser hermes "
         f"{api_key_flag}"
