@@ -520,15 +520,7 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
             _poll_s = min(_poll_s * 2, 60)
             continue
 
-        # vLLM is up — try to resolve the public endpoint via Vast port mapping
-        try:
-            _vc = VastClient(cfg.vast_api_key)
-            ep = _vc.endpoint_for(gpu.vast_instance_id, gpu.vllm_port)
-            _vc.close()
-        except G.MichaelError:
-            ep = None
-
-        endpoint = ep or f"http://localhost:{gpu.vllm_port}/v1"
+        endpoint = f"http://localhost:{gpu.vllm_port}/v1"
         break
 
     if not endpoint:
@@ -546,18 +538,14 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
     cfg.save()
     append_event("gpu.ready", {"instance": gpu.vast_instance_id, "model": gpu.model_repo, "endpoint": endpoint})
 
-    needs_pf = endpoint.startswith("http://localhost")
     G.console.print(
         Panel(
             f"[bold green]vLLM is ready[/] — {gpu.model_repo}\n\n"
-            f"endpoint: [bold]{endpoint}[/]\n\n"
-            + (
-                f"[dim]Open a new terminal and keep this running:[/]\n"
-                f"  {gpu_port_forward_cmd(gpu)}\n\n"
-                if needs_pf else ""
-            )
-            + f"[dim]Then:[/]  michael run <your prompt>",
-            title="ready",
+            f"[bold]Open a new terminal and keep this running:[/]\n\n"
+            f"  {gpu_port_forward_cmd(gpu)}\n\n"
+            f"[dim]Keep that terminal open. Then:[/]\n"
+            f"  michael run <your prompt>",
+            title="port forward",
             border_style="green",
         )
     )
