@@ -443,6 +443,44 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
             vast.start(gpu.vast_instance_id)
             vast.close()
             G.console.print("[dim]start requested — waiting for SSH to come up…[/]")
+
+            # Re-fetch SSH host/port after start: port mappings are assigned at boot time
+            # and may differ from what was stored when the instance was stopped.
+            _ssh_wait = 0
+            while _ssh_wait < 120:
+                time.sleep(10)
+                _ssh_wait += 10
+                try:
+                    _vc = VastClient(cfg.vast_api_key)
+                    inst = _vc.get(gpu.vast_instance_id)
+                    _vc.close()
+                except G.MichaelError:
+                    G.console.print(f"[dim]· {_ssh_wait}s — waiting for instance metadata…[/]")
+                    continue
+                fresh_host = inst.get("ssh_host") or inst.get("public_ipaddr") or ""
+                fresh_port = 22
+                ports = inst.get("ports") or {}
+                if isinstance(ports, dict):
+                    mapping = ports.get("22/tcp") or ports.get("22")
+                    if isinstance(mapping, list) and mapping:
+                        try:
+                            fresh_port = int(mapping[0].get("HostPort", 22))
+                        except (TypeError, ValueError):
+                            pass
+                if fresh_host and fresh_port != 22 or (fresh_host and not gpu.ssh_host):
+                    if fresh_host != gpu.ssh_host or fresh_port != gpu.ssh_port:
+                        G.console.print(
+                            f"[dim]SSH endpoint updated: {gpu.ssh_user}@{fresh_host}:{fresh_port}[/]"
+                        )
+                    gpu.ssh_host = fresh_host
+                    gpu.ssh_port = fresh_port
+                    if gname in cfg.gpus:
+                        cfg.gpus[gname] = gpu
+                    cfg.gpu = gpu
+                    cfg.save()
+                    break
+                G.console.print(f"[dim]· {_ssh_wait}s — SSH endpoint not assigned yet…[/]")
+
             _poll_s = 10
             _max_boot = 300
             _elapsed = 0
