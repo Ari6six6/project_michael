@@ -395,7 +395,6 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
     G.console.print("[dim]start requested — waiting for SSH…[/]")
 
     # ── Wait for SSH host/port to appear in Vast API ──
-    # inst["ssh_host"] and inst["ssh_port"] are assigned at boot time.
     for _t in range(10, 181, 10):
         time.sleep(10)
         try:
@@ -405,6 +404,13 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
         except G.MichaelError:
             G.console.print(f"[dim]· {_t}s — waiting for instance metadata…[/]")
             continue
+        status = inst.get("actual_status", "unknown")
+        if status == "exited":
+            raise G.MichaelError(
+                f"Instance {gpu.vast_instance_id} exited before SSH was ready.\n"
+                "Check Vast.ai console for the crash reason (OOM, driver error, etc.).\n"
+                "You may need to destroy and re-rent, or SSH in manually first to verify."
+            )
         fresh_host = inst.get("ssh_host") or inst.get("public_ipaddr") or ""
         fresh_port = int(inst.get("ssh_port") or 0)
         if fresh_host and fresh_port:
@@ -417,23 +423,53 @@ def cmd_gpu_up(name: Optional[str] = None) -> None:
                 cfg.save()
                 G.console.print(f"[green]SSH:[/] {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}")
             break
-        G.console.print(f"[dim]· {_t}s — SSH details not assigned yet…[/]")
+        G.console.print(f"[dim]· {_t}s — status={status}, SSH details not assigned yet…[/]")
     else:
         raise G.MichaelError(
             "Instance did not expose SSH details within 180s — check Vast.ai console."
         )
 
     # ── Poll SSH until reachable ──
+    import subprocess as _sp
+    _last_ssh_err = ""
     for _t in range(10, 301, 10):
         time.sleep(10)
-        if _gpu_ssh_run(gpu, "echo ok", timeout=12).returncode == 0:
+        # Also check instance hasn't crashed
+        try:
+            _vc = VastClient(cfg.vast_api_key)
+            _inst = _vc.get(gpu.vast_instance_id)
+            _vc.close()
+            _status = _inst.get("actual_status", "unknown")
+            if _status == "exited":
+                raise G.MichaelError(
+                    f"Instance crashed while waiting for SSH (status=exited).\n"
+                    f"Last SSH error: {_last_ssh_err or '(none yet)'}\n"
+                    "Check Vast.ai console for OOM/driver crash."
+                )
+        except G.MichaelError:
+            raise
+        except Exception:
+            pass
+
+        key = os.path.expanduser(gpu.ssh_key_path)
+        _r = _sp.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=12",
+             "-i", key, "-p", str(gpu.ssh_port),
+             f"{gpu.ssh_user}@{gpu.ssh_host}", "echo ok"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if _r.returncode == 0:
             break
-        G.console.print(f"[dim]· {_t}s — SSH not accepting connections yet…[/]")
+        _last_ssh_err = (_r.stderr or "").strip().splitlines()[-1] if _r.stderr else ""
+        G.console.print(f"[dim]· {_t}s — SSH not ready ({_last_ssh_err or 'timeout'})[/]")
     else:
         raise G.MichaelError(
             f"SSH did not become reachable within 300s at "
             f"{gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}\n"
-            "Verify your SSH key is uploaded in Vast.ai account settings."
+            f"Last error: {_last_ssh_err or '(none)'}\n"
+            "Verify your SSH key is uploaded in Vast.ai account settings:\n"
+            "  https://cloud.vast.ai/account/ → SSH Keys"
         )
 
     # ── Install vLLM if missing ──
